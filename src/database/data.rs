@@ -236,47 +236,51 @@ impl StoredDatabaseUpdate {
         database: &crate::database::Database,
         data: &mut StoredDatabase,
     ) -> anyhow::Result<()> {
+        // Stage mutations on a clone so the in-memory state only diverges
+        // from disk once the UPDATE has actually succeeded.
+        let mut new_data = data.clone();
+
         if let Some(suspended) = self.suspended {
-            data.suspended = suspended;
+            new_data.suspended = suspended;
         }
         if let Some(memory) = self.memory {
-            data.memory = memory;
+            new_data.memory = memory;
         }
         if let Some(swap) = self.swap {
-            data.swap = swap;
+            new_data.swap = swap;
         }
         if let Some(disk) = self.disk {
-            data.disk = disk;
+            new_data.disk = disk;
         }
         if let Some(io_weight) = self.io_weight {
-            data.io_weight = io_weight;
+            new_data.io_weight = io_weight;
         }
         if let Some(cpu) = self.cpu {
-            data.cpu = cpu;
+            new_data.cpu = cpu;
         }
         if let Some(image) = self.image {
-            data.image = image;
+            new_data.image = image;
         }
         if let Some(image_uid) = self.image_uid {
-            data.image_uid = image_uid;
+            new_data.image_uid = image_uid;
         }
         if let Some(image_gid) = self.image_gid {
-            data.image_gid = image_gid;
+            new_data.image_gid = image_gid;
         }
         if let Some(volumes) = self.volumes {
-            data.volumes = volumes;
+            new_data.volumes = volumes;
         }
         if let Some(socket_path) = self.socket_path {
-            data.socket_path = socket_path;
+            new_data.socket_path = socket_path;
         }
         if let Some(timezone) = self.timezone {
-            data.timezone = timezone;
+            new_data.timezone = timezone;
         }
         if let Some(env) = self.env {
-            data.env = env;
+            new_data.env = env;
         }
         if let Some(cmd) = self.cmd {
-            data.cmd = cmd;
+            new_data.cmd = cmd;
         }
 
         sqlx::query(
@@ -285,24 +289,31 @@ impl StoredDatabaseUpdate {
             image_gid = ?, volumes = ?, socket_path = ?, timezone = ?,
             env = ?, cmd = ? WHERE uuid = ?",
         )
-        .bind(data.suspended)
-        .bind(data.memory)
-        .bind(data.swap)
-        .bind(data.disk)
-        .bind(data.io_weight)
-        .bind(data.cpu)
-        .bind(&data.image)
-        .bind(data.image_uid)
-        .bind(data.image_gid)
-        .bind(serde_json::to_string(&data.volumes)?)
-        .bind(&data.socket_path)
-        .bind(&data.timezone)
-        .bind(serde_json::to_string(&data.env)?)
-        .bind(data.cmd.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(data.uuid)
+        .bind(new_data.suspended)
+        .bind(new_data.memory)
+        .bind(new_data.swap)
+        .bind(new_data.disk)
+        .bind(new_data.io_weight)
+        .bind(new_data.cpu)
+        .bind(&new_data.image)
+        .bind(new_data.image_uid)
+        .bind(new_data.image_gid)
+        .bind(serde_json::to_string(&new_data.volumes)?)
+        .bind(&new_data.socket_path)
+        .bind(&new_data.timezone)
+        .bind(serde_json::to_string(&new_data.env)?)
+        .bind(
+            new_data
+                .cmd
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .bind(new_data.uuid)
         .execute(database.write())
         .await?;
 
+        *data = new_data;
         Ok(())
     }
 }

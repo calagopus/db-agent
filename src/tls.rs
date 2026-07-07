@@ -9,7 +9,11 @@ use tokio_rustls::{
 
 pub fn build_acceptor(cert: &str, key: &str) -> anyhow::Result<Option<TlsAcceptor>> {
     let (Ok(cert_pem), Ok(key_pem)) = (std::fs::read(cert), std::fs::read(key)) else {
-        return Ok(None);
+        let err = (std::fs::metadata(cert).err(), std::fs::metadata(key).err());
+        return Err(anyhow::anyhow!(
+            "failed to read TLS cert/key (cert={cert}, key={key}): {:?}",
+            err
+        ));
     };
 
     let certs: Vec<CertificateDer> =

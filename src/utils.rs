@@ -1,4 +1,6 @@
 use rand::{RngExt, distr::SampleString};
+use std::{future::Future, net::SocketAddr, time::Duration};
+use tokio::net::{TcpListener, TcpStream};
 
 pub fn generate_password() -> String {
     const PASSWORD_SPECIAL_CHARS: &[u8] = b"!@#$%^&*()<>-_";
@@ -27,6 +29,42 @@ pub fn is_silent_error(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::UnexpectedEof
     )
+}
+
+pub async fn accept_loop<
+    F: FnMut(TcpStream, SocketAddr) -> Fut,
+    Fut: Future<Output = std::io::Result<()>> + Send + 'static,
+>(
+    listener: &TcpListener,
+    name: &'static str,
+    mut on_accept: F,
+) -> Result<(), anyhow::Error> {
+    loop {
+        match listener.accept().await {
+            Ok((tcp, peer)) => {
+                let fut = on_accept(tcp, peer);
+                tokio::spawn(async move {
+                    if let Err(err) = fut.await
+                        && !is_silent_error(&err)
+                    {
+                        tracing::error!("[{peer}] error: {err}");
+                    }
+                });
+            }
+            Err(err) => {
+                const EMFILE: i32 = 24;
+                const ENFILE: i32 = 23;
+
+                let backoff = match err.raw_os_error() {
+                    Some(EMFILE) | Some(ENFILE) => Duration::from_millis(500),
+                    _ => Duration::from_millis(50),
+                };
+
+                tracing::error!("{name} accept error: {err}; backing off {backoff:?}");
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
 }
 
 pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {

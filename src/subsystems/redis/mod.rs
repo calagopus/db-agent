@@ -1,5 +1,5 @@
 use super::database::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
-use crate::{config::Config, subsystems::status::SubsystemConnections, utils::is_silent_error};
+use crate::{config::Config, subsystems::status::SubsystemConnections};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
@@ -36,19 +36,13 @@ pub async fn run(
         if acceptor.is_some() { "on" } else { "off" }
     );
 
-    loop {
-        let (tcp, peer) = listener.accept().await?;
+    crate::utils::accept_loop(&listener, "redis", |tcp, peer| {
         let status = Arc::clone(&status);
         let routes = Arc::clone(&routes);
         let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle(tcp, &status, &routes, acceptor, peer).await
-                && !is_silent_error(&err)
-            {
-                tracing::error!("[{peer}] error: {err}");
-            }
-        });
-    }
+        async move { handle(tcp, &status, &routes, acceptor, peer).await }
+    })
+    .await
 }
 
 async fn handle(

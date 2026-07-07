@@ -32,22 +32,16 @@ pub type DbIdentifier = StructuredIdentifier<DatabaseIdentifier>;
 #[derive(ToSchema, Clone, Copy, PartialEq, Eq, Hash)]
 #[schema(as = String)]
 pub struct StructuredIdentifier<P: IdentifierPrefix> {
-    user_short_uuid: u32,
-    user_len: u8,
-    user: [u8; 23],
+    short_uuid: u32,
+    label_len: u8,
+    label: [u8; 23],
     #[schema(ignore)]
     _marker: std::marker::PhantomData<P>,
 }
 
 impl<P: IdentifierPrefix> std::fmt::Display for StructuredIdentifier<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}{:08x}_{}",
-            P::prefix(),
-            self.user_short_uuid,
-            self.user()
-        )
+        write!(f, "{}{:08x}_{}", P::prefix(), self.short_uuid, self.label())
     }
 }
 
@@ -59,29 +53,31 @@ impl<P: IdentifierPrefix> std::str::FromStr for StructuredIdentifier<P> {
         let Some(trimmed) = s.strip_prefix(prefix) else {
             return Err(format!("identifier must start with '{prefix}'").into());
         };
-        let Some((short_uuid, user)) = trimmed.split_once('_') else {
+        let Some((short_uuid, label)) = trimmed.split_once('_') else {
             return Err("invalid identifier format".into());
         };
 
         if short_uuid.len() != 8 || !short_uuid.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err("invalid short UUID".into());
         }
-        if user.len() < 2 {
-            return Err("user part too short".into());
+        if label.len() < 2 {
+            return Err("label part too short".into());
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err("label part must be alphanumeric".into());
         }
 
-        let user_bytes = user.as_bytes();
-        let mut user_array = [0; 23];
-        let Some(user_array_slice) = user_array.get_mut(..user_bytes.len()) else {
-            return Err("user part too long".into());
+        let label_bytes = label.as_bytes();
+        let mut label_array = [0; 23];
+        let Some(label_array_slice) = label_array.get_mut(..label_bytes.len()) else {
+            return Err("label part too long".into());
         };
-        user_array_slice.copy_from_slice(user_bytes);
+        label_array_slice.copy_from_slice(label_bytes);
 
         Ok(Self {
-            user_short_uuid: u32::from_str_radix(short_uuid, 16)
-                .map_err(|_| "invalid short UUID")?,
-            user_len: user_bytes.len() as u8,
-            user: user_array,
+            short_uuid: u32::from_str_radix(short_uuid, 16).map_err(|_| "invalid short UUID")?,
+            label_len: label_bytes.len() as u8,
+            label: label_array,
             _marker: std::marker::PhantomData,
         })
     }
@@ -94,33 +90,38 @@ impl<P: IdentifierPrefix> Serialize for StructuredIdentifier<P> {
 }
 
 impl<P: IdentifierPrefix> StructuredIdentifier<P> {
-    pub fn from_parts(short_uuid: u32, user: &str) -> Result<Self, anyhow::Error> {
-        if user.len() < 2 {
-            anyhow::bail!("user part too short");
+    pub fn from_parts(short_uuid: u32, label: &str) -> Result<Self, anyhow::Error> {
+        if label.len() < 2 {
+            anyhow::bail!("label part too short");
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            anyhow::bail!("label part must be alphanumeric");
         }
 
-        let mut user_array = [0; 23];
-        let Some(user_array_slice) = user_array.get_mut(..user.len()) else {
-            anyhow::bail!("user part too long");
+        let mut label_array = [0; 23];
+        let Some(label_array_slice) = label_array.get_mut(..label.len()) else {
+            anyhow::bail!("label part too long");
         };
-        user_array_slice.copy_from_slice(user.as_bytes());
+        label_array_slice.copy_from_slice(label.as_bytes());
 
         Ok(Self {
-            user_short_uuid: short_uuid,
-            user_len: user.len() as u8,
-            user: user_array,
+            short_uuid,
+            label_len: label.len() as u8,
+            label: label_array,
             _marker: std::marker::PhantomData,
         })
     }
 
     #[inline]
     pub fn short_uuid(&self) -> u32 {
-        self.user_short_uuid
+        self.short_uuid
     }
 
     #[inline]
-    pub fn user(&self) -> &str {
-        // SAFETY: The username is always valid UTF-8, and the length is correct.
-        unsafe { std::str::from_utf8_unchecked(self.user.get_unchecked(..self.user_len as usize)) }
+    pub fn label(&self) -> &str {
+        // SAFETY: The label is always valid UTF-8, and the length is correct.
+        unsafe {
+            std::str::from_utf8_unchecked(self.label.get_unchecked(..self.label_len as usize))
+        }
     }
 }

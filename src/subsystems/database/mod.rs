@@ -335,7 +335,21 @@ impl Database {
         Ok(())
     }
 
+    pub async fn is_disk_full(&self) -> bool {
+        let disk_limit = self.data.read().await.disk;
+        disk_limit != 0
+            && self.disk_usage.load(std::sync::atomic::Ordering::Relaxed)
+                >= disk_limit as u64 * 1024 * 1024
+    }
+
     pub async fn start(&self) -> anyhow::Result<()> {
+        if self.is_disk_full().await {
+            anyhow::bail!(
+                "database {} is over its disk limit, cannot start",
+                self.uuid
+            );
+        }
+
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.start().await,
             None => anyhow::bail!("no container handle for database {}", self.uuid),

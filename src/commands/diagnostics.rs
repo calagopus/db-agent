@@ -41,13 +41,6 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 };
                 let config = config.load();
 
-                let include_endpoints = Confirm::with_theme(&ColorfulTheme::default())
-                    .with_prompt(
-                        "do you want to include endpoints (i.e. the bind address of your api)?",
-                    )
-                    .default(false)
-                    .interact()?;
-
                 let review_before_upload = Confirm::with_theme(&ColorfulTheme::default())
                     .with_prompt(
                         "do you want to review the collected data before uploading to pastes.dev?",
@@ -85,8 +78,8 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 write_line(&mut output, "api", &config.api.bind)?;
                 write_line(
                     &mut output,
-                    "api ssl enabled",
-                    &config.api.ssl.enabled.to_string(),
+                    "api tls enabled",
+                    &config.api.tls.enabled.to_string(),
                 )?;
                 writeln!(output)?;
                 write_line(&mut output, "socket directory", &config.socket_dir)?;
@@ -122,22 +115,6 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 match latest_log_lines(&config.log_dir, args.log_lines).await {
                     Ok(lines) => output.push_str(&lines),
                     Err(err) => writeln!(output, "failed to read log directory: {err}")?,
-                }
-
-                if !include_endpoints {
-                    output = output
-                        .replace(&config.api.bind, "{redacted}")
-                        .replace(&config.api.token, "{redacted}");
-
-                    if !config.api.ssl.cert.is_empty() {
-                        output = output.replace(&config.api.ssl.cert, "{redacted}");
-                    }
-                    if !config.api.ssl.key.is_empty() {
-                        output = output.replace(&config.api.ssl.key, "{redacted}");
-                    }
-                    if !config.database.url.is_empty() {
-                        output = output.replace(&config.database.url, "{redacted}");
-                    }
                 }
 
                 if review_before_upload {

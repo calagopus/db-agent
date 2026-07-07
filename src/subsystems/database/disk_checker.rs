@@ -20,7 +20,8 @@ pub async fn run(app_state: crate::routes::State, database: Weak<InnerDatabase>)
         let database = Database(database);
 
         {
-            let _permit = app_state.config.disk_check_semaphore.acquire().await;
+            let semaphore = app_state.config.disk_check_semaphore.load();
+            let _permit = semaphore.acquire().await;
             database.check_disk_usage().await;
         }
 

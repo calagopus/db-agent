@@ -213,14 +213,7 @@ nestify::nest! {
             pub ignore_upgrades: bool,
 
             #[serde(default)]
-            pub ssl: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct ApiSsl {
-                #[serde(default)]
-                pub enabled: bool,
-                #[serde(default)]
-                pub cert: String,
-                #[serde(default)]
-                pub key: String,
-            },
+            pub tls: Tls,
 
             #[serde(default)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
@@ -241,7 +234,7 @@ pub struct LogGuard(
 pub struct Config {
     inner: ArcSwap<InnerConfig>,
     pub path: String,
-    pub disk_check_semaphore: tokio::sync::Semaphore,
+    pub disk_check_semaphore: ArcSwap<tokio::sync::Semaphore>,
 }
 
 impl Config {
@@ -257,7 +250,9 @@ impl Config {
 
         Self::save_to(path, &inner)?;
 
-        let disk_check_semaphore = tokio::sync::Semaphore::new(inner.disk_check_concurrency.max(1));
+        let disk_check_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
+            inner.disk_check_concurrency.max(1),
+        ));
 
         Ok(Arc::new(Self {
             inner: ArcSwap::from_pointee(inner),
@@ -291,8 +286,9 @@ impl Config {
         let trusted = headers
             .get("X-Real-Ip-Token")
             .and_then(|token| token.to_str().ok())
-            .map(|token| token == cfg.api.token.as_str())
-            .unwrap_or(false)
+            .is_some_and(|token| {
+                constant_time_eq::constant_time_eq(token.as_bytes(), cfg.api.token.as_bytes())
+            })
             || cfg
                 .api
                 .trusted_proxies
@@ -351,8 +347,15 @@ impl Config {
     }
 
     pub fn replace(&self, new: InnerConfig) -> anyhow::Result<()> {
+        let old_concurrency = self.load().disk_check_concurrency.max(1);
+        let new_concurrency = new.disk_check_concurrency.max(1);
         Self::save_to(&self.path, &new)?;
         self.inner.store(Arc::new(new));
+
+        if new_concurrency != old_concurrency {
+            self.disk_check_semaphore
+                .store(Arc::new(tokio::sync::Semaphore::new(new_concurrency)));
+        }
 
         Ok(())
     }

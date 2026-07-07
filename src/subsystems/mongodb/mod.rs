@@ -3,11 +3,7 @@ use super::database::{
     identifier::{DbIdentifier, UserIdentifier},
     manager::DatabaseRouteManager,
 };
-use crate::{
-    config::Config,
-    subsystems::status::SubsystemConnections,
-    utils::{bad, is_silent_error},
-};
+use crate::{config::Config, subsystems::status::SubsystemConnections, utils::bad};
 use bson::doc;
 use protocol::{
     OP_MSG, OP_QUERY, binary, hello_doc, op_msg_doc, read_message, sasl_error, write_op_msg,
@@ -51,19 +47,13 @@ pub async fn run(
         if acceptor.is_some() { "on" } else { "off" }
     );
 
-    loop {
-        let (tcp, peer) = listener.accept().await?;
+    crate::utils::accept_loop(&listener, "mongodb", |tcp, peer| {
         let status = Arc::clone(&status);
         let routes = Arc::clone(&routes);
         let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle(tcp, status, routes, acceptor, peer).await
-                && !is_silent_error(&err)
-            {
-                tracing::error!("[{peer}] error: {err}");
-            }
-        });
-    }
+        async move { handle(tcp, status, routes, acceptor, peer).await }
+    })
+    .await
 }
 
 async fn handle(

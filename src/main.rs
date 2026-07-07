@@ -372,17 +372,17 @@ async fn main_rt() -> anyhow::Result<()> {
     let bind = state.config.load().api.bind.clone();
 
     if let Ok(address) = bind.parse::<SocketAddr>() {
-        if state.config.load().api.ssl.enabled {
-            tracing::info!("loading ssl certs");
+        if state.config.load().api.tls.enabled {
+            tracing::info!("loading tls certs");
 
             let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                state.config.load().api.ssl.cert.as_str(),
-                state.config.load().api.ssl.key.as_str(),
+                state.config.load().api.tls.cert.as_str(),
+                state.config.load().api.tls.key.as_str(),
             )
             .await
             {
                 Ok(config) => config,
-                Err(err) => exit_error!("failed to load SSL certificate and key: {:?}", err),
+                Err(err) => exit_error!("failed to load TLS certificate and key: {:?}", err),
             };
 
             tokio::spawn({
@@ -392,18 +392,18 @@ async fn main_rt() -> anyhow::Result<()> {
                 async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
-                        tracing::info!("reloading ssl certs");
+                        tracing::info!("reloading tls certs");
 
                         if let Err(err) = rustls_config
                             .reload_from_pem_file(
-                                config.load().api.ssl.cert.as_str(),
-                                config.load().api.ssl.key.as_str(),
+                                config.load().api.tls.cert.as_str(),
+                                config.load().api.tls.key.as_str(),
                             )
                             .await
                         {
-                            tracing::error!("failed to reload SSL certificate and key: {:?}", err);
+                            tracing::error!("failed to reload TLS certificate and key: {:?}", err);
                         } else {
-                            tracing::info!("ssl certs reloaded successfully");
+                            tracing::info!("tls certs reloaded successfully");
                         }
                     }
                 }
