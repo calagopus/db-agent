@@ -229,7 +229,7 @@ impl DockerExecutor {
     }
 }
 
-async fn find_running_container(docker: &bollard::Docker, name: &str) -> Option<String> {
+async fn find_container(docker: &bollard::Docker, name: &str) -> Option<String> {
     let containers = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
             all: true,
@@ -242,13 +242,7 @@ async fn find_running_container(docker: &bollard::Docker, name: &str) -> Option<
         .await
         .unwrap_or_default();
 
-    containers.into_iter().find_map(|c| {
-        if c.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING) {
-            c.id
-        } else {
-            None
-        }
-    })
+    containers.into_iter().find_map(|c| c.id)
 }
 
 struct DockerProcessHandle {
@@ -596,6 +590,11 @@ impl super::ContainerExecutor for DockerExecutor {
 
         self.pull_image(&data.image).await?;
         tokio::fs::create_dir_all(data_dir.join("volumes")).await?;
+        for mapping in &data.volumes {
+            let host_path = mapping.host_path(&self.app_config, data.uuid);
+            tokio::fs::create_dir_all(&host_path).await?;
+            std::os::unix::fs::chown(&host_path, Some(data.image_uid), Some(data.image_gid))?;
+        }
 
         let socket_dir = self.app_config.socket_path(data.uuid);
         tokio::fs::create_dir_all(&socket_dir).await?;
@@ -626,8 +625,7 @@ impl super::ContainerExecutor for DockerExecutor {
         &self,
         database: &super::super::Database,
     ) -> Result<Option<Arc<dyn super::ProcessHandle>>, anyhow::Error> {
-        let Some(container_id) =
-            find_running_container(&self.docker, &database.uuid.to_string()).await
+        let Some(container_id) = find_container(&self.docker, &database.uuid.to_string()).await
         else {
             return Ok(None);
         };

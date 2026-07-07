@@ -1,4 +1,4 @@
-use super::protocol::{binary, op_msg_doc, read_message, write_op_msg};
+use super::protocol::{binary, op_msg_doc, read_message, write_op_msg_request};
 use crate::utils::bad;
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use bson::doc;
@@ -94,7 +94,7 @@ pub async fn backend_auth(
     let mut be = UnixStream::connect(socket).await?;
 
     let hello = doc! { "ismaster": 1, "$db": "admin" };
-    write_op_msg(&mut be, 1, &hello).await?;
+    write_op_msg_request(&mut be, 1, &hello).await?;
     let _ = read_message(&mut be).await?;
 
     let cnonce = B64.encode(random_bytes::<18>());
@@ -106,7 +106,7 @@ pub async fn backend_auth(
         "payload": binary(client_first.as_bytes()),
         "$db": db,
     };
-    write_op_msg(&mut be, 2, &start).await?;
+    write_op_msg_request(&mut be, 2, &start).await?;
 
     let (_, _, body) = read_message(&mut be).await?;
     let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
@@ -146,7 +146,7 @@ pub async fn backend_auth(
         "payload": binary(client_final.as_bytes()),
         "$db": db,
     };
-    write_op_msg(&mut be, 3, &cont).await?;
+    write_op_msg_request(&mut be, 3, &cont).await?;
 
     let (_, _, body) = read_message(&mut be).await?;
     let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
@@ -159,7 +159,8 @@ pub async fn backend_auth(
 fn field(s: &str, prefix: &str) -> Option<String> {
     s.split(',')
         .find(|p| p.starts_with(prefix))
-        .map(|p| p[prefix.len()..].to_string())
+        .and_then(|p| p.get(prefix.len()..))
+        .map(str::to_string)
 }
 
 fn escape(s: &str) -> String {

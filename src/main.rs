@@ -46,17 +46,46 @@ fn full_version() -> String {
     }
 }
 
+#[inline(always)]
+#[cold]
+fn cold_path() {}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn likely(b: bool) -> bool {
+    if b {
+        true
+    } else {
+        cold_path();
+        false
+    }
+}
+
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold_path();
+        true
+    } else {
+        false
+    }
+}
+
 macro_rules! exit_error {
-    ($msg:expr) => {{
-        use ::colored::Colorize;
-        eprintln!("{}", $msg.red());
-        std::process::exit(1);
-    }};
-    ($fmt:expr, $($arg:tt)*) => {{
-        use ::colored::Colorize;
-        eprintln!("{}", format!($fmt, $($arg)*).red());
-        std::process::exit(1);
-    }};
+    ($msg:expr) => {
+        {
+            use ::colored::Colorize;
+            eprintln!("{}", $msg.red());
+            std::process::exit(1);
+        }
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        {
+            use ::colored::Colorize;
+            eprintln!("{}", format!($fmt, $($arg)*).red());
+            std::process::exit(1);
+        }
+    };
 }
 
 fn spawn_subsystem(
@@ -143,7 +172,7 @@ async fn main_rt() -> anyhow::Result<()> {
     let _log_guard = config.setup_logging(debug)?;
 
     if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        exit_error!("failed to install rustls crypto provider: {:?}", err);
+        exit_error!("Failed to install rustls crypto provider: {:?}", err);
     }
 
     tracing::info!("db-agent {} loaded from {}", full_version(), config_path);
@@ -276,7 +305,7 @@ async fn main_rt() -> anyhow::Result<()> {
         ));
 
     if let Err(err) = container_executor.boot().await {
-        exit_error!("failed to boot container executor: {:?}", err);
+        exit_error!("failed to boot server executor: {:?}", err);
     }
 
     let state = Arc::new(routes::AppState {
@@ -416,11 +445,18 @@ async fn main_rt() -> anyhow::Result<()> {
                 state.start_time.elapsed().as_millis()
             );
 
-            if let Err(err) = axum_server::bind_rustls(address, rustls_config)
+            match axum_server::bind_rustls(address, rustls_config)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {
-                exit_error!("failed to start https server: {:?}", err);
+                Ok(_) => {}
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        exit_error!("failed to start https server ({} already in use)", address);
+                    } else {
+                        exit_error!("failed to start https server: {:?}", err);
+                    }
+                }
             }
         } else {
             tracing::info!(
@@ -430,21 +466,29 @@ async fn main_rt() -> anyhow::Result<()> {
                 state.start_time.elapsed().as_millis()
             );
 
-            let listener = match tokio::net::TcpListener::bind(address).await {
-                Ok(listener) => listener,
-                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-                    exit_error!("failed to bind http server ({address} already in use)")
-                }
-                Err(err) => exit_error!("failed to bind http server: {:?}", err),
-            };
-
-            if let Err(err) = axum::serve(
-                listener,
+            match axum::serve(
+                match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::AddrInUse {
+                            exit_error!("failed to start http server ({} already in use)", address);
+                        } else {
+                            exit_error!("failed to start http server: {:?}", err);
+                        }
+                    }
+                },
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
             {
-                exit_error!("failed to start http server: {:?}", err);
+                Ok(_) => {}
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        exit_error!("failed to start http server ({} already in use)", address);
+                    } else {
+                        exit_error!("failed to start http server: {:?}", err);
+                    }
+                }
             }
         }
     } else {
@@ -471,11 +515,11 @@ async fn main_rt() -> anyhow::Result<()> {
             let _ = tokio::fs::remove_file(&bind).await;
             let listener = match tokio::net::UnixListener::bind(&bind) {
                 Ok(listener) => listener,
-                Err(err) => exit_error!("failed to bind unix socket {bind}: {:?}", err),
+                Err(err) => exit_error!("failed to bind to unix socket ({}): {:?}", bind, err),
             };
 
             if let Err(err) = axum::serve(listener, router.into_make_service()).await {
-                exit_error!("failed to start http server: {:?}", err);
+                exit_error!("failed to start http server ({}): {:?}", bind, err);
             }
         }
         #[cfg(not(unix))]

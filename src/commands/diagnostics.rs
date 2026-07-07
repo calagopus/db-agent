@@ -202,7 +202,7 @@ async fn latest_log_lines(log_dir: &str, count: usize) -> anyhow::Result<String>
     let start = lines.len().saturating_sub(count);
 
     let mut out = String::new();
-    for line in &lines[start..] {
+    for line in lines.iter().skip(start) {
         out.push_str(&strip_ansi(line));
         out.push('\n');
     }

@@ -2,7 +2,7 @@ use super::database::{DatabaseType, identifier::UserIdentifier, manager::Databas
 use crate::{config::Config, subsystems::status::SubsystemConnections};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixStream},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
@@ -87,21 +87,23 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    let cmd = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+    let Some(first_arg) = args.first() else {
+        return Ok(());
+    };
+    let cmd = String::from_utf8_lossy(first_arg).to_ascii_uppercase();
     let (user, password, forward): (String, Vec<u8>, Option<Vec<u8>>) = match cmd.as_str() {
         "AUTH" => {
-            let (user, password) = if args.len() >= 3 {
-                (
-                    String::from_utf8_lossy(&args[1]).into_owned(),
-                    args[2].clone(),
-                )
-            } else if args.len() == 2 {
-                ("default".to_string(), args[1].clone())
-            } else {
-                client
-                    .write_all(b"-ERR wrong number of arguments for 'auth' command\r\n")
-                    .await?;
-                return Ok(());
+            let (user, password) = match args.as_slice() {
+                [_, user, password, ..] => {
+                    (String::from_utf8_lossy(user).into_owned(), password.clone())
+                }
+                [_, password] => ("default".to_string(), password.clone()),
+                _ => {
+                    client
+                        .write_all(b"-ERR wrong number of arguments for 'auth' command\r\n")
+                        .await?;
+                    return Ok(());
+                }
             };
             (user, password, None)
         }
@@ -139,24 +141,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    let backend_user = user_id.map(|id| id.to_string()).unwrap_or(user);
     let mut backend = UnixStream::connect(&creds.database.get_socket_path().await).await?;
-    backend
-        .write_all(&resp::encode_command(&[
-            b"AUTH".to_vec(),
-            backend_user.into_bytes(),
-            creds.password.as_bytes().to_vec(),
-        ]))
-        .await?;
-    match resp::read_command(&mut backend).await? {
-        Some((_, raw)) if raw.first() == Some(&b'+') => {}
-        _ => {
-            client
-                .write_all(b"-ERR backend authentication failed\r\n")
-                .await?;
-            return Ok(());
-        }
-    }
 
     match forward {
         Some(bytes) => backend.write_all(&bytes).await?,
@@ -164,7 +149,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let _guard = user_id.map(|id| status.connect(id, None));
-    let (c2b, b2c) = copy_bidirectional(&mut client, &mut backend).await?;
+    let (c2b, b2c) = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
     tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }

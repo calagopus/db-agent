@@ -76,11 +76,25 @@ pub async fn write_op_msg<S: AsyncRead + AsyncWrite + Unpin>(
     response_to: i32,
     doc: &Document,
 ) -> std::io::Result<()> {
+    let body = encode_op_msg(doc)?;
+    write_header(s, 0, response_to, OP_MSG, &body).await
+}
+
+pub async fn write_op_msg_request<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    request_id: i32,
+    doc: &Document,
+) -> std::io::Result<()> {
+    let body = encode_op_msg(doc)?;
+    write_header(s, request_id, 0, OP_MSG, &body).await
+}
+
+fn encode_op_msg(doc: &Document) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&0u32.to_le_bytes()); // flagBits
     body.push(0x00); // section kind
     doc.to_writer(&mut body).map_err(|_| bad("bson encode"))?;
-    write_header(s, response_to, OP_MSG, &body).await
+    Ok(body)
 }
 
 pub async fn write_op_reply<S: AsyncRead + AsyncWrite + Unpin>(
@@ -94,11 +108,12 @@ pub async fn write_op_reply<S: AsyncRead + AsyncWrite + Unpin>(
     body.extend_from_slice(&0i32.to_le_bytes()); // startingFrom
     body.extend_from_slice(&1i32.to_le_bytes()); // numberReturned
     doc.to_writer(&mut body).map_err(|_| bad("bson encode"))?;
-    write_header(s, response_to, OP_REPLY, &body).await
+    write_header(s, 0, response_to, OP_REPLY, &body).await
 }
 
 async fn write_header<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
+    request_id: i32,
     response_to: i32,
     opcode: i32,
     body: &[u8],
@@ -106,7 +121,7 @@ async fn write_header<S: AsyncRead + AsyncWrite + Unpin>(
     let mlen = (16 + body.len()) as i32;
     let mut hdr = Vec::with_capacity(16);
     hdr.extend_from_slice(&mlen.to_le_bytes());
-    hdr.extend_from_slice(&0i32.to_le_bytes()); // requestID
+    hdr.extend_from_slice(&request_id.to_le_bytes());
     hdr.extend_from_slice(&response_to.to_le_bytes());
     hdr.extend_from_slice(&opcode.to_le_bytes());
     s.write_all(&hdr).await?;

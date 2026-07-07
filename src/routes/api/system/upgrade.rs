@@ -98,7 +98,7 @@ mod post {
         loop {
             match file.read(&mut buffer).await? {
                 0 => break,
-                bytes_read => hasher.update(&buffer[..bytes_read]),
+                bytes_read => hasher.update(buffer.get(..bytes_read).unwrap_or_default()),
             }
         }
         drop(file);

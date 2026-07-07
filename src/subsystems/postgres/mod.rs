@@ -3,7 +3,11 @@ use super::database::{
     identifier::{DbIdentifier, UserIdentifier},
     manager::DatabaseRouteManager,
 };
-use crate::{config::Config, subsystems::status::SubsystemConnections, utils::bad};
+use crate::{
+    config::Config,
+    subsystems::status::SubsystemConnections,
+    utils::{SafeSliceExt, bad},
+};
 use protocol::Params;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
@@ -87,7 +91,10 @@ async fn negotiate(
             },
             protocol::GSS_REQUEST => tcp.write_all(b"N").await?,
             protocol::PROTOCOL_30 => {
-                return Ok((Conn::Plain(tcp), Some(protocol::parse_params(&body[4..]))));
+                return Ok((
+                    Conn::Plain(tcp),
+                    Some(protocol::parse_params(body.get_slice(4..)?)),
+                ));
             }
             other => return Err(bad(&format!("unsupported startup code {other}"))),
         }

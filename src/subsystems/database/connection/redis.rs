@@ -46,43 +46,23 @@ impl RedisConnection {
     async fn conn(&self) -> anyhow::Result<redis::aio::MultiplexedConnection> {
         Ok(self.client.get_multiplexed_async_connection().await?)
     }
-
-    async fn set_user(&self, user: &UserIdentifier, password: &str) -> anyhow::Result<()> {
-        redis::cmd("ACL")
-            .arg("SETUSER")
-            .arg(user.to_string())
-            .arg("reset")
-            .arg("on")
-            .arg(format!(">{password}"))
-            .arg("~*")
-            .arg("&*")
-            .arg("+@all")
-            .exec_async(&mut self.conn().await?)
-            .await?;
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
 impl DatabaseConnection for RedisConnection {
-    async fn create_user(&self, user: &UserIdentifier, password: &str) -> anyhow::Result<()> {
-        self.set_user(user, password).await
+    async fn create_user(&self, _user: &UserIdentifier, _password: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn update_user_password(
         &self,
-        user: &UserIdentifier,
-        password: &str,
+        _user: &UserIdentifier,
+        _password: &str,
     ) -> anyhow::Result<()> {
-        self.set_user(user, password).await
+        Ok(())
     }
 
-    async fn delete_user(&self, user: &UserIdentifier) -> anyhow::Result<()> {
-        redis::cmd("ACL")
-            .arg("DELUSER")
-            .arg(user.to_string())
-            .exec_async(&mut self.conn().await?)
-            .await?;
+    async fn delete_user(&self, _user: &UserIdentifier) -> anyhow::Result<()> {
         Ok(())
     }
 

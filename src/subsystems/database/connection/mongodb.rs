@@ -23,9 +23,10 @@ impl MongodbConnection {
         })
     }
 
-    async fn run_admin(&self, command: Document) -> anyhow::Result<()> {
+    async fn run_user_db(&self, user: &UserIdentifier, command: Document) -> anyhow::Result<()> {
+        let db = DbIdentifier::from_parts(user.short_uuid(), user.label())?;
         self.client
-            .database(ADMIN_DATABASE)
+            .database(&db.to_string())
             .run_command(command)
             .await?;
         Ok(())
@@ -35,11 +36,15 @@ impl MongodbConnection {
 #[async_trait::async_trait]
 impl DatabaseConnection for MongodbConnection {
     async fn create_user(&self, user: &UserIdentifier, password: &str) -> anyhow::Result<()> {
-        self.run_admin(doc! {
-            "createUser": user.to_string(),
-            "pwd": password,
-            "roles": [],
-        })
+        let db = DbIdentifier::from_parts(user.short_uuid(), user.label())?;
+        self.run_user_db(
+            user,
+            doc! {
+                "createUser": user.to_string(),
+                "pwd": password,
+                "roles": [{ "role": "dbOwner", "db": db.to_string() }],
+            },
+        )
         .await
     }
 
@@ -48,27 +53,27 @@ impl DatabaseConnection for MongodbConnection {
         user: &UserIdentifier,
         password: &str,
     ) -> anyhow::Result<()> {
-        self.run_admin(doc! {
-            "updateUser": user.to_string(),
-            "pwd": password,
-        })
+        self.run_user_db(
+            user,
+            doc! {
+                "updateUser": user.to_string(),
+                "pwd": password,
+            },
+        )
         .await
     }
 
     async fn delete_user(&self, user: &UserIdentifier) -> anyhow::Result<()> {
-        self.run_admin(doc! { "dropUser": user.to_string() }).await
+        self.run_user_db(user, doc! { "dropUser": user.to_string() })
+            .await
     }
 
     async fn create_database(
         &self,
-        db: &DbIdentifier,
-        owner: &UserIdentifier,
+        _db: &DbIdentifier,
+        _owner: &UserIdentifier,
     ) -> anyhow::Result<()> {
-        self.run_admin(doc! {
-            "grantRolesToUser": owner.to_string(),
-            "roles": [{ "role": "dbOwner", "db": db.to_string() }],
-        })
-        .await
+        Ok(())
     }
 
     async fn delete_database(&self, db: &DbIdentifier) -> anyhow::Result<()> {

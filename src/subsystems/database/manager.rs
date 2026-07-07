@@ -70,6 +70,18 @@ impl DatabaseManager {
     pub async fn delete_database(&self, database: &super::Database) -> anyhow::Result<()> {
         database.destroy_container().await?;
 
+        let config = &database.app_state.config;
+        for dir in [
+            config.socket_path(database.uuid),
+            config.data_path(database.uuid),
+        ] {
+            if let Err(err) = tokio::fs::remove_dir_all(&dir).await
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(database = %database.uuid, "failed to remove {}: {err}", dir.display());
+            }
+        }
+
         sqlx::query("DELETE FROM databases WHERE uuid = ?")
             .bind(database.uuid)
             .execute(database.app_state.database.write())

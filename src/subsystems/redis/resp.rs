@@ -18,8 +18,14 @@ pub async fn read_command<S: AsyncRead + Unpin>(
     raw.push(first);
 
     if first != b'*' {
-        read_line(s, &mut raw).await?;
-        return Ok(Some((Vec::new(), raw)));
+        let mut line = read_line(s, &mut raw).await?;
+        line.insert(0, first);
+        let args = line
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|a| !a.is_empty())
+            .map(|a| a.to_vec())
+            .collect();
+        return Ok(Some((args, raw)));
     }
 
     let count = parse_int(&read_line(s, &mut raw).await?)?;
@@ -118,11 +124,11 @@ pub fn extract_hello_password(args: &[Vec<u8>]) -> Option<Vec<u8>> {
 pub fn strip_hello_auth(args: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
-    while i < args.len() {
-        if args[i].as_slice().eq_ignore_ascii_case(b"AUTH") {
+    while let Some(arg) = args.get(i) {
+        if arg.as_slice().eq_ignore_ascii_case(b"AUTH") {
             i += 3; // skip AUTH + username + password
         } else {
-            out.push(args[i].clone());
+            out.push(arg.clone());
             i += 1;
         }
     }

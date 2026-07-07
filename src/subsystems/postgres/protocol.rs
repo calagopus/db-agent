@@ -1,4 +1,4 @@
-use crate::utils::bad;
+use crate::utils::{SafeSliceExt, bad};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -25,11 +25,14 @@ pub async fn read_startup_message<S: AsyncRead + Unpin>(stream: &mut S) -> std::
     if startup_code(&body) != PROTOCOL_30 {
         return Err(bad("expected StartupMessage after TLS"));
     }
-    Ok(parse_params(&body[4..]))
+    Ok(parse_params(body.get_slice(4..)?))
 }
 
 pub fn startup_code(body: &[u8]) -> i32 {
-    i32::from_be_bytes([body[0], body[1], body[2], body[3]])
+    match body {
+        [a, b, c, d, ..] => i32::from_be_bytes([*a, *b, *c, *d]),
+        _ => 0,
+    }
 }
 
 pub fn parse_params(mut buf: &[u8]) -> Params {
@@ -46,8 +49,8 @@ pub fn parse_params(mut buf: &[u8]) -> Params {
 
 fn next_cstr(buf: &mut &[u8]) -> Option<String> {
     let end = buf.iter().position(|&b| b == 0)?;
-    let s = String::from_utf8_lossy(&buf[..end]).into_owned();
-    *buf = &buf[end + 1..];
+    let s = String::from_utf8_lossy(buf.get(..end)?).into_owned();
+    *buf = buf.get(end + 1..).unwrap_or_default();
     Some(s)
 }
 

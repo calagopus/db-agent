@@ -3,7 +3,11 @@ use super::database::{
     identifier::{DbIdentifier, UserIdentifier},
     manager::DatabaseRouteManager,
 };
-use crate::{config::Config, subsystems::status::SubsystemConnections, utils::bad};
+use crate::{
+    config::Config,
+    subsystems::status::SubsystemConnections,
+    utils::{SafeSliceExt, SafeSliceMutExt, bad, get_array},
+};
 use protocol::{read_packet, write_packet};
 use rand::Rng;
 use std::{net::SocketAddr, path::Path, sync::Arc};
@@ -65,7 +69,7 @@ async fn handle(
     .await?;
 
     let (seq, first) = read_packet(&mut tcp).await?;
-    let caps = u32::from_le_bytes([first[0], first[1], first[2], first[3]]);
+    let caps = u32::from_le_bytes(get_array(&first, 0)?);
 
     if ssl_offered && caps & protocol::CLIENT_SSL != 0 {
         tracing::debug!("[{peer}] connection (tls)");
@@ -192,7 +196,7 @@ async fn backend_auth(
             Some(0x00) => return Ok(be),
             Some(0xff) => {
                 let msg = if r.len() > 9 {
-                    String::from_utf8_lossy(&r[9..]).into_owned()
+                    String::from_utf8_lossy(r.get_slice(9..)?).into_owned()
                 } else {
                     "backend error".into()
                 };
@@ -204,7 +208,9 @@ async fn backend_auth(
                 let _plugin = protocol::read_cstr(&r, &mut i)?;
                 let mut new_scramble = [0; 20];
                 let avail = r.len().saturating_sub(i).min(20);
-                new_scramble[..avail].copy_from_slice(&r[i..i + avail]);
+                new_scramble
+                    .get_slice_mut(..avail)?
+                    .copy_from_slice(r.get_slice(i..i + avail)?);
                 let token = auth::native_token(&new_scramble, password.as_bytes());
                 write_packet(&mut be, rseq + 1, &token).await?;
             }

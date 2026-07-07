@@ -15,10 +15,16 @@ impl<'a> VolumeMappingEntry<'a> {
         config: &crate::config::Config,
         database_uuid: uuid::Uuid,
     ) -> std::path::PathBuf {
-        config
-            .data_path(database_uuid)
-            .join("volumes")
-            .join(self.host_name)
+        let mut path = config.data_path(database_uuid).join("volumes");
+        path.extend(
+            std::path::Path::new(self.host_name)
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(p) => Some(p),
+                    _ => None,
+                }),
+        );
+        path
     }
 
     pub fn container_path(&self) -> &std::path::Path {
@@ -236,8 +242,6 @@ impl StoredDatabaseUpdate {
         database: &crate::database::Database,
         data: &mut StoredDatabase,
     ) -> anyhow::Result<()> {
-        // Stage mutations on a clone so the in-memory state only diverges
-        // from disk once the UPDATE has actually succeeded.
         let mut new_data = data.clone();
 
         if let Some(suspended) = self.suspended {

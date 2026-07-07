@@ -1,4 +1,4 @@
-use crate::utils::bad;
+use crate::utils::{SafeSliceExt, bad, get_array};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
@@ -99,7 +99,7 @@ pub fn parse_handshake_response(p: &[u8]) -> std::io::Result<HandshakeResponse> 
     if p.len() < 32 {
         return Err(bad("short handshake response"));
     }
-    let caps = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let caps = u32::from_le_bytes(get_array(p, 0)?);
     let mut i = 32;
     let user = read_cstr(p, &mut i)?;
     let auth_response = if caps & CLIENT_PLUGIN_AUTH_LENENC != 0 {
@@ -137,12 +137,12 @@ pub fn parse_server_handshake(p: &[u8]) -> std::io::Result<([u8; 20], String)> {
     let mut scramble = [0; 20];
     scramble[..8].copy_from_slice(p.get(i..i + 8).ok_or_else(|| bad("eof"))?);
     i += 8 + 1; // part1 + filler
-    let cap_lo = u16::from_le_bytes([p[i], p[i + 1]]);
+    let cap_lo = u16::from_le_bytes(get_array(p, i)?);
     i += 2 + 1 + 2; // caps_lo + charset + status
-    let cap_hi = u16::from_le_bytes([p[i], p[i + 1]]);
+    let cap_hi = u16::from_le_bytes(get_array(p, i)?);
     i += 2;
     let caps = ((cap_hi as u32) << 16) | cap_lo as u32;
-    let adlen = p[i] as usize;
+    let adlen = *p.get(i).ok_or_else(|| bad("eof"))? as usize;
     i += 1 + 10; // auth-data-len + reserved
     scramble[8..20].copy_from_slice(p.get(i..i + 12).ok_or_else(|| bad("eof"))?);
     i += if adlen > 8 { adlen - 8 } else { 13 };
@@ -156,23 +156,23 @@ pub fn parse_server_handshake(p: &[u8]) -> std::io::Result<([u8; 20], String)> {
 
 pub fn read_cstr(p: &[u8], i: &mut usize) -> std::io::Result<String> {
     let start = *i;
-    while *i < p.len() && p[*i] != 0 {
+    while p.get(*i).is_some_and(|&b| b != 0) {
         *i += 1;
     }
     if *i >= p.len() {
         return Err(bad("unterminated string"));
     }
-    let s = String::from_utf8_lossy(&p[start..*i]).into_owned();
+    let s = String::from_utf8_lossy(p.get_slice(start..*i)?).into_owned();
     *i += 1;
     Ok(s)
 }
 
 fn read_cstr_bytes(p: &[u8], i: &mut usize) -> std::io::Result<Vec<u8>> {
     let start = *i;
-    while *i < p.len() && p[*i] != 0 {
+    while p.get(*i).is_some_and(|&b| b != 0) {
         *i += 1;
     }
-    let v = p[start..*i].to_vec();
+    let v = p.get_slice(start..*i)?.to_vec();
     *i += 1;
     Ok(v)
 }
@@ -189,18 +189,17 @@ fn read_lenenc(p: &[u8], i: &mut usize) -> std::io::Result<u64> {
     Ok(match first {
         n if n < 0xfb => n as u64,
         0xfc => {
-            let v = u16::from_le_bytes([p[*i], p[*i + 1]]) as u64;
+            let v = u16::from_le_bytes(get_array(p, *i)?) as u64;
             *i += 2;
             v
         }
         0xfd => {
-            let v = u32::from_le_bytes([p[*i], p[*i + 1], p[*i + 2], 0]) as u64;
+            let [b0, b1, b2] = get_array(p, *i)?;
             *i += 3;
-            v
+            u32::from_le_bytes([b0, b1, b2, 0]) as u64
         }
         _ => {
-            let mut b = [0; 8];
-            b.copy_from_slice(&p[*i..*i + 8]);
+            let b: [u8; 8] = get_array(p, *i)?;
             *i += 8;
             u64::from_le_bytes(b)
         }

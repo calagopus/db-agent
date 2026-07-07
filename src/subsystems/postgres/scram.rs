@@ -1,5 +1,5 @@
 use super::protocol::{read_msg, write_msg};
-use crate::utils::bad;
+use crate::utils::{SafeSliceExt, bad, get_array};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, KeyInit, Mac};
 use postgres_protocol::{
@@ -29,7 +29,7 @@ pub async fn authenticate_client<S: AsyncRead + AsyncWrite + Unpin>(
         .iter()
         .position(|&b| b == 0)
         .ok_or_else(|| bad("no mechanism"))?;
-    let client_first = String::from_utf8_lossy(&body[mech_end + 5..]).into_owned();
+    let client_first = String::from_utf8_lossy(body.get_slice(mech_end + 5..)?).into_owned();
     let client_first_bare = bare_after_gs2(&client_first);
     let client_nonce = field(&client_first_bare, "r=").ok_or_else(|| bad("no client nonce"))?;
 
@@ -86,7 +86,7 @@ fn bare_after_gs2(client_first: &str) -> String {
         if c == ',' {
             commas += 1;
             if commas == 2 {
-                return client_first[i + 1..].to_string();
+                return client_first.get(i + 1..).unwrap_or_default().to_string();
             }
         }
     }
@@ -96,7 +96,8 @@ fn bare_after_gs2(client_first: &str) -> String {
 fn field(s: &str, prefix: &str) -> Option<String> {
     s.split(',')
         .find(|p| p.starts_with(prefix))
-        .map(|p| p[prefix.len()..].to_string())
+        .and_then(|p| p.get(prefix.len()..))
+        .map(str::to_string)
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -142,7 +143,7 @@ pub async fn authenticate_backend<
     loop {
         let (tag, body) = read_msg(backend).await?;
         match tag {
-            b'R' => match i32::from_be_bytes([body[0], body[1], body[2], body[3]]) {
+            b'R' => match i32::from_be_bytes(get_array(&body, 0)?) {
                 0 => {}
                 10 => {
                     let s = ScramSha256::new(password.as_bytes(), ChannelBinding::unsupported());
@@ -155,7 +156,7 @@ pub async fn authenticate_backend<
                     let s = scram
                         .as_mut()
                         .ok_or_else(|| bad("unexpected SASLContinue"))?;
-                    s.update(&body[4..])?;
+                    s.update(body.get_slice(4..)?)?;
                     let mut buf = bytes::BytesMut::new();
                     sasl_response(s.message(), &mut buf)?;
                     backend.write_all(&buf).await?;
@@ -163,7 +164,7 @@ pub async fn authenticate_backend<
                 12 => scram
                     .as_mut()
                     .ok_or_else(|| bad("unexpected SASLFinal"))?
-                    .finish(&body[4..])?,
+                    .finish(body.get_slice(4..)?)?,
                 3 => {
                     let mut buf = bytes::BytesMut::new();
                     password_message(password.as_bytes(), &mut buf)?;
