@@ -1,0 +1,37 @@
+name: Feature Request
+description: Suggest a new feature or improvement for db-agent
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before submitting, please search existing issues to see if this has already been suggested.
+        For panel related bugs, create an issue in [calagopus/panel](https://github.com/calagopus/panel/issues) instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: A clear description of the problem or limitation you're facing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear description of the feature or change you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds you've considered.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other context, mockups, or screenshots about the feature request.

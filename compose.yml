@@ -1,0 +1,21 @@
+services:
+  db-agent:
+    image: ghcr.io/calagopus/db-agent:latest
+    restart: unless-stopped
+    environment:
+      TZ: "Europe/Berlin"
+    volumes:
+      - "./config.yml:/etc/calagopus/db-agent/config.yml"
+      - "./certs:/etc/calagopus/db-agent/certs:ro"
+    command: ["/etc/calagopus/db-agent/config.yml"]
+    ports:
+      # PostgreSQL proxy (config: postgresql.bind)
+      - 5432:5432
+      # MariaDB/MySQL proxy (config: mariadb.bind)
+      - 3306:3306
+      # MongoDB proxy (config: mongodb.bind)
+      - 27017:27017
+      # Redis proxy (config: redis.bind)
+      - 6379:6379
+      # Management API (config: api.bind)
+      - 8090:8090
