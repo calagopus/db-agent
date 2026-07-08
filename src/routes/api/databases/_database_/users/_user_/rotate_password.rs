@@ -4,7 +4,10 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::{GetDatabase, users::_user_::GetUser},
+        routes::{
+            ApiError,
+            api::databases::_database_::{GetDatabase, users::_user_::GetUser},
+        },
     };
     use serde::Serialize;
     use utoipa::ToSchema;
@@ -16,6 +19,7 @@ mod post {
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
         ("user" = uuid::Uuid, description = "The database user uuid"),

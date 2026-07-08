@@ -7,45 +7,27 @@ mod utilization;
 mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::{GetState, Paginated, PaginationParams},
+        routes::GetState,
         subsystems::database::ApiDatabase,
     };
-    use axum::extract::Query;
     use serde::Serialize;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
     struct Response {
-        #[schema(inline)]
-        databases: Paginated<ApiDatabase>,
+        databases: Vec<ApiDatabase>,
     }
 
-    #[utoipa::path(get, path = "/", params(PaginationParams), responses(
+    #[utoipa::path(get, path = "/", responses(
         (status = OK, body = inline(Response)),
     ))]
-    pub async fn route(
-        state: GetState,
-        Query(pagination): Query<PaginationParams>,
-    ) -> ApiResponseResult {
-        let (page, per_page, offset) = pagination.resolve();
-
-        let databases = state.database_manager.get_databases().await;
-        let total = databases.len() as u64;
-
-        let mut data = Vec::new();
-        for database in databases.iter().skip(offset).take(per_page as usize) {
-            data.push(database.to_api_response().await);
+    pub async fn route(state: GetState) -> ApiResponseResult {
+        let mut databases = Vec::new();
+        for database in state.database_manager.get_databases().await.iter() {
+            databases.push(database.to_api_response().await);
         }
 
-        ApiResponse::new_serialized(Response {
-            databases: Paginated {
-                data,
-                total,
-                page,
-                per_page,
-            },
-        })
-        .ok()
+        ApiResponse::new_serialized(Response { databases }).ok()
     }
 }
 

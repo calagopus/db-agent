@@ -3,10 +3,37 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub mod _user_;
 
+mod get {
+    use crate::{
+        response::{ApiResponse, ApiResponseResult},
+        routes::{ApiError, api::databases::_database_::GetDatabase},
+    };
+    use serde::Serialize;
+    use utoipa::ToSchema;
+
+    #[derive(ToSchema, Serialize)]
+    struct Response {
+        users: Vec<crate::database::data::StoredDatabaseUser>,
+    }
+
+    #[utoipa::path(get, path = "/", responses(
+        (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
+    ), params(
+        ("database" = uuid::Uuid, description = "The database uuid"),
+    ))]
+    pub async fn route(database: GetDatabase) -> ApiResponseResult {
+        ApiResponse::new_serialized(Response {
+            users: database.get_users().await?,
+        })
+        .ok()
+    }
+}
+
 mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::GetDatabase,
+        routes::{ApiError, api::databases::_database_::GetDatabase},
     };
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
@@ -25,6 +52,7 @@ mod post {
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
     ), request_body = inline(Payload))]
@@ -50,6 +78,7 @@ mod post {
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .nest("/{user}", _user_::router(state))
+        .routes(routes!(get::route))
         .routes(routes!(post::route))
         .with_state(state.clone())
 }

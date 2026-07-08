@@ -30,7 +30,7 @@ mod post {
 
     #[utoipa::path(post, path = "/", responses(
         (status = ACCEPTED, body = inline(Response)),
-        (status = CONFLICT, body = inline(ApiError)),
+        (status = CONFLICT, body = ApiError),
     ), request_body = inline(Payload))]
     pub async fn route(
         state: GetState,

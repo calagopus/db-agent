@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::GetDatabase,
+        routes::{ApiError, api::databases::_database_::GetDatabase},
         subsystems::database::{connection::QueryResult, identifier::DbIdentifier},
     };
     use axum::http::StatusCode;
@@ -24,6 +24,7 @@ mod post {
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
     ), request_body = inline(Payload))]

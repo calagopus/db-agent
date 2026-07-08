@@ -154,6 +154,19 @@ impl Database {
         Ok(())
     }
 
+    pub async fn get_users(
+        &self,
+    ) -> anyhow::Result<Vec<crate::database::data::StoredDatabaseUser>> {
+        Ok(
+            sqlx::query_as::<_, crate::database::data::StoredDatabaseUser>(
+                "SELECT * FROM database_users WHERE database_uuid = ?",
+            )
+            .bind(self.uuid)
+            .fetch_all(self.app_state.database.read())
+            .await?,
+        )
+    }
+
     pub async fn get_user(
         &self,
         uuid: uuid::Uuid,

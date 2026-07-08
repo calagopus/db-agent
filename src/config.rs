@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 use tracing_subscriber::fmt::writer::MakeWriterExt;
+use utoipa::ToSchema;
 
 fn tls_cert() -> String {
     "cert.pem".to_string()
@@ -93,7 +94,7 @@ fn docker_log_config_config() -> std::collections::BTreeMap<String, String> {
     ])
 }
 
-#[derive(Deserialize, Serialize, DefaultFromSerde)]
+#[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
 pub struct Tls {
     #[serde(default)]
     pub enabled: bool,
@@ -104,7 +105,7 @@ pub struct Tls {
 }
 
 nestify::nest! {
-    #[derive(Deserialize, Serialize, DefaultFromSerde)]
+    #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
     pub struct InnerConfig {
         #[serde(default)]
         pub debug: bool,
@@ -125,47 +126,56 @@ nestify::nest! {
         pub disk_check_concurrency: usize,
 
         #[serde(default)]
-        pub postgres: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct Postgres {
+        #[schema(inline)]
+        pub postgres: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Postgres {
             #[serde(default = "postgres_enabled")]
             pub enabled: bool,
             #[serde(default = "postgres_bind")]
+            #[schema(value_type = String)]
             pub bind: SocketAddr,
             #[serde(default)]
             pub tls: Tls,
         },
 
         #[serde(default)]
-        pub mariadb: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct Mariadb {
+        #[schema(inline)]
+        pub mariadb: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Mariadb {
             #[serde(default = "mariadb_enabled")]
             pub enabled: bool,
             #[serde(default = "mariadb_bind")]
+            #[schema(value_type = String)]
             pub bind: SocketAddr,
             #[serde(default)]
             pub tls: Tls,
         },
 
         #[serde(default)]
-        pub mongodb: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct Mongodb {
+        #[schema(inline)]
+        pub mongodb: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Mongodb {
             #[serde(default = "mongodb_enabled")]
             pub enabled: bool,
             #[serde(default = "mongodb_bind")]
+            #[schema(value_type = String)]
             pub bind: SocketAddr,
             #[serde(default)]
             pub tls: Tls,
         },
 
         #[serde(default)]
-        pub redis: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct Redis {
+        #[schema(inline)]
+        pub redis: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Redis {
             #[serde(default = "redis_enabled")]
             pub enabled: bool,
             #[serde(default = "redis_bind")]
+            #[schema(value_type = String)]
             pub bind: SocketAddr,
             #[serde(default)]
             pub tls: Tls,
         },
 
         #[serde(default)]
-        pub database: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct DatabaseConfig {
+        #[schema(inline)]
+        pub database: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DatabaseConfig {
             #[serde(default = "database_url")]
             pub url: String,
             #[serde(default = "database_migrate")]
@@ -173,12 +183,13 @@ nestify::nest! {
         },
 
         #[serde(default)]
-        pub docker: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct Docker {
+        #[schema(inline)]
+        pub docker: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Docker {
             #[serde(default = "docker_socket")]
             pub socket: String,
 
             #[serde(default)]
-            pub registries: std::collections::HashMap<String, #[derive(Deserialize, Serialize, Clone)] pub struct DockerRegistry {
+            pub registries: std::collections::HashMap<String, #[derive(ToSchema, Deserialize, Serialize, Clone)] pub struct DockerRegistry {
                 pub username: String,
                 pub password: String,
             }>,
@@ -193,7 +204,8 @@ nestify::nest! {
             pub userns_mode: String,
 
             #[serde(default)]
-            pub log_config: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct DockerLogConfig {
+            #[schema(inline)]
+            pub log_config: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerLogConfig {
                 #[serde(default = "docker_log_config_type")]
                 pub r#type: String,
                 #[serde(default = "docker_log_config_config")]
@@ -202,7 +214,8 @@ nestify::nest! {
         },
 
         #[serde(default)]
-        pub api: #[derive(Deserialize, Serialize, DefaultFromSerde)] pub struct Api {
+        #[schema(inline)]
+        pub api: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Api {
             #[serde(default = "api_bind")]
             pub bind: String,
             #[serde(default)]
@@ -216,6 +229,7 @@ nestify::nest! {
             pub tls: Tls,
 
             #[serde(default)]
+            #[schema(value_type = Vec<String>)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
         },
     }

@@ -51,10 +51,38 @@ pub async fn auth(
     Ok(next.run(req).await)
 }
 
+mod get {
+    use crate::{
+        response::{ApiResponse, ApiResponseResult},
+        routes::{ApiError, api::databases::_database_::users::_user_::GetUser},
+    };
+    use serde::Serialize;
+    use utoipa::ToSchema;
+
+    #[derive(ToSchema, Serialize)]
+    struct Response {
+        user: crate::database::data::StoredDatabaseUser,
+    }
+
+    #[utoipa::path(get, path = "/", responses(
+        (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
+    ), params(
+        ("database" = uuid::Uuid, description = "The database uuid"),
+        ("user" = uuid::Uuid, description = "The database user uuid"),
+    ))]
+    pub async fn route(user: GetUser) -> ApiResponseResult {
+        ApiResponse::new_serialized(Response { user: user.0 }).ok()
+    }
+}
+
 mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::{GetDatabase, users::_user_::GetUser},
+        routes::{
+            ApiError,
+            api::databases::_database_::{GetDatabase, users::_user_::GetUser},
+        },
     };
     use serde::Serialize;
     use utoipa::ToSchema;
@@ -64,6 +92,7 @@ mod delete {
 
     #[utoipa::path(delete, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
         ("user" = uuid::Uuid, description = "The database user uuid"),
@@ -78,6 +107,7 @@ mod delete {
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .nest("/rotate-password", rotate_password::router(state))
+        .routes(routes!(get::route))
         .routes(routes!(delete::route))
         .route_layer(axum::middleware::from_fn(auth))
         .with_state(state.clone())

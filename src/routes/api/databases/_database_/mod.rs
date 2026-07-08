@@ -56,7 +56,7 @@ pub async fn auth(
 mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::GetDatabase,
+        routes::{ApiError, api::databases::_database_::GetDatabase},
     };
     use serde::Serialize;
     use utoipa::ToSchema;
@@ -68,6 +68,7 @@ mod get {
 
     #[utoipa::path(get, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
     ))]
@@ -83,7 +84,7 @@ mod patch {
     use crate::{
         database::data::StoredDatabaseUpdate,
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::GetDatabase,
+        routes::{ApiError, api::databases::_database_::GetDatabase},
     };
     use serde::Serialize;
     use utoipa::ToSchema;
@@ -93,6 +94,7 @@ mod patch {
 
     #[utoipa::path(patch, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
     ), request_body = inline(StoredDatabaseUpdate))]
@@ -125,7 +127,7 @@ mod patch {
 mod delete {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::{GetState, api::databases::_database_::GetDatabase},
+        routes::{ApiError, GetState, api::databases::_database_::GetDatabase},
     };
     use serde::Serialize;
     use utoipa::ToSchema;
@@ -135,6 +137,7 @@ mod delete {
 
     #[utoipa::path(delete, path = "/", responses(
         (status = OK, body = inline(Response)),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
     ))]

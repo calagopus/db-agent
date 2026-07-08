@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::GetDatabase,
+        routes::{ApiError, api::databases::_database_::GetDatabase},
     };
     use axum::extract::Query;
     use serde::Deserialize;
@@ -17,6 +17,7 @@ mod get {
 
     #[utoipa::path(get, path = "/", responses(
         (status = OK, body = String),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
         (

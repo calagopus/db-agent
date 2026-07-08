@@ -4,7 +4,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::api::databases::_database_::GetDatabase,
+        routes::{ApiError, api::databases::_database_::GetDatabase},
     };
     use axum::http::StatusCode;
     use serde::{Deserialize, Serialize};
@@ -28,7 +28,9 @@ mod post {
     struct Response {}
 
     #[utoipa::path(post, path = "/", responses(
-        (status = ACCEPTED, body = inline(Response)),
+        (status = OK, body = inline(Response)),
+        (status = EXPECTATION_FAILED, body = ApiError),
+        (status = NOT_FOUND, body = ApiError),
     ), params(
         ("database" = uuid::Uuid, description = "The database uuid"),
     ), request_body = inline(Payload))]
@@ -36,28 +38,31 @@ mod post {
         database: GetDatabase,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        tokio::spawn(async move {
-            let result = match data.action {
-                PowerAction::Start => database.start().await,
-                PowerAction::Stop => database.stop().await,
-                PowerAction::Kill => database.kill().await,
-                PowerAction::Restart => match database.stop().await {
-                    Ok(()) => database.start().await,
-                    Err(err) => Err(err),
-                },
-            };
+        let result = match data.action {
+            PowerAction::Start => database.start().await,
+            PowerAction::Stop => database.stop().await,
+            PowerAction::Kill => database.kill().await,
+            PowerAction::Restart => match database.stop().await {
+                Ok(()) => database.start().await,
+                Err(err) => Err(err),
+            },
+        };
 
-            if let Err(err) = result {
-                tracing::error!(
-                    "failed to run power action on database {}: {err}",
-                    database.uuid
-                );
-            }
-        });
+        if let Err(err) = result {
+            tracing::error!(
+                "failed to run power action on database {}: {err}",
+                database.uuid
+            );
 
-        ApiResponse::new_serialized(Response {})
-            .with_status(StatusCode::ACCEPTED)
-            .ok()
+            return ApiResponse::error(&format!(
+                "failed to run power action on database {}: {err}",
+                database.uuid
+            ))
+            .with_status(StatusCode::EXPECTATION_FAILED)
+            .ok();
+        }
+
+        ApiResponse::new_serialized(Response {}).ok()
     }
 }
 
