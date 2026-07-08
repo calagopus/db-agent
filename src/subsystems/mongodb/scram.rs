@@ -150,7 +150,7 @@ pub async fn backend_auth(
 
     let (_, _, body) = read_message(&mut be).await?;
     let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
-    if reply.get_f64("ok") != Ok(1.0) {
+    if reply.get_f64("ok").ok() != Some(1.0) {
         return Err(bad("backend rejected auth"));
     }
     Ok(be)
