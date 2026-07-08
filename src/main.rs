@@ -36,7 +36,7 @@ const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
 const TARGET: &str = env!("CARGO_TARGET");
 
-const DEFAULT_CONFIG_PATH: &str = "config.yml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/calagopus-db-agent/config.yml";
 
 fn full_version() -> String {
     if GIT_BRANCH == "unknown" {

@@ -26,7 +26,7 @@ fn data_dir() -> String {
     "/var/lib/calagopus-db-agent/data".to_string()
 }
 fn log_dir() -> String {
-    "/var/lib/calagopus-db-agent/logs".to_string()
+    "/var/log/calagopus-db-agent".to_string()
 }
 
 fn disk_check_interval() -> u64 {
