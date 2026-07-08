@@ -7,9 +7,15 @@ use std::{
     fs::File,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{
+    filter::Targets,
+    fmt::writer::MakeWriterExt,
+    layer::{Layered, SubscriberExt},
+    util::SubscriberInitExt,
+};
 use utoipa::ToSchema;
 
 fn tls_cert() -> String {
@@ -238,6 +244,20 @@ nestify::nest! {
 pub const FORBIDDEN_PATHS: &[&str] = &["api.token"];
 
 pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
+type ReloadHandle =
+    tracing_subscriber::reload::Handle<Targets, Layered<LevelFilter, tracing_subscriber::Registry>>;
+
+fn log_filter(debug: bool) -> Targets {
+    let crate_level = if debug {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
+
+    Targets::new()
+        .with_default(LevelFilter::INFO)
+        .with_target("db_agent", crate_level)
+}
 
 #[allow(dead_code)]
 pub struct LogGuard(
@@ -247,6 +267,7 @@ pub struct LogGuard(
 
 pub struct Config {
     inner: ArcSwap<InnerConfig>,
+    log_reload_handle: OnceLock<ReloadHandle>,
     pub path: String,
     pub disk_check_semaphore: ArcSwap<tokio::sync::Semaphore>,
 }
@@ -270,6 +291,7 @@ impl Config {
 
         Ok(Arc::new(Self {
             inner: ArcSwap::from_pointee(inner),
+            log_reload_handle: OnceLock::new(),
             path: path.to_string(),
             disk_check_semaphore,
         }))
@@ -347,24 +369,39 @@ impl Config {
         let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
         let (file_writer, file_guard) = tracing_appender::non_blocking(rolling);
 
-        tracing_subscriber::fmt()
-            .with_max_level(if debug {
-                tracing::Level::DEBUG
-            } else {
-                tracing::Level::INFO
-            })
+        let (reload_layer, reload_handle) =
+            tracing_subscriber::reload::Layer::new(log_filter(debug));
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(stdout_writer.and(file_writer))
-            .with_target(false)
+            .with_target(false);
+
+        tracing_subscriber::registry()
+            .with(LevelFilter::DEBUG)
+            .with(reload_layer)
+            .with(fmt_layer)
             .init();
+
+        let _ = self.log_reload_handle.set(reload_handle);
 
         Ok(LogGuard(file_guard, stdout_guard))
     }
 
     pub fn replace(&self, new: InnerConfig) -> anyhow::Result<()> {
+        let old_debug = self.load().debug;
+        let new_debug = new.debug;
         let old_concurrency = self.load().disk_check_concurrency.max(1);
         let new_concurrency = new.disk_check_concurrency.max(1);
         Self::save_to(&self.path, &new)?;
         self.inner.store(Arc::new(new));
+
+        if old_debug != new_debug
+            && let Some(handle) = self.log_reload_handle.get()
+        {
+            handle
+                .modify(|filter| *filter = log_filter(new_debug))
+                .context("failed to reload tracing level filter")?;
+        }
 
         if new_concurrency != old_concurrency {
             self.disk_check_semaphore
