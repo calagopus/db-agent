@@ -234,6 +234,20 @@ impl Database {
         Ok(user)
     }
 
+    async fn ensure_acl_writable(&self, action: &str) -> anyhow::Result<()> {
+        if self.data.read().await.database_type != DatabaseType::Redis
+            && self.resource_usage().await.state != resources::ContainerState::Running
+        {
+            return Err(crate::response::DisplayError::new(format!(
+                "the database must be online to {action}"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT)
+            .into());
+        }
+
+        Ok(())
+    }
+
     pub async fn create_db(
         &self,
         name: &str,
@@ -241,6 +255,8 @@ impl Database {
         crate::database::data::StoredDatabaseUser,
         Option<DbIdentifier>,
     )> {
+        self.ensure_acl_writable("create a user").await?;
+
         let database_type = self.data.read().await.database_type;
         let user = self.create_user(name).await?;
 
@@ -263,6 +279,8 @@ impl Database {
         &self,
         user: &crate::database::data::StoredDatabaseUser,
     ) -> anyhow::Result<String> {
+        self.ensure_acl_writable("rotate a user's password").await?;
+
         let password = crate::utils::generate_password();
         let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
 
@@ -287,6 +305,8 @@ impl Database {
         &self,
         user: &crate::database::data::StoredDatabaseUser,
     ) -> anyhow::Result<()> {
+        self.ensure_acl_writable("delete a user").await?;
+
         let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
         let connection = self.connection().await?;
 
@@ -458,7 +478,9 @@ impl Database {
                     None => format!("mariadb --socket='{socket}' -u root"),
                 };
                 let wipe = if wipe {
-                    let db = db.ok_or_else(|| anyhow::anyhow!("wipe requires a target db"))?;
+                    let db = db.ok_or_else(|| {
+                        crate::response::DisplayError::new("wipe requires a target db")
+                    })?;
                     Some(format!(
                         "mariadb --socket='{socket}' -u root -e \
                          'DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`;'"
@@ -476,7 +498,12 @@ impl Database {
                 };
                 (None, import)
             }
-            DatabaseType::Redis => anyhow::bail!("import is not supported for redis"),
+            DatabaseType::Redis => {
+                return Err(crate::response::DisplayError::new(
+                    "import is not supported for redis",
+                )
+                .into());
+            }
         };
         drop(data);
 

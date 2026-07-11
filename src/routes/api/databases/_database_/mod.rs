@@ -9,12 +9,12 @@ use axum::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+pub mod databases;
 mod export;
 mod import;
 mod logs;
 mod power;
 mod query;
-pub mod users;
 mod utilization;
 
 pub type GetDatabase = axum::extract::Extension<crate::subsystems::database::Database>;
@@ -156,7 +156,7 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/power", power::router(state))
         .nest("/query", query::router(state))
         .nest("/utilization", utilization::router(state))
-        .nest("/users", users::router(state))
+        .nest("/databases", databases::router(state))
         .routes(routes!(get::route))
         .routes(routes!(patch::route))
         .routes(routes!(delete::route))

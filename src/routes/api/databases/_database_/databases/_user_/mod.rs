@@ -54,7 +54,7 @@ pub async fn auth(
 mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::{ApiError, api::databases::_database_::users::_user_::GetUser},
+        routes::{ApiError, api::databases::_database_::databases::_user_::GetUser},
     };
     use serde::Serialize;
     use utoipa::ToSchema;
@@ -81,7 +81,7 @@ mod delete {
         response::{ApiResponse, ApiResponseResult},
         routes::{
             ApiError,
-            api::databases::_database_::{GetDatabase, users::_user_::GetUser},
+            api::databases::_database_::{GetDatabase, databases::_user_::GetUser},
         },
     };
     use serde::Serialize;

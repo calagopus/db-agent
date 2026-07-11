@@ -6,7 +6,7 @@ mod post {
         response::{ApiResponse, ApiResponseResult},
         routes::{
             ApiError,
-            api::databases::_database_::{GetDatabase, users::_user_::GetUser},
+            api::databases::_database_::{GetDatabase, databases::_user_::GetUser},
         },
     };
     use serde::Serialize;

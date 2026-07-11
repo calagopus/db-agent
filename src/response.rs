@@ -124,6 +124,11 @@ where
 {
     fn from(err: T) -> Self {
         let err = err.into();
+
+        if let Some(err) = err.downcast_ref::<DisplayError>() {
+            return ApiResponse::error(&err.message).with_status(err.status);
+        }
+
         tracing::error!("a request error occurred: {:?}", err);
 
         let message = if let Some(err) = err.downcast_ref::<&str>() {
@@ -150,3 +155,34 @@ impl IntoResponse for ApiResponse {
         response
     }
 }
+
+#[derive(Debug)]
+pub struct DisplayError<'a> {
+    pub status: axum::http::StatusCode,
+    pub message: std::borrow::Cow<'a, str>,
+}
+
+impl<'a> DisplayError<'a> {
+    pub fn new(message: impl Into<std::borrow::Cow<'a, str>>) -> Self {
+        Self {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_status(mut self, status: axum::http::StatusCode) -> Self {
+        self.status = status;
+        self
+    }
+}
+
+impl std::fmt::Display for DisplayError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DisplayError")
+            .field("status", &self.status)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl std::error::Error for DisplayError<'_> {}
