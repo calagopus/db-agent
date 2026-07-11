@@ -436,28 +436,63 @@ impl Database {
     pub async fn import(
         &self,
         db: Option<&DbIdentifier>,
+        wipe: bool,
         reader: &mut (dyn tokio::io::AsyncRead + Send + Unpin),
     ) -> anyhow::Result<()> {
         let data = self.data.read().await;
         let socket = &data.socket_path;
 
-        let command = match data.database_type {
+        let (wipe_command, command) = match data.database_type {
             DatabaseType::Postgres => {
                 let dir = socket.rsplit_once('/').map_or("", |(dir, _)| dir);
                 let db = db.map_or("postgres".to_string(), |db| db.to_string());
-                format!("psql -q -o /dev/null -v ON_ERROR_STOP=1 -h '{dir}' -U postgres -d '{db}'")
+                let base = format!("psql -q -v ON_ERROR_STOP=1 -h '{dir}' -U postgres -d '{db}'");
+                let wipe = wipe.then(|| {
+                    format!("{base} -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'")
+                });
+                (wipe, format!("{base} -o /dev/null"))
             }
-            DatabaseType::Mariadb => match db {
-                Some(db) => format!("mariadb --socket='{socket}' -u root '{db}'"),
-                None => format!("mariadb --socket='{socket}' -u root"),
-            },
-            DatabaseType::Mongodb => match db {
-                Some(db) => format!("mongorestore --host='{socket}' --archive -d '{db}'"),
-                None => format!("mongorestore --host='{socket}' --archive"),
-            },
+            DatabaseType::Mariadb => {
+                let import = match db {
+                    Some(db) => format!("mariadb --socket='{socket}' -u root '{db}'"),
+                    None => format!("mariadb --socket='{socket}' -u root"),
+                };
+                let wipe = if wipe {
+                    let db = db.ok_or_else(|| anyhow::anyhow!("wipe requires a target db"))?;
+                    Some(format!(
+                        "mariadb --socket='{socket}' -u root -e \
+                         'DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`;'"
+                    ))
+                } else {
+                    None
+                };
+                (wipe, import)
+            }
+            DatabaseType::Mongodb => {
+                let drop = if wipe { " --drop" } else { "" };
+                let import = match db {
+                    Some(db) => format!("mongorestore --host='{socket}' --archive{drop} -d '{db}'"),
+                    None => format!("mongorestore --host='{socket}' --archive{drop}"),
+                };
+                (None, import)
+            }
             DatabaseType::Redis => anyhow::bail!("import is not supported for redis"),
         };
         drop(data);
+
+        if let Some(wipe_command) = wipe_command {
+            let mut stream = self
+                .exec(executor::ExecOptions::new(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    wipe_command,
+                ]))
+                .await?;
+            drop(stream.stdin);
+            while let Some(chunk) = stream.output.next().await {
+                chunk?;
+            }
+        }
 
         let executor::ExecStream {
             mut output,

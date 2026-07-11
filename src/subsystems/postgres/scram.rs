@@ -67,7 +67,7 @@ pub async fn authenticate_client<S: AsyncRead + AsyncWrite + Unpin>(
     let Ok(given) = B64.decode(proof_b64) else {
         return Err(bad("bad proof base64"));
     };
-    if expected != given {
+    if !constant_time_eq::constant_time_eq(&expected, &given) {
         return Ok(false);
     }
 

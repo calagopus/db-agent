@@ -15,6 +15,8 @@ mod post {
     #[derive(ToSchema, Deserialize)]
     pub struct Params {
         db: Option<String>,
+        #[serde(default)]
+        wipe: bool,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -28,6 +30,10 @@ mod post {
         (
             "db" = Option<String>, Query,
             description = "The db to import into, the dump decides if omitted",
+        ),
+        (
+            "wipe" = Option<bool>, Query,
+            description = "Clear existing data in the target before importing",
         ),
     ), request_body = String)]
     pub async fn route(
@@ -49,7 +55,9 @@ mod post {
             body.into_data_stream().map_err(std::io::Error::other),
         );
 
-        database.import(db.as_ref(), &mut reader).await?;
+        database
+            .import(db.as_ref(), params.wipe, &mut reader)
+            .await?;
 
         ApiResponse::new_serialized(Response {}).ok()
     }

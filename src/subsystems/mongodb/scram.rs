@@ -58,7 +58,8 @@ impl Scram {
             .zip(client_sig)
             .map(|(a, b)| a ^ b)
             .collect();
-        if expected != B64.decode(proof_b64).ok()? {
+        let given = B64.decode(proof_b64).ok()?;
+        if !constant_time_eq::constant_time_eq(&expected, &given) {
             return None;
         }
         let server_key = hmac(&salted, b"Server Key");

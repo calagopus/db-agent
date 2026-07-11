@@ -146,7 +146,10 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         seq = s2;
     }
 
-    if token != auth::native_token(&scramble, creds.password.as_bytes()) {
+    if !constant_time_eq::constant_time_eq(
+        &token,
+        &auth::native_token(&scramble, creds.password.as_bytes()),
+    ) {
         write_packet(
             &mut stream,
             seq + 1,

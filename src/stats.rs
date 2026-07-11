@@ -125,7 +125,7 @@ impl Default for StatsManager {
                     let disk_write_rate = disk.usage().written_bytes as f64;
 
                     let mut network = SystemNetworkStats::default();
-                    for (_, net) in networks.iter() {
+                    for net in networks.values() {
                         network.received += net.total_received();
                         network.received_packets += net.total_packets_received();
                         network.receiving_rate += net.received() as f64;

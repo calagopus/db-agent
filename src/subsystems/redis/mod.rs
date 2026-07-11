@@ -124,7 +124,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let user_id = user.parse::<UserIdentifier>().ok();
     let creds = user_id.and_then(|id| routes.find(DatabaseType::Redis, &id));
-    let Some(creds) = creds.filter(|c| password == c.password.as_bytes()) else {
+    let Some(creds) =
+        creds.filter(|c| constant_time_eq::constant_time_eq(&password, c.password.as_bytes()))
+    else {
         tracing::debug!("[{peer}] rejected auth for user {user:?}");
         client
             .write_all(b"-WRONGPASS invalid username-password pair or user is disabled.\r\n")

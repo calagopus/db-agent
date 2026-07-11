@@ -2,7 +2,7 @@
 name = "db-agent"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.95.0"
+rust-version = "1.97.0"
 
 [dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "process"] }
