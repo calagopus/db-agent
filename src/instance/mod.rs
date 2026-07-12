@@ -517,14 +517,23 @@ impl Instance {
             DatabaseType::Postgres => {
                 let dir = socket.rsplit_once('/').map_or("", |(dir, _)| dir);
                 match db {
-                    Some(db) => format!("pg_dump -h '{dir}' -U postgres '{db}'"),
-                    None => format!("pg_dumpall -h '{dir}' -U postgres"),
+                    Some(db) => {
+                        format!("pg_dump --no-owner --no-privileges -h '{dir}' -U postgres '{db}'")
+                    }
+                    None => format!("pg_dumpall --no-owner --no-privileges -h '{dir}' -U postgres"),
                 }
             }
-            DatabaseType::Mariadb => match db {
-                Some(db) => format!("mariadb-dump --socket='{socket}' -u root '{db}'"),
-                None => format!("mariadb-dump --socket='{socket}' -u root --all-databases"),
-            },
+            DatabaseType::Mariadb => {
+                let strip = r"| sed -e 's/DEFINER=`[^`]*`@`[^`]*`//g'";
+                match db {
+                    Some(db) => {
+                        format!("mariadb-dump --socket='{socket}' -u root '{db}' {strip}")
+                    }
+                    None => {
+                        format!("mariadb-dump --socket='{socket}' -u root --all-databases {strip}")
+                    }
+                }
+            }
             DatabaseType::Mongodb => match db {
                 Some(db) => format!("mongodump --host='{socket}' --archive -d '{db}'"),
                 None => format!("mongodump --host='{socket}' --archive"),
@@ -619,14 +628,31 @@ impl Instance {
             Ok::<_, anyhow::Error>(())
         };
         let drain = async {
+            let mut buf = Vec::new();
             while let Some(chunk) = output.next().await {
-                chunk?;
+                match chunk {
+                    Ok(bytes) if buf.len() < 8192 => buf.extend_from_slice(&bytes),
+                    Ok(_) => {}
+                    Err(err) => {
+                        let msg = String::from_utf8_lossy(&buf);
+                        let msg = msg.trim();
+                        return Err(if msg.is_empty() {
+                            err
+                        } else {
+                            anyhow::anyhow!("{err}: {msg}")
+                        });
+                    }
+                }
             }
             Ok::<_, anyhow::Error>(())
         };
 
-        let (write, drain) = tokio::join!(write, drain);
-        drain.and(write)
+        let mut write = std::pin::pin!(write);
+        let mut drain = std::pin::pin!(drain);
+        tokio::select! {
+            drained = &mut drain => drained,
+            written = &mut write => drain.await.and(written),
+        }
     }
 
     pub async fn logs(
