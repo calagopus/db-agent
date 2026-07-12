@@ -1,11 +1,11 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4efadd00-e8f2-4acb-b6f6-ac76fcd0b40f",
+  "id": "f061a759-766e-485e-ac25-1e13940d0afc",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
-    "database_users": {
-      "name": "database_users",
+    "databases": {
+      "name": "databases",
       "columns": {
         "uuid": {
           "name": "uuid",
@@ -14,65 +14,53 @@
           "notNull": true,
           "autoincrement": false
         },
-        "uuid_short": {
-          "name": "uuid_short",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "autoincrement": false
-        },
-        "database_uuid": {
-          "name": "database_uuid",
+        "instance_uuid": {
+          "name": "instance_uuid",
           "type": "blob",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
-        "username": {
-          "name": "username",
+        "name": {
+          "name": "name",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
         },
-        "password": {
-          "name": "password",
-          "type": "text",
+        "created": {
+          "name": "created",
+          "type": "integer",
           "primaryKey": false,
           "notNull": true,
-          "autoincrement": false
+          "autoincrement": false,
+          "default": "(unixepoch())"
         }
       },
       "indexes": {
-        "database_users_database_uuid_idx": {
-          "name": "database_users_database_uuid_idx",
+        "databases_instance_uuid_idx": {
+          "name": "databases_instance_uuid_idx",
           "columns": [
-            "database_uuid"
+            "instance_uuid"
           ],
           "isUnique": false
         },
-        "database_users_username_idx": {
-          "name": "database_users_username_idx",
+        "databases_instance_uuid_name_idx": {
+          "name": "databases_instance_uuid_name_idx",
           "columns": [
-            "username"
-          ],
-          "isUnique": false
-        },
-        "database_users_uuid_short_idx": {
-          "name": "database_users_uuid_short_idx",
-          "columns": [
-            "uuid_short"
+            "instance_uuid",
+            "name"
           ],
           "isUnique": true
         }
       },
       "foreignKeys": {
-        "database_users_database_uuid_databases_uuid_fk": {
-          "name": "database_users_database_uuid_databases_uuid_fk",
-          "tableFrom": "database_users",
-          "tableTo": "databases",
+        "databases_instance_uuid_instances_uuid_fk": {
+          "name": "databases_instance_uuid_instances_uuid_fk",
+          "tableFrom": "databases",
+          "tableTo": "instances",
           "columnsFrom": [
-            "database_uuid"
+            "instance_uuid"
           ],
           "columnsTo": [
             "uuid"
@@ -85,8 +73,8 @@
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
-    "databases": {
-      "name": "databases",
+    "instances": {
+      "name": "instances",
       "columns": {
         "uuid": {
           "name": "uuid",
@@ -193,18 +181,41 @@
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false
+        },
+        "env": {
+          "name": "env",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'{}'"
+        },
+        "cmd": {
+          "name": "cmd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "created": {
+          "name": "created",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch())"
         }
       },
       "indexes": {
-        "databases_database_type_idx": {
-          "name": "databases_database_type_idx",
+        "instances_database_type_idx": {
+          "name": "instances_database_type_idx",
           "columns": [
             "database_type"
           ],
           "isUnique": false
         },
-        "databases_uuid_short_idx": {
-          "name": "databases_uuid_short_idx",
+        "instances_uuid_short_idx": {
+          "name": "instances_uuid_short_idx",
           "columns": [
             "uuid_short"
           ],
@@ -212,6 +223,122 @@
         }
       },
       "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "users": {
+      "name": "users",
+      "columns": {
+        "uuid": {
+          "name": "uuid",
+          "type": "blob",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "uuid_short": {
+          "name": "uuid_short",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "instance_uuid": {
+          "name": "instance_uuid",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "database_uuid": {
+          "name": "database_uuid",
+          "type": "blob",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "username": {
+          "name": "username",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "password": {
+          "name": "password",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "created": {
+          "name": "created",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "(unixepoch())"
+        }
+      },
+      "indexes": {
+        "users_instance_uuid_idx": {
+          "name": "users_instance_uuid_idx",
+          "columns": [
+            "instance_uuid"
+          ],
+          "isUnique": false
+        },
+        "users_database_uuid_idx": {
+          "name": "users_database_uuid_idx",
+          "columns": [
+            "database_uuid"
+          ],
+          "isUnique": false
+        },
+        "users_username_idx": {
+          "name": "users_username_idx",
+          "columns": [
+            "username"
+          ],
+          "isUnique": false
+        },
+        "users_uuid_short_idx": {
+          "name": "users_uuid_short_idx",
+          "columns": [
+            "uuid_short"
+          ],
+          "isUnique": true
+        }
+      },
+      "foreignKeys": {
+        "users_instance_uuid_instances_uuid_fk": {
+          "name": "users_instance_uuid_instances_uuid_fk",
+          "tableFrom": "users",
+          "tableTo": "instances",
+          "columnsFrom": [
+            "instance_uuid"
+          ],
+          "columnsTo": [
+            "uuid"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "users_database_uuid_databases_uuid_fk": {
+          "name": "users_database_uuid_databases_uuid_fk",
+          "tableFrom": "users",
+          "tableTo": "databases",
+          "columnsFrom": [
+            "database_uuid"
+          ],
+          "columnsTo": [
+            "uuid"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}

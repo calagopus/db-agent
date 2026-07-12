@@ -1,8 +1,19 @@
-use crate::subsystems::database::DatabaseType;
+use crate::instance::DatabaseType;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row, sqlite::SqliteRow};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
+
+fn decode_created(row: &SqliteRow) -> Result<chrono::DateTime<chrono::Utc>, sqlx::Error> {
+    let secs = row.try_get::<i64, _>("created")?;
+    chrono::DateTime::from_timestamp(secs, 0).ok_or_else(|| sqlx::Error::ColumnDecode {
+        index: "created".into(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid created timestamp: {secs}"),
+        )),
+    })
+}
 
 pub struct VolumeMappingEntry<'a> {
     host_name: &'a str,
@@ -61,7 +72,7 @@ impl<'a> IntoIterator for &'a VolumeMapping {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct StoredDatabase {
+pub struct StoredInstance {
     pub uuid: uuid::Uuid,
     pub uuid_short: i64,
     pub database_type: DatabaseType,
@@ -79,9 +90,10 @@ pub struct StoredDatabase {
     pub timezone: Option<String>,
     pub env: BTreeMap<String, String>,
     pub cmd: Option<Vec<String>>,
+    pub created: chrono::DateTime<chrono::Utc>,
 }
 
-impl FromRow<'_, SqliteRow> for StoredDatabase {
+impl FromRow<'_, SqliteRow> for StoredInstance {
     fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             uuid: row.try_get("uuid")?,
@@ -131,12 +143,13 @@ impl FromRow<'_, SqliteRow> for StoredDatabase {
                         source: Box::new(e),
                     })?
             },
+            created: decode_created(row)?,
         })
     }
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct StoredDatabaseCreate {
+pub struct StoredInstanceCreate {
     pub database_type: DatabaseType,
     #[serde(default)]
     pub suspended: bool,
@@ -156,18 +169,19 @@ pub struct StoredDatabaseCreate {
     pub cmd: Option<Vec<String>>,
 }
 
-impl StoredDatabaseCreate {
+impl StoredInstanceCreate {
     pub async fn insert(
         self,
         database: &crate::database::Database,
-    ) -> anyhow::Result<StoredDatabase> {
+    ) -> anyhow::Result<StoredInstance> {
         loop {
             let uuid = uuid::Uuid::new_v4();
             let uuid_short = uuid.as_fields().0 as i64;
+            let created = chrono::Utc::now();
 
             match sqlx::query(
-                "INSERT INTO databases (uuid, uuid_short, database_type, suspended, memory, swap, disk, io_weight, cpu, image, image_uid, image_gid, volumes, socket_path, timezone, env, cmd)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO instances (uuid, uuid_short, database_type, suspended, memory, swap, disk, io_weight, cpu, image, image_uid, image_gid, volumes, socket_path, timezone, env, cmd, created)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid)
             .bind(uuid_short)
@@ -186,11 +200,12 @@ impl StoredDatabaseCreate {
             .bind(&self.timezone)
             .bind(serde_json::to_string(&self.env)?)
             .bind(self.cmd.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(created.timestamp())
             .execute(database.write())
             .await
             {
                 Ok(_) => {
-                    return Ok(StoredDatabase {
+                    return Ok(StoredInstance {
                         uuid,
                         uuid_short,
                         database_type: self.database_type,
@@ -208,6 +223,7 @@ impl StoredDatabaseCreate {
                         timezone: self.timezone,
                         env: self.env,
                         cmd: self.cmd,
+                        created,
                     });
                 }
                 Err(sqlx::Error::Database(err)) if err.is_unique_violation() => continue,
@@ -219,7 +235,7 @@ impl StoredDatabaseCreate {
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(default)]
-pub struct StoredDatabaseUpdate {
+pub struct StoredInstanceUpdate {
     pub suspended: Option<bool>,
     pub memory: Option<i64>,
     pub swap: Option<i64>,
@@ -236,11 +252,11 @@ pub struct StoredDatabaseUpdate {
     pub cmd: Option<Option<Vec<String>>>,
 }
 
-impl StoredDatabaseUpdate {
+impl StoredInstanceUpdate {
     pub async fn apply(
         self,
         database: &crate::database::Database,
-        data: &mut StoredDatabase,
+        data: &mut StoredInstance,
     ) -> anyhow::Result<()> {
         let mut new_data = data.clone();
 
@@ -288,7 +304,7 @@ impl StoredDatabaseUpdate {
         }
 
         sqlx::query(
-            "UPDATE databases SET suspended = ?, memory = ?, swap = ?,
+            "UPDATE instances SET suspended = ?, memory = ?, swap = ?,
             disk = ?, io_weight = ?, cpu = ?, image = ?, image_uid = ?,
             image_gid = ?, volumes = ?, socket_path = ?, timezone = ?,
             env = ?, cmd = ? WHERE uuid = ?",
@@ -323,22 +339,45 @@ impl StoredDatabaseUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct StoredDatabaseUser {
+pub struct StoredDatabase {
     pub uuid: uuid::Uuid,
-    pub uuid_short: i64,
-    pub database_uuid: uuid::Uuid,
-    pub username: String,
-    pub password: String,
+    pub instance_uuid: uuid::Uuid,
+    pub name: String,
+    pub created: chrono::DateTime<chrono::Utc>,
 }
 
-impl FromRow<'_, SqliteRow> for StoredDatabaseUser {
+impl FromRow<'_, SqliteRow> for StoredDatabase {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            uuid: row.try_get("uuid")?,
+            instance_uuid: row.try_get("instance_uuid")?,
+            name: row.try_get("name")?,
+            created: decode_created(row)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StoredUser {
+    pub uuid: uuid::Uuid,
+    pub uuid_short: i64,
+    pub instance_uuid: uuid::Uuid,
+    pub database_uuid: Option<uuid::Uuid>,
+    pub username: String,
+    pub password: String,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+impl FromRow<'_, SqliteRow> for StoredUser {
     fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             uuid: row.try_get("uuid")?,
             uuid_short: row.try_get("uuid_short")?,
+            instance_uuid: row.try_get("instance_uuid")?,
             database_uuid: row.try_get("database_uuid")?,
             username: row.try_get("username")?,
             password: row.try_get("password")?,
+            created: decode_created(row)?,
         })
     }
 }

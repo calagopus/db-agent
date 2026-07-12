@@ -9,7 +9,7 @@ use axum::{
 };
 use utoipa_axum::router::OpenApiRouter;
 
-mod databases;
+mod instances;
 mod status;
 mod system;
 
@@ -53,8 +53,8 @@ pub async fn auth(state: GetState, req: Request, next: Next) -> Result<Response<
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .nest(
-            "/databases",
-            databases::router(state)
+            "/instances",
+            instances::router(state)
                 .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
         )
         .nest(

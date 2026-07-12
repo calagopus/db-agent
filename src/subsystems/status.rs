@@ -1,4 +1,4 @@
-use super::database::identifier::{DbIdentifier, UserIdentifier};
+use crate::instance::identifier::UserIdentifier;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::{
@@ -16,7 +16,7 @@ pub struct SubsystemConnections {
     running: AtomicBool,
     total: AtomicUsize,
     users: Mutex<HashMap<UserIdentifier, usize>>,
-    databases: Mutex<HashMap<DbIdentifier, usize>>,
+    databases: Mutex<HashMap<String, usize>>,
 }
 
 impl SubsystemConnections {
@@ -27,12 +27,12 @@ impl SubsystemConnections {
     pub fn connect(
         self: &Arc<Self>,
         user: UserIdentifier,
-        database: Option<DbIdentifier>,
+        database: Option<String>,
     ) -> ConnectionGuard {
         self.total.fetch_add(1, Ordering::SeqCst);
         increment(&self.users, user);
-        if let Some(database) = database {
-            increment(&self.databases, database);
+        if let Some(database) = &database {
+            increment(&self.databases, database.clone());
         }
 
         ConnectionGuard {
@@ -71,7 +71,7 @@ fn decrement<K: Eq + Hash>(map: &Mutex<HashMap<K, usize>>, key: &K) {
 pub struct ConnectionGuard {
     subsystem: Arc<SubsystemConnections>,
     user: UserIdentifier,
-    database: Option<DbIdentifier>,
+    database: Option<String>,
 }
 
 impl Drop for ConnectionGuard {

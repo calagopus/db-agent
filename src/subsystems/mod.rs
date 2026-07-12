@@ -1,7 +1,6 @@
 use status::SubsystemConnections;
 use std::sync::Arc;
 
-pub mod database;
 pub mod mariadb;
 pub mod mongodb;
 pub mod postgres;

@@ -1,4 +1,4 @@
-use super::database::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
+use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
 use crate::{config::Config, subsystems::status::SubsystemConnections};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{
@@ -134,16 +134,16 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    if creds.database.is_suspended().await {
+    if creds.instance.is_suspended().await {
         tracing::debug!(
             "[{peer}] rejected: database {} suspended",
-            creds.database.uuid
+            creds.instance.uuid
         );
         client.write_all(b"-ERR database is suspended\r\n").await?;
         return Ok(());
     }
 
-    let mut backend = UnixStream::connect(&creds.database.get_socket_path().await).await?;
+    let mut backend = UnixStream::connect(&creds.instance.get_socket_path().await).await?;
 
     match forward {
         Some(bytes) => backend.write_all(&bytes).await?,

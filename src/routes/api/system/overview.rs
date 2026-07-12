@@ -3,9 +3,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod get {
     use crate::{
+        instance::resources::ContainerState,
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
-        subsystems::database::resources::ContainerState,
     };
     use serde::Serialize;
     use sysinfo::System;
@@ -29,7 +29,7 @@ mod get {
     }
 
     #[derive(ToSchema, Serialize)]
-    struct ResponseDatabases {
+    struct ResponseInstances {
         total: usize,
         online: usize,
         offline: usize,
@@ -46,7 +46,7 @@ mod get {
         #[schema(inline)]
         memory: ResponseMemory,
         #[schema(inline)]
-        databases: ResponseDatabases,
+        instances: ResponseInstances,
 
         architecture: &'static str,
         kernel_version: String,
@@ -76,18 +76,18 @@ mod get {
             return ApiResponse::error("failed to retrieve cpu information").ok();
         };
 
-        let mut databases = ResponseDatabases {
+        let mut instances = ResponseInstances {
             total: 0,
             online: 0,
             offline: 0,
         };
 
-        for database in state.database_manager.get_databases().await.iter() {
-            databases.total += 1;
-            if database.resource_usage().await.state == ContainerState::Offline {
-                databases.offline += 1;
+        for instance in state.instance_manager.get_instances().await.iter() {
+            instances.total += 1;
+            if instance.resource_usage().await.state == ContainerState::Offline {
+                instances.offline += 1;
             } else {
-                databases.online += 1;
+                instances.online += 1;
             }
         }
 
@@ -108,7 +108,7 @@ mod get {
                 used_bytes: sys.used_memory(),
                 used_bytes_process,
             },
-            databases,
+            instances,
             architecture: std::env::consts::ARCH,
             kernel_version: System::kernel_long_version(),
         })

@@ -46,6 +46,7 @@ rustc-hash = "2.1.2"
 bollard = "0.21.0"
 async-trait = "0.1.89"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+garde = { version = "0.23.0", features = ["full"] }
 itertools = "0.15.0"
 cap-std = "4.0.0"
 clap = { version = "4.5.37", features = ["derive", "string"] }

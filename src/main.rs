@@ -21,6 +21,7 @@ use utoipa_axum::router::OpenApiRouter;
 mod commands;
 mod config;
 mod database;
+mod instance;
 mod payload;
 mod response;
 mod routes;
@@ -239,8 +240,7 @@ async fn main_rt() -> anyhow::Result<()> {
 
     let database = Arc::new(database::Database::new(Arc::clone(&config)).await?);
     let registry = Arc::new(subsystems::SubsystemRegistry::default());
-    let database_route_manager =
-        Arc::new(subsystems::database::manager::DatabaseRouteManager::default());
+    let database_route_manager = Arc::new(instance::manager::DatabaseRouteManager::default());
 
     if config.load().postgres.enabled {
         spawn_subsystem(
@@ -298,11 +298,9 @@ async fn main_rt() -> anyhow::Result<()> {
         }
     };
 
-    let container_executor: Arc<dyn subsystems::database::executor::ContainerExecutor> =
-        Arc::new(subsystems::database::executor::docker::DockerExecutor::new(
-            Arc::clone(&docker),
-            Arc::clone(&config),
-        ));
+    let container_executor: Arc<dyn instance::executor::ContainerExecutor> = Arc::new(
+        instance::executor::docker::DockerExecutor::new(Arc::clone(&docker), Arc::clone(&config)),
+    );
 
     if let Err(err) = container_executor.boot().await {
         exit_error!("failed to boot server executor: {:?}", err);
@@ -320,12 +318,12 @@ async fn main_rt() -> anyhow::Result<()> {
         database: Arc::clone(&database),
         stats_manager: Arc::new(stats::StatsManager::default()),
         subsystem_registry: Arc::clone(&registry),
-        database_manager: Arc::new(subsystems::database::manager::DatabaseManager::default()),
+        instance_manager: Arc::new(instance::manager::InstanceManager::default()),
         database_route_manager: Arc::clone(&database_route_manager),
         container_executor,
     });
 
-    if let Err(err) = state.database_manager.initialize(state.clone()).await {
+    if let Err(err) = state.instance_manager.initialize(state.clone()).await {
         exit_error!("failed to initialize database manager: {:?}", err);
     }
 

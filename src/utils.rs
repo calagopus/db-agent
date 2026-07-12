@@ -7,6 +7,15 @@ use std::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
+pub fn validate_data<T: garde::Validate<Context = ()>>(data: &T) -> Result<(), Vec<String>> {
+    data.validate().map_err(|report| {
+        report
+            .iter()
+            .map(|(path, error)| format!("{path}: {error}"))
+            .collect()
+    })
+}
+
 pub fn generate_password() -> String {
     const PASSWORD_SPECIAL_CHARS: &[u8] = b"!@#$%^&*()<>-_";
 

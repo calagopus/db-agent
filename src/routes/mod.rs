@@ -22,9 +22,9 @@ pub struct AppState {
     pub database: Arc<crate::database::Database>,
     pub stats_manager: Arc<crate::stats::StatsManager>,
     pub subsystem_registry: Arc<crate::subsystems::SubsystemRegistry>,
-    pub database_manager: Arc<crate::subsystems::database::manager::DatabaseManager>,
-    pub database_route_manager: Arc<crate::subsystems::database::manager::DatabaseRouteManager>,
-    pub container_executor: Arc<dyn crate::subsystems::database::executor::ContainerExecutor>,
+    pub instance_manager: Arc<crate::instance::manager::InstanceManager>,
+    pub database_route_manager: Arc<crate::instance::manager::DatabaseRouteManager>,
+    pub container_executor: Arc<dyn crate::instance::executor::ContainerExecutor>,
 }
 
 #[derive(ToSchema, Serialize, Deserialize)]

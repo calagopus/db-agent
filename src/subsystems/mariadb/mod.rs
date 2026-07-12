@@ -1,8 +1,4 @@
-use super::database::{
-    DatabaseType,
-    identifier::{DbIdentifier, UserIdentifier},
-    manager::DatabaseRouteManager,
-};
+use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
 use crate::{
     config::Config,
     subsystems::status::SubsystemConnections,
@@ -119,7 +115,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    if creds.database.is_suspended().await {
+    if creds.instance.is_suspended().await {
         write_packet(
             &mut stream,
             cseq + 1,
@@ -128,7 +124,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         tracing::debug!(
             "[{peer}] rejected: database {} suspended",
-            creds.database.uuid
+            creds.instance.uuid
         );
         return Ok(());
     }
@@ -162,7 +158,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     tracing::info!("[{peer}] {:?}@{:?} authenticated", hr.user, hr.database);
 
     let mut backend = backend_auth(
-        &creds.database.get_socket_path().await,
+        &creds.instance.get_socket_path().await,
         &hr.user,
         &creds.password,
         &hr.database,
@@ -170,7 +166,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     .await?;
     tracing::debug!("[{peer}] backend ready, relaying");
 
-    let _guard = user_id.map(|id| status.connect(id, hr.database.parse::<DbIdentifier>().ok()));
+    let _guard = user_id
+        .map(|id| status.connect(id, Some(hr.database.to_string()).filter(|s| !s.is_empty())));
     let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
     tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())

@@ -1,8 +1,4 @@
-use super::database::{
-    DatabaseType,
-    identifier::{DbIdentifier, UserIdentifier},
-    manager::DatabaseRouteManager,
-};
+use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
 use crate::{config::Config, subsystems::status::SubsystemConnections, utils::bad};
 use bson::doc;
 use protocol::{
@@ -128,10 +124,10 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(());
                 };
 
-                if creds.database.is_suspended().await {
+                if creds.instance.is_suspended().await {
                     tracing::debug!(
                         "[{peer}] rejected: database {} suspended",
-                        creds.database.uuid
+                        creds.instance.uuid
                     );
                     write_op_msg(&mut stream, reqid, &sasl_error("database is suspended")).await?;
                     return Ok(());
@@ -139,7 +135,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
                 let (st, server_first) = Scram::start(
                     &creds.password,
-                    &creds.database.get_socket_path().await,
+                    &creds.instance.get_socket_path().await,
                     bare,
                     &cnonce,
                     user,
@@ -192,7 +188,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .user
         .parse::<UserIdentifier>()
         .ok()
-        .map(|id| status.connect(id, st.db.parse::<DbIdentifier>().ok()));
+        .map(|id| status.connect(id, Some(st.db.to_string()).filter(|s| !s.is_empty())));
     let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
     tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
 
