@@ -9,6 +9,8 @@ use axum::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+mod size;
+
 pub type GetDatabase = axum::extract::Extension<crate::database::data::StoredDatabase>;
 
 pub async fn auth(
@@ -107,6 +109,7 @@ mod delete {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/size", size::router(state))
         .routes(routes!(get::route))
         .routes(routes!(delete::route))
         .route_layer(axum::middleware::from_fn(auth))

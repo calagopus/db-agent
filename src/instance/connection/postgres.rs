@@ -108,6 +108,16 @@ impl DatabaseConnection for PostgresConnection {
         .await
     }
 
+    async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
+        let row = self
+            .client(ADMIN_DATABASE)
+            .await?
+            .query_one("SELECT pg_database_size($1)", &[&name])
+            .await?;
+
+        Ok(row.get::<_, i64>(0))
+    }
+
     async fn query(&self, db: Option<&str>, query: &str) -> anyhow::Result<QueryResult> {
         let client = self.client(db.unwrap_or(ADMIN_DATABASE)).await?;
 

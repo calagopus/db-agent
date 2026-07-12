@@ -73,6 +73,21 @@ impl DatabaseConnection for MongodbConnection {
         Ok(())
     }
 
+    async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
+        let stats = self
+            .client
+            .database(name)
+            .run_command(doc! { "dbStats": 1, "scale": 1 })
+            .await?;
+
+        Ok(match stats.get("dataSize") {
+            Some(Bson::Int32(i)) => *i as i64,
+            Some(Bson::Int64(i)) => *i,
+            Some(Bson::Double(f)) => *f as i64,
+            _ => 0,
+        })
+    }
+
     async fn query(&self, db: Option<&str>, query: &str) -> anyhow::Result<QueryResult> {
         let command: Document = serde_json::from_str(query)?;
 

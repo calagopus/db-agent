@@ -75,6 +75,10 @@ impl DatabaseConnection for RedisConnection {
         anyhow::bail!("redis has no named databases");
     }
 
+    async fn get_size(&self, _name: &str) -> anyhow::Result<i64> {
+        anyhow::bail!("redis has no named databases");
+    }
+
     async fn query(&self, _db: Option<&str>, query: &str) -> anyhow::Result<QueryResult> {
         let mut parts = query.split_whitespace();
         let Some(command) = parts.next() else {

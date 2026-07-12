@@ -105,6 +105,19 @@ impl DatabaseConnection for MariadbConnection {
             .await
     }
 
+    async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
+        let mut conn = self.conn().await?;
+        let size: Option<Option<i64>> = conn
+            .exec_first(
+                "SELECT CAST(SUM(data_length + index_length) AS SIGNED) FROM information_schema.tables WHERE table_schema = ?",
+                (name,),
+            )
+            .await?;
+        conn.disconnect().await?;
+
+        Ok(size.flatten().unwrap_or(0))
+    }
+
     async fn query(&self, db: Option<&str>, query: &str) -> anyhow::Result<QueryResult> {
         let mut conn = self.conn().await?;
         if let Some(db) = db {
