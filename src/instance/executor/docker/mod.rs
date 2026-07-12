@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod host_mounts;
+
 #[inline]
 fn string_to_option(s: &str) -> Option<String> {
     if s.is_empty() {
@@ -62,12 +64,16 @@ fn convert_resources(
 fn host_config(
     data: &StoredInstance,
     config: &crate::config::Config,
+    host_mounts: Option<&host_mounts::HostMountTable>,
 ) -> bollard::models::HostConfig {
     let resources = convert_resources(data, config);
 
     let mut mounts = vec![bollard::models::Mount {
         typ: Some(bollard::models::MountType::BIND),
-        source: Some(config.socket_path(data.uuid).to_string_lossy().into_owned()),
+        source: Some(host_mounts::translate_source(
+            host_mounts,
+            &config.socket_path(data.uuid).to_string_lossy(),
+        )),
         target: Some(
             data.socket_path
                 .split('/')
@@ -84,12 +90,10 @@ fn host_config(
     for mapping in &data.volumes {
         mounts.push(bollard::models::Mount {
             typ: Some(bollard::models::MountType::BIND),
-            source: Some(
-                mapping
-                    .host_path(config, data.uuid)
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            source: Some(host_mounts::translate_source(
+                host_mounts,
+                &mapping.host_path(config, data.uuid).to_string_lossy(),
+            )),
             target: Some(mapping.container_path().to_string_lossy().into_owned()),
             ..Default::default()
         });
@@ -133,6 +137,7 @@ fn host_config(
 fn container_config(
     data: &StoredInstance,
     config: &crate::config::Config,
+    host_mounts: Option<&host_mounts::HostMountTable>,
 ) -> bollard::models::ContainerCreateBody {
     let cfg = config.load();
     let timezone = data
@@ -152,7 +157,7 @@ fn container_config(
             ("Service".to_string(), "calagopus-db-agent".to_string()),
             ("ContainerType".to_string(), "database".to_string()),
         ])),
-        host_config: Some(host_config(data, config)),
+        host_config: Some(host_config(data, config, host_mounts)),
         attach_stdin: Some(true),
         attach_stdout: Some(true),
         attach_stderr: Some(true),
@@ -165,11 +170,21 @@ fn container_config(
 pub struct DockerExecutor {
     docker: Arc<bollard::Docker>,
     app_config: Arc<crate::config::Config>,
+    host_mounts: std::sync::OnceLock<Option<host_mounts::HostMountTable>>,
 }
 
 impl DockerExecutor {
     pub fn new(docker: Arc<bollard::Docker>, app_config: Arc<crate::config::Config>) -> Self {
-        Self { docker, app_config }
+        Self {
+            docker,
+            app_config,
+            host_mounts: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    fn host_mounts(&self) -> Option<&host_mounts::HostMountTable> {
+        self.host_mounts.get().and_then(Option::as_ref)
     }
 
     async fn pull_image(&self, image: &str) -> Result<(), anyhow::Error> {
@@ -578,6 +593,40 @@ impl super::ProcessHandle for DockerProcessHandle {
 impl super::ContainerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.docker.version().await?;
+
+        if std::env::var("OCI_CONTAINER").is_ok() {
+            match host_mounts::HostMountTable::discover(&self.docker).await {
+                Ok(table) => {
+                    table.validate_directories(&self.app_config.load())?;
+
+                    tracing::info!(
+                        "running in container {}, translating bind mount sources to host paths",
+                        table.container_id().get(..12).unwrap_or_default()
+                    );
+                    for (destination, source) in table.mounts() {
+                        if destination != source {
+                            tracing::info!(
+                                "translating bind mount sources under {} to {}",
+                                destination.display(),
+                                source.display()
+                            );
+                        }
+                    }
+
+                    let _ = self.host_mounts.set(Some(table));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "running in a container, but failed to inspect own container: {err:#}"
+                    );
+                    tracing::warn!(
+                        "bind mount sources will be passed to the container engine untranslated, host paths must match the db-agent container's paths exactly"
+                    );
+                    let _ = self.host_mounts.set(None);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -600,7 +649,7 @@ impl super::ContainerExecutor for DockerExecutor {
         tokio::fs::create_dir_all(&socket_dir).await?;
         std::os::unix::fs::chown(&socket_dir, Some(data.image_uid), Some(data.image_gid))?;
 
-        let config = container_config(&data, &self.app_config);
+        let config = container_config(&data, &self.app_config, self.host_mounts());
 
         let container = self
             .docker

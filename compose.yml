@@ -8,7 +8,10 @@ services:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "/var/lib/docker/containers/:/var/lib/docker/containers/"
       - "./config.yml:/etc/calagopus-db-agent/config.yml"
-      # please note: if you change the /var/lib/calagopus-db-agent path and split it up, make sure to include the following paths properly (all in the config.yml):
+      # db-agent inspects its own container on boot and translates bind mount sources
+      # to host paths automatically, so only the host side (left) of these volumes
+      # needs to be adjusted to relocate storage. if you split /var/lib/calagopus-db-agent
+      # up, make sure the following paths are all still covered by a volume:
       # /var/lib/calagopus-db-agent/data (used for storing database files)
       - "/var/lib/calagopus-db-agent/:/var/lib/calagopus-db-agent/"
       - "/var/log/calagopus-db-agent/:/var/log/calagopus-db-agent/"

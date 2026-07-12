@@ -981,6 +981,7 @@ dependencies = [
  "postgres-protocol",
  "rand 0.10.2",
  "redis",
+ "regex",
  "reqwest",
  "rmp-serde",
  "rustc-hash",
