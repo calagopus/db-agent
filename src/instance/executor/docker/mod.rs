@@ -129,7 +129,14 @@ fn host_config(
             ),
         }),
         network_mode: Some("none".to_string()),
-        userns_mode: string_to_option(&config.docker.userns_mode),
+        userns_mode: if config.docker.rootless.enabled {
+            Some(format!(
+                "keep-id:uid={},gid={}",
+                data.image_uid, data.image_gid
+            ))
+        } else {
+            string_to_option(&config.docker.userns_mode)
+        },
         ..Default::default()
     }
 }
@@ -637,17 +644,23 @@ impl super::ContainerExecutor for DockerExecutor {
         let data = database.data.read().await.clone();
         let data_dir = self.app_config.data_path(data.uuid);
 
+        let rootless = self.app_config.load().docker.rootless.enabled;
+
         self.pull_image(&data.image).await?;
         tokio::fs::create_dir_all(data_dir.join("volumes")).await?;
         for mapping in &data.volumes {
             let host_path = mapping.host_path(&self.app_config, data.uuid);
             tokio::fs::create_dir_all(&host_path).await?;
-            std::os::unix::fs::chown(&host_path, Some(data.image_uid), Some(data.image_gid))?;
+            if !rootless {
+                std::os::unix::fs::chown(&host_path, Some(data.image_uid), Some(data.image_gid))?;
+            }
         }
 
         let socket_dir = self.app_config.socket_path(data.uuid);
         tokio::fs::create_dir_all(&socket_dir).await?;
-        std::os::unix::fs::chown(&socket_dir, Some(data.image_uid), Some(data.image_gid))?;
+        if !rootless {
+            std::os::unix::fs::chown(&socket_dir, Some(data.image_uid), Some(data.image_gid))?;
+        }
 
         let config = container_config(&data, &self.app_config, self.host_mounts());
 

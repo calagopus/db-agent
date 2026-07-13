@@ -211,6 +211,13 @@ nestify::nest! {
 
             #[serde(default)]
             #[schema(inline)]
+            pub rootless: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerRootless {
+                #[serde(default)]
+                pub enabled: bool,
+            },
+
+            #[serde(default)]
+            #[schema(inline)]
             pub log_config: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerLogConfig {
                 #[serde(default = "docker_log_config_type")]
                 pub r#type: String,
