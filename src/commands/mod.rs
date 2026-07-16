@@ -3,6 +3,7 @@
 use clap::{Arg, ArgMatches, Args, Command};
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
+mod completions;
 mod configure;
 mod diagnostics;
 mod service_install;
@@ -55,6 +56,10 @@ impl CliCommandGroupBuilder {
                 .about(about),
             map: HashMap::new(),
         }
+    }
+
+    pub fn get_command(&mut self) -> Command {
+        self.command.clone()
     }
 
     pub fn get_matches(&mut self) -> ArgMatches {
@@ -135,6 +140,11 @@ pub fn commands(cli: CliCommandGroupBuilder) -> CliCommandGroupBuilder {
         "version",
         "Prints the current executable version and exits.",
         version::VersionCommand,
+    )
+    .add_command(
+        "completions",
+        "Generates shell completions for the current executable.",
+        completions::CompletionsCommand,
     )
     .add_command(
         "configure",

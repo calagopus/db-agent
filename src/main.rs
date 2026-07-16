@@ -10,13 +10,15 @@ use axum::{
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa_axum::router::OpenApiRouter;
+
+pub static CLAP_COMMAND: OnceLock<clap::Command> = OnceLock::new();
 
 mod commands;
 mod config;
@@ -146,6 +148,10 @@ async fn main_rt() -> anyhow::Result<()> {
     let cli = commands::CliCommandGroupBuilder::new("db-agent", "Calagopus database agent.");
     let mut cli = commands::commands(cli);
     let mut matches = cli.get_matches();
+
+    CLAP_COMMAND
+        .set(cli.get_command())
+        .expect("failed to set CLAP_COMMAND");
 
     let config_path = matches
         .get_one::<String>("config")
