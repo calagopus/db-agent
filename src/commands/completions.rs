@@ -39,7 +39,10 @@ impl crate::commands::CliCommand<CompletionsArgs> for CompletionsCommand {
                 clap_complete::generate(
                     args.shell,
                     &mut command,
-                    binary.to_string_lossy().to_string(),
+                    binary
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("calagopus-db-agent"),
                     &mut std::io::stdout(),
                 );
 

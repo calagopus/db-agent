@@ -145,7 +145,8 @@ async fn handle_request(
 }
 
 async fn main_rt() -> anyhow::Result<()> {
-    let cli = commands::CliCommandGroupBuilder::new("db-agent", "Calagopus database agent.");
+    let cli =
+        commands::CliCommandGroupBuilder::new("calagopus-db-agent", "Calagopus database agent.");
     let mut cli = commands::commands(cli);
     let mut matches = cli.get_matches();
 
