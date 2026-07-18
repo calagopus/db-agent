@@ -3,6 +3,7 @@ use crate::{
     database::data::StoredInstance,
     instance::resources::{ContainerState, ResourceUsage},
 };
+use anyhow::Context;
 use bollard::errors::Error::DockerResponseServerError;
 use futures_util::StreamExt;
 use itertools::Itertools;
@@ -600,6 +601,13 @@ impl super::ProcessHandle for DockerProcessHandle {
 impl super::ContainerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.docker.version().await?;
+
+        let config = self.app_config.load();
+        for dir in [&config.socket_dir, &config.data_dir] {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .with_context(|| format!("failed to create directory {dir}"))?;
+        }
 
         if std::env::var("OCI_CONTAINER").is_ok() {
             match host_mounts::HostMountTable::discover(&self.docker).await {
