@@ -42,7 +42,7 @@ mod post {
 
     #[derive(ToSchema, Validate, Deserialize)]
     pub struct Payload {
-        #[garde(custom(|v: &str, ctx: &()| crate::instance::validate_database_name(v, ctx)))]
+        #[garde(custom(crate::instance::validate_database_name))]
         name: String,
     }
 

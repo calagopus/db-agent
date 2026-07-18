@@ -617,44 +617,68 @@ impl Instance {
 
     pub async fn import(
         &self,
-        db: &str,
+        db: Option<&str>,
         wipe: bool,
         reader: &mut (dyn tokio::io::AsyncRead + Send + Unpin),
     ) -> anyhow::Result<()> {
         let data = self.data.read().await;
         let socket = &data.socket_path;
 
+        if wipe && db.is_none() && !matches!(data.database_type, DatabaseType::Redis) {
+            return Err(crate::response::DisplayError::new("wipe requires a db").into());
+        }
+
         let (wipe_command, command) = match data.database_type {
             DatabaseType::Postgres => {
                 let dir = socket.rsplit_once('/').map_or("", |(dir, _)| dir);
-                let base = format!("psql -q -v ON_ERROR_STOP=1 -h '{dir}' -U postgres -d '{db}'");
-                let wipe = wipe.then(|| {
-                    format!("{base} -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'")
-                });
-                (wipe, format!("{base} -o /dev/null"))
+                match db {
+                    Some(db) => {
+                        let base =
+                            format!("psql -q -v ON_ERROR_STOP=1 -h '{dir}' -U postgres -d '{db}'");
+                        let wipe = wipe.then(|| {
+                            format!("{base} -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'")
+                        });
+                        (wipe, format!("{base} -o /dev/null"))
+                    }
+                    // no ON_ERROR_STOP: pg_dumpall output recreates existing roles
+                    None => (
+                        None,
+                        format!("psql -q -h '{dir}' -U postgres -d postgres -o /dev/null"),
+                    ),
+                }
             }
-            DatabaseType::Mariadb => {
-                let import = format!("mariadb --socket='{socket}' -u root '{db}'");
-                let wipe = wipe.then(|| {
-                    format!(
-                        "mariadb --socket='{socket}' -u root -e \
-                         'DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`;'"
-                    )
-                });
-                (wipe, import)
-            }
+            DatabaseType::Mariadb => match db {
+                Some(db) => {
+                    let import = format!("mariadb --socket='{socket}' -u root '{db}'");
+                    let wipe = wipe.then(|| {
+                        format!(
+                            "mariadb --socket='{socket}' -u root -e \
+                             'DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`;'"
+                        )
+                    });
+                    (wipe, import)
+                }
+                None => (None, format!("mariadb --socket='{socket}' -u root")),
+            },
             DatabaseType::Mongodb => {
                 let auth = mongodb_shell_auth(&data);
                 let drop = if wipe { " --drop" } else { "" };
-                let import =
-                    format!("mongorestore --host='{socket}'{auth} --archive{drop} -d '{db}'");
+                let import = match db {
+                    Some(db) => {
+                        format!("mongorestore --host='{socket}'{auth} --archive{drop} -d '{db}'")
+                    }
+                    None => format!("mongorestore --host='{socket}'{auth} --archive{drop}"),
+                };
                 (None, import)
             }
             DatabaseType::Redis => {
-                return Err(crate::response::DisplayError::new(
-                    "import is not supported for redis",
-                )
-                .into());
+                if db.is_some() {
+                    return Err(
+                        crate::response::DisplayError::new("redis has no named databases").into(),
+                    );
+                }
+                let wipe = wipe.then(|| format!("redis-cli -s '{socket}' FLUSHALL"));
+                (wipe, format!("redis-cli -s '{socket}' --pipe"))
             }
         };
         drop(data);

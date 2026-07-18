@@ -15,9 +15,9 @@ services:
       # /var/lib/calagopus-db-agent/data (used for storing database files)
       - "/var/lib/calagopus-db-agent/:/var/lib/calagopus-db-agent/"
       - "/var/log/calagopus-db-agent/:/var/log/calagopus-db-agent/"
+      - "/run/calagopus-db-agent/:/run/calagopus-db-agent/"
       # do not mount directly to /etc/ssl/certs (right side), this will cause certificate issues within the container
       - "/etc/ssl/certs/db-agent:/etc/ssl/certs/db-agent:ro"
-    command: ["/etc/calagopus-db-agent/config.yml"]
     ports:
       # PostgreSQL proxy (config: postgresql.bind)
       - 5432:5432

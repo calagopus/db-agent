@@ -8,12 +8,15 @@ mod post {
         routes::{ApiError, api::instances::_instance_::GetInstance},
     };
     use axum::http::StatusCode;
+    use garde::Validate;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
-    #[derive(ToSchema, Deserialize)]
+    #[derive(ToSchema, Validate, Deserialize)]
     pub struct Payload {
+        #[garde(inner(custom(crate::instance::validate_database_name)))]
         db: Option<String>,
+        #[garde(skip)]
         query: String,
     }
 
@@ -33,10 +36,8 @@ mod post {
         instance: GetInstance,
         crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        if let Some(db) = &data.db
-            && let Err(err) = crate::instance::validate_database_name(db, &())
-        {
-            return ApiResponse::error(&format!("invalid db name: {err}"))
+        if let Err(errors) = crate::utils::validate_data(&data) {
+            return ApiResponse::error(&errors.join(", "))
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
         }

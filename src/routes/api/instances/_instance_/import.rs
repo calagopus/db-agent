@@ -8,12 +8,15 @@ mod post {
     };
     use axum::{extract::Query, http::StatusCode};
     use futures_util::TryStreamExt;
+    use garde::Validate;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
-    #[derive(ToSchema, Deserialize)]
+    #[derive(ToSchema, Validate, Deserialize)]
     pub struct Params {
-        db: String,
+        #[garde(inner(custom(crate::instance::validate_database_name)))]
+        db: Option<String>,
+        #[garde(skip)]
         #[serde(default)]
         wipe: bool,
     }
@@ -28,12 +31,12 @@ mod post {
     ), params(
         ("instance" = uuid::Uuid, description = "The instance uuid"),
         (
-            "db" = String, Query,
-            description = "The db to import into",
+            "db" = Option<String>, Query,
+            description = "The db to import into, whole instance if omitted; must be omitted for redis",
         ),
         (
             "wipe" = Option<bool>, Query,
-            description = "Clear existing data in the target before importing",
+            description = "Clear existing data in the target before importing, requires db except for redis",
         ),
     ), request_body = String)]
     pub async fn route(
@@ -41,8 +44,8 @@ mod post {
         Query(params): Query<Params>,
         body: axum::body::Body,
     ) -> ApiResponseResult {
-        if let Err(err) = crate::instance::validate_database_name(&params.db, &()) {
-            return ApiResponse::error(&format!("invalid db name: {err}"))
+        if let Err(errors) = crate::utils::validate_data(&params) {
+            return ApiResponse::error(&errors.join(", "))
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
         }
@@ -52,7 +55,7 @@ mod post {
         );
 
         instance
-            .import(&params.db, params.wipe, &mut reader)
+            .import(params.db.as_deref(), params.wipe, &mut reader)
             .await?;
 
         ApiResponse::new_serialized(Response {}).ok()
