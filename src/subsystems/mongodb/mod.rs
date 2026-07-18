@@ -133,6 +133,17 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(());
                 }
 
+                if let Err(err) = creds.instance.verify_mongodb_auth().await {
+                    tracing::error!("[{peer}] rejected: instance {}: {err}", creds.instance.uuid);
+                    write_op_msg(
+                        &mut stream,
+                        reqid,
+                        &sasl_error("backend authorization not verified"),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
                 let (st, server_first) = Scram::start(
                     &creds.password,
                     &creds.instance.get_socket_path().await,
@@ -181,7 +192,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let st = scram.ok_or_else(|| bad("not authenticated"))?;
     tracing::info!("[{peer}] {:?}@{:?} authenticated", st.user, st.db);
-    let mut backend = scram::backend_auth(&st.socket, &st.user, &st.password, &st.db).await?;
+    let mut backend = scram::backend_auth(&st.socket, &st.user, &st.password).await?;
     tracing::debug!("[{peer}] backend ready, relaying");
 
     let _guard = st

@@ -90,6 +90,8 @@ pub struct StoredInstance {
     pub timezone: Option<String>,
     pub env: BTreeMap<String, String>,
     pub cmd: Option<Vec<String>>,
+    #[serde(skip)]
+    pub root_password: Option<String>,
     pub created: chrono::DateTime<chrono::Utc>,
 }
 
@@ -143,6 +145,7 @@ impl FromRow<'_, SqliteRow> for StoredInstance {
                         source: Box::new(e),
                     })?
             },
+            root_password: row.try_get("root_password")?,
             created: decode_created(row)?,
         })
     }
@@ -223,6 +226,7 @@ impl StoredInstanceCreate {
                         timezone: self.timezone,
                         env: self.env,
                         cmd: self.cmd,
+                        root_password: None,
                         created,
                     });
                 }

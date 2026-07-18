@@ -3,16 +3,25 @@ use mongodb::bson::{Bson, Document, doc};
 use std::path::PathBuf;
 
 const ADMIN_DATABASE: &str = "admin";
+pub const ROOT_USERNAME: &str = "calagopus_root";
 
 pub struct MongodbConnection {
     client: mongodb::Client,
 }
 
 impl MongodbConnection {
-    pub fn new(socket: PathBuf) -> anyhow::Result<Self> {
+    pub fn new(socket: PathBuf, root_password: Option<&str>) -> anyhow::Result<Self> {
         let options = mongodb::options::ClientOptions::builder()
             .hosts(vec![mongodb::options::ServerAddress::Unix { path: socket }])
             .direct_connection(true)
+            .server_selection_timeout(std::time::Duration::from_secs(5))
+            .credential(root_password.map(|password| {
+                mongodb::options::Credential::builder()
+                    .username(ROOT_USERNAME.to_string())
+                    .password(password.to_string())
+                    .source(ADMIN_DATABASE.to_string())
+                    .build()
+            }))
             .build();
 
         Ok(Self {
@@ -27,6 +36,33 @@ impl MongodbConnection {
             .await?;
         Ok(())
     }
+
+    pub async fn create_root(&self, password: &str) -> anyhow::Result<()> {
+        self.run_admin(doc! {
+            "createUser": ROOT_USERNAME,
+            "pwd": password,
+            "roles": [{ "role": "root", "db": ADMIN_DATABASE }],
+        })
+        .await
+    }
+
+    pub async fn auth_enforced(&self) -> anyhow::Result<bool> {
+        match self
+            .client
+            .database(ADMIN_DATABASE)
+            .run_command(doc! { "usersInfo": 1 })
+            .await
+        {
+            Ok(_) => Ok(false),
+            Err(err) if is_unauthorized(&err) => Ok(true),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+fn is_unauthorized(err: &mongodb::error::Error) -> bool {
+    const UNAUTHORIZED: i32 = 13;
+    matches!(*err.kind, mongodb::error::ErrorKind::Command(ref c) if c.code == UNAUTHORIZED)
 }
 
 #[async_trait::async_trait]

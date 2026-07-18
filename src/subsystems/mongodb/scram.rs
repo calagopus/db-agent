@@ -90,7 +90,6 @@ pub async fn backend_auth(
     socket: &Path,
     user: &str,
     password: &str,
-    db: &str,
 ) -> std::io::Result<UnixStream> {
     let mut be = UnixStream::connect(socket).await?;
 
@@ -105,7 +104,7 @@ pub async fn backend_auth(
         "saslStart": 1,
         "mechanism": "SCRAM-SHA-256",
         "payload": binary(client_first.as_bytes()),
-        "$db": db,
+        "$db": "admin",
     };
     write_op_msg_request(&mut be, 2, &start).await?;
 
@@ -145,7 +144,7 @@ pub async fn backend_auth(
         "saslContinue": 1,
         "conversationId": conversation_id,
         "payload": binary(client_final.as_bytes()),
-        "$db": db,
+        "$db": "admin",
     };
     write_op_msg_request(&mut be, 3, &cont).await?;
 
@@ -154,6 +153,36 @@ pub async fn backend_auth(
     if reply.get_f64("ok").ok() != Some(1.0) {
         return Err(bad("backend rejected auth"));
     }
+
+    let server_final = String::from_utf8(
+        reply
+            .get_binary_generic("payload")
+            .map_err(|_| bad("no server-final"))?
+            .clone(),
+    )
+    .map_err(|_| bad("non-utf8 server-final"))?;
+    let server_key = hmac(&salted, b"Server Key");
+    let server_sig = B64.encode(hmac(&server_key, auth_message.as_bytes()));
+    if field(&server_final, "v=") != Some(server_sig) {
+        return Err(bad("backend server signature mismatch"));
+    }
+
+    if !reply.get_bool("done").unwrap_or(false) {
+        let finish = doc! {
+            "saslContinue": 1,
+            "conversationId": conversation_id,
+            "payload": binary(b""),
+            "$db": "admin",
+        };
+        write_op_msg_request(&mut be, 4, &finish).await?;
+
+        let (_, _, body) = read_message(&mut be).await?;
+        let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
+        if reply.get_f64("ok").ok() != Some(1.0) || !reply.get_bool("done").unwrap_or(false) {
+            return Err(bad("backend auth did not complete"));
+        }
+    }
+
     Ok(be)
 }
 

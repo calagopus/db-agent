@@ -37,10 +37,18 @@ impl super::Instance {
     pub async fn connection(&self) -> anyhow::Result<Box<dyn DatabaseConnection>> {
         let socket = self.get_socket_path().await;
 
-        Ok(match self.data.read().await.database_type {
+        let database_type = self.data.read().await.database_type;
+        Ok(match database_type {
             super::DatabaseType::Postgres => Box::new(postgres::PostgresConnection::new(socket)),
             super::DatabaseType::Mariadb => Box::new(mariadb::MariadbConnection::new(socket)),
-            super::DatabaseType::Mongodb => Box::new(mongodb::MongodbConnection::new(socket)?),
+            super::DatabaseType::Mongodb => {
+                self.ensure_mongodb_root().await?;
+                let root_password = self.data.read().await.root_password.clone();
+                Box::new(mongodb::MongodbConnection::new(
+                    socket,
+                    root_password.as_deref(),
+                )?)
+            }
             super::DatabaseType::Redis => Box::new(redis::RedisConnection::new(socket)?),
         })
     }

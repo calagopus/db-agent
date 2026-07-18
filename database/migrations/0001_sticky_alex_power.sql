@@ -1,0 +1,1 @@
+ALTER TABLE `instances` ADD `root_password` text;

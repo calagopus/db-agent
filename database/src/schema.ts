@@ -21,6 +21,7 @@ export const instances = sqliteTable(
     timezone: text(),
     env: text().default('{}').notNull(),
     cmd: text(),
+    root_password: text(),
     created: integer({ mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
   },
   (cols) => [

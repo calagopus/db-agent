@@ -82,6 +82,7 @@ pub struct InnerInstance {
     pub data: RwLock<crate::database::data::StoredInstance>,
 
     pub process_handle: RwLock<Option<Arc<dyn executor::ProcessHandle>>>,
+    pub backend_auth_error: RwLock<Option<String>>,
 
     pub disk_usage: AtomicU64,
     disk_checker_task: tokio::task::JoinHandle<()>,
@@ -113,6 +114,7 @@ impl Instance {
                     .inserter(weak.clone(), data.database_type),
                 data: RwLock::new(data),
                 process_handle: RwLock::new(None),
+                backend_auth_error: RwLock::new(None),
                 disk_usage: AtomicU64::new(0),
                 disk_checker_task,
             }
@@ -135,6 +137,61 @@ impl Instance {
 
     pub async fn is_suspended(&self) -> bool {
         self.data.read().await.suspended
+    }
+
+    /// verifies mongod enforces authorization and the agent holds root
+    /// credentials, bootstrapping the root user when possible. sessions
+    /// must not be relayed unless this succeeds (fail closed).
+    pub async fn verify_mongodb_auth(&self) -> anyhow::Result<()> {
+        let result = self.verify_mongodb_auth_inner().await;
+        *self.backend_auth_error.write().await = result.as_ref().err().map(|e| e.to_string());
+        result
+    }
+
+    async fn verify_mongodb_auth_inner(&self) -> anyhow::Result<()> {
+        let conn = connection::mongodb::MongodbConnection::new(self.get_socket_path().await, None)?;
+        let enforced = conn.auth_enforced().await?;
+
+        if let Err(err) = self.ensure_mongodb_root().await {
+            if enforced {
+                anyhow::bail!(
+                    "authorization is enforced but the agent has no root credentials: {err}"
+                );
+            }
+            return Err(err);
+        }
+
+        if !enforced {
+            anyhow::bail!("mongod does not enforce authorization, add --auth and restart");
+        }
+
+        Ok(())
+    }
+
+    /// creates and stores the agent's root user if missing. works while
+    /// authorization is off, or on a fresh `--auth` instance via the
+    /// localhost exception; must run before any other user is created
+    pub async fn ensure_mongodb_root(&self) -> anyhow::Result<()> {
+        let socket = self.get_socket_path().await;
+
+        // write lock serializes concurrent bootstrap attempts
+        let mut data = self.data.write().await;
+        if data.root_password.is_some() {
+            return Ok(());
+        }
+
+        let conn = connection::mongodb::MongodbConnection::new(socket, None)?;
+        let password = crate::utils::generate_password();
+        conn.create_root(&password).await?;
+
+        sqlx::query("UPDATE instances SET root_password = ? WHERE uuid = ?")
+            .bind(&password)
+            .bind(self.uuid)
+            .execute(self.app_state.database.write())
+            .await?;
+        data.root_password = Some(password);
+
+        Ok(())
     }
 
     pub async fn resync_users(&self) -> anyhow::Result<()> {
@@ -534,10 +591,13 @@ impl Instance {
                     }
                 }
             }
-            DatabaseType::Mongodb => match db {
-                Some(db) => format!("mongodump --host='{socket}' --archive -d '{db}'"),
-                None => format!("mongodump --host='{socket}' --archive"),
-            },
+            DatabaseType::Mongodb => {
+                let auth = mongodb_shell_auth(&data);
+                match db {
+                    Some(db) => format!("mongodump --host='{socket}'{auth} --archive -d '{db}'"),
+                    None => format!("mongodump --host='{socket}'{auth} --archive"),
+                }
+            }
             DatabaseType::Redis => format!("redis-cli -s '{socket}' --rdb -"),
         };
         drop(data);
@@ -584,8 +644,10 @@ impl Instance {
                 (wipe, import)
             }
             DatabaseType::Mongodb => {
+                let auth = mongodb_shell_auth(&data);
                 let drop = if wipe { " --drop" } else { "" };
-                let import = format!("mongorestore --host='{socket}' --archive{drop} -d '{db}'");
+                let import =
+                    format!("mongorestore --host='{socket}'{auth} --archive{drop} -d '{db}'");
                 (None, import)
             }
             DatabaseType::Redis => {
@@ -681,6 +743,7 @@ impl Instance {
     pub async fn to_api_response(&self) -> ApiInstance {
         ApiInstance {
             data: self.data.read().await.clone(),
+            backend_auth_error: self.backend_auth_error.read().await.clone(),
             utilization: self.resource_usage().await,
         }
     }
@@ -695,10 +758,22 @@ impl Instance {
     }
 }
 
+fn mongodb_shell_auth(data: &crate::database::data::StoredInstance) -> String {
+    data.root_password
+        .as_deref()
+        .map_or_else(String::new, |pw| {
+            format!(
+                " -u {} -p '{pw}' --authenticationDatabase admin",
+                connection::mongodb::ROOT_USERNAME
+            )
+        })
+}
+
 #[derive(ToSchema, Serialize, Deserialize)]
 pub struct ApiInstance {
     #[serde(flatten)]
     pub data: crate::database::data::StoredInstance,
+    pub backend_auth_error: Option<String>,
     pub utilization: resources::ResourceUsage,
 }
 
