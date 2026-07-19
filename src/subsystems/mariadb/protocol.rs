@@ -10,6 +10,8 @@ pub const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 pub const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 pub const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 pub const CLIENT_PLUGIN_AUTH_LENENC: u32 = 0x0020_0000;
+pub const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
+pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 
 pub const NATIVE: &str = "mysql_native_password";
 
@@ -19,7 +21,9 @@ const CAPS: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_SECURE_CONNECTION
     | CLIENT_PLUGIN_AUTH
     | CLIENT_CONNECT_WITH_DB
-    | CLIENT_TRANSACTIONS;
+    | CLIENT_TRANSACTIONS
+    | CLIENT_MULTI_STATEMENTS
+    | CLIENT_MULTI_RESULTS;
 
 pub fn server_handshake(scramble: &[u8; 20], ssl: bool) -> Vec<u8> {
     let mut caps = CAPS;
