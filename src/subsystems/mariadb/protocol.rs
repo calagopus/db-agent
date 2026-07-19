@@ -10,6 +10,8 @@ pub const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 pub const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 pub const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 pub const CLIENT_PLUGIN_AUTH_LENENC: u32 = 0x0020_0000;
+pub const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
+pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 
 pub const NATIVE: &str = "mysql_native_password";
 
@@ -19,7 +21,16 @@ const CAPS: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_SECURE_CONNECTION
     | CLIENT_PLUGIN_AUTH
     | CLIENT_CONNECT_WITH_DB
-    | CLIENT_TRANSACTIONS;
+    | CLIENT_TRANSACTIONS
+    | CLIENT_MULTI_STATEMENTS
+    | CLIENT_MULTI_RESULTS;
+
+// Caps whose bit must match the fixed packet layout handshake_response() writes.
+const BACKEND_REQUIRED_CAPS: u32 =
+    CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_CONNECT_WITH_DB | CLIENT_PLUGIN_AUTH;
+// Caps safe to pass through from the client as-is.
+const BACKEND_FORWARDABLE_CAPS: u32 =
+    CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_TRANSACTIONS | CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS;
 
 pub fn server_handshake(scramble: &[u8; 20], ssl: bool) -> Vec<u8> {
     let mut caps = CAPS;
@@ -45,8 +56,9 @@ pub fn server_handshake(scramble: &[u8; 20], ssl: bool) -> Vec<u8> {
     p
 }
 
-pub fn handshake_response(user: &str, token: &[u8], database: &str) -> Vec<u8> {
-    let mut p = CAPS.to_le_bytes().to_vec();
+pub fn handshake_response(user: &str, token: &[u8], database: &str, client_caps: u32) -> Vec<u8> {
+    let caps = BACKEND_REQUIRED_CAPS | (client_caps & BACKEND_FORWARDABLE_CAPS);
+    let mut p = caps.to_le_bytes().to_vec();
     p.extend_from_slice(&(16 * 1024 * 1024u32).to_le_bytes()); // max packet
     p.push(45); // charset
     p.extend_from_slice(&[0; 23]); // reserved
@@ -89,6 +101,7 @@ pub fn err_packet(code: u16, sqlstate: &str, msg: &str) -> Vec<u8> {
 }
 
 pub struct HandshakeResponse {
+    pub caps: u32,
     pub user: String,
     pub auth_response: Vec<u8>,
     pub database: String,
@@ -123,6 +136,7 @@ pub fn parse_handshake_response(p: &[u8]) -> std::io::Result<HandshakeResponse> 
         String::new()
     };
     Ok(HandshakeResponse {
+        caps,
         user,
         auth_response,
         database,
