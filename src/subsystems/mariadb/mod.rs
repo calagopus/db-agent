@@ -162,6 +162,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         &hr.user,
         &creds.password,
         &hr.database,
+        hr.caps,
     )
     .await?;
     tracing::debug!("[{peer}] backend ready, relaying");
@@ -178,6 +179,7 @@ async fn backend_auth(
     user: &str,
     password: &str,
     database: &str,
+    client_caps: u32,
 ) -> std::io::Result<UnixStream> {
     let mut be = UnixStream::connect(socket).await?;
     let (seq, hs) = read_packet(&mut be).await?;
@@ -186,7 +188,7 @@ async fn backend_auth(
     write_packet(
         &mut be,
         seq + 1,
-        &protocol::handshake_response(user, &token, database),
+        &protocol::handshake_response(user, &token, database, client_caps),
     )
     .await?;
 
