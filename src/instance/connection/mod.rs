@@ -28,6 +28,7 @@ pub trait DatabaseConnection: Send + Sync {
 
     async fn create_database(&self, name: &str) -> anyhow::Result<()>;
     async fn delete_database(&self, name: &str) -> anyhow::Result<()>;
+    async fn recreate_database(&self, name: &str, users: &[UserIdentifier]) -> anyhow::Result<()>;
     async fn get_size(&self, name: &str) -> anyhow::Result<i64>;
 
     async fn query(&self, db: Option<&str>, query: &str) -> anyhow::Result<QueryResult>;

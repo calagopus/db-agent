@@ -75,6 +75,14 @@ impl DatabaseConnection for RedisConnection {
         anyhow::bail!("redis has no named databases");
     }
 
+    async fn recreate_database(
+        &self,
+        _name: &str,
+        _users: &[UserIdentifier],
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("redis has no named databases");
+    }
+
     async fn get_size(&self, _name: &str) -> anyhow::Result<i64> {
         anyhow::bail!("redis has no named databases");
     }

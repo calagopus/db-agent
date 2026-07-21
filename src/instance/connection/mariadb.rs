@@ -105,6 +105,11 @@ impl DatabaseConnection for MariadbConnection {
             .await
     }
 
+    async fn recreate_database(&self, name: &str, _users: &[UserIdentifier]) -> anyhow::Result<()> {
+        self.delete_database(name).await?;
+        self.create_database(name).await
+    }
+
     async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
         let mut conn = self.conn().await?;
         let size: Option<Option<i64>> = conn

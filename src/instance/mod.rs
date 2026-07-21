@@ -315,6 +315,27 @@ impl Instance {
         Ok(())
     }
 
+    pub async fn recreate_database(
+        &self,
+        database: &crate::database::data::StoredDatabase,
+    ) -> anyhow::Result<()> {
+        self.ensure_acl_writable("recreate a database").await?;
+
+        let users = self
+            .get_database_users(database.uuid)
+            .await?
+            .into_iter()
+            .map(|user| UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.connection()
+            .await?
+            .recreate_database(&database.name, &users)
+            .await?;
+
+        Ok(())
+    }
+
     async fn get_database_users(
         &self,
         database_uuid: uuid::Uuid,

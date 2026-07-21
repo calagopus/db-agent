@@ -43,7 +43,7 @@ fn disk_check_concurrency() -> usize {
 }
 
 fn database_url() -> String {
-    "sqlite://./data/database.db".to_string()
+    "sqlite:///var/lib/calagopus-db-agent/data/database.db".to_string()
 }
 fn database_migrate() -> bool {
     true

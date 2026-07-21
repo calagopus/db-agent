@@ -109,6 +109,10 @@ impl DatabaseConnection for MongodbConnection {
         Ok(())
     }
 
+    async fn recreate_database(&self, name: &str, _users: &[UserIdentifier]) -> anyhow::Result<()> {
+        self.delete_database(name).await
+    }
+
     async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
         let stats = self
             .client

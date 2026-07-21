@@ -108,6 +108,17 @@ impl DatabaseConnection for PostgresConnection {
         .await
     }
 
+    async fn recreate_database(&self, name: &str, users: &[UserIdentifier]) -> anyhow::Result<()> {
+        self.delete_database(name).await?;
+        self.create_database(name).await?;
+
+        for user in users {
+            self.grant_user(user, name).await?;
+        }
+
+        Ok(())
+    }
+
     async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
         let row = self
             .client(ADMIN_DATABASE)
