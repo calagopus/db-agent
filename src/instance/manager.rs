@@ -51,17 +51,8 @@ impl InstanceManager {
         create: crate::database::data::StoredInstanceCreate,
     ) -> anyhow::Result<super::Instance> {
         let data = create.insert(&app_state.database).await?;
-        let uuid = data.uuid;
 
         let instance = super::Instance::new(app_state.clone(), data)?;
-        if let Err(err) = instance.create_container().await {
-            sqlx::query("DELETE FROM instances WHERE uuid = ?")
-                .bind(uuid)
-                .execute(app_state.database.write())
-                .await?;
-            return Err(err);
-        }
-
         self.instances.write().await.push(instance.clone());
 
         Ok(instance)

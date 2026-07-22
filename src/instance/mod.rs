@@ -84,6 +84,8 @@ pub struct InnerInstance {
     pub process_handle: RwLock<Option<Arc<dyn executor::ProcessHandle>>>,
     pub backend_auth_error: RwLock<Option<String>>,
 
+    power_lock: tokio::sync::Mutex<()>,
+
     pub disk_usage: AtomicU64,
     disk_checker_task: tokio::task::JoinHandle<()>,
 }
@@ -115,6 +117,7 @@ impl Instance {
                 data: RwLock::new(data),
                 process_handle: RwLock::new(None),
                 backend_auth_error: RwLock::new(None),
+                power_lock: tokio::sync::Mutex::new(()),
                 disk_usage: AtomicU64::new(0),
                 disk_checker_task,
             }
@@ -554,6 +557,11 @@ impl Instance {
             );
         }
 
+        let _guard = self.power_lock.lock().await;
+
+        self.destroy_container().await?;
+        self.create_container().await?;
+
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.start().await,
             None => anyhow::bail!("no container handle for database {}", self.uuid),
@@ -561,16 +569,18 @@ impl Instance {
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
+        let _guard = self.power_lock.lock().await;
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.stop().await,
-            None => anyhow::bail!("no container handle for database {}", self.uuid),
+            None => Ok(()),
         }
     }
 
     pub async fn kill(&self) -> anyhow::Result<()> {
+        let _guard = self.power_lock.lock().await;
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.kill().await,
-            None => anyhow::bail!("no container handle for database {}", self.uuid),
+            None => Ok(()),
         }
     }
 

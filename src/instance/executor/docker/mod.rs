@@ -195,8 +195,99 @@ impl DockerExecutor {
         self.host_mounts.get().and_then(Option::as_ref)
     }
 
+    async fn image_exists(&self, image_name: &str) -> bool {
+        self.docker
+            .list_images(Some(bollard::query_parameters::ListImagesOptions {
+                all: true,
+                filters: Some(HashMap::from([(
+                    "reference".to_string(),
+                    vec![image_name.to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .is_ok_and(|images| !images.is_empty())
+    }
+
     async fn pull_image(&self, image: &str) -> Result<(), anyhow::Error> {
         if image.ends_with('~') {
+            return Ok(());
+        }
+
+        let (image_name, tag) = match image.rsplit_once(':') {
+            Some((name, tag)) if !tag.is_empty() => {
+                let colon_is_tag_sep = image.rfind('/').is_none_or(|slash| slash < name.len());
+                if colon_is_tag_sep {
+                    (name, tag)
+                } else {
+                    (image, "latest")
+                }
+            }
+            _ => (image, "latest"),
+        };
+
+        let pull_cache = {
+            type InnerMap = HashMap<String, Arc<tokio::sync::Mutex<Option<std::time::Instant>>>>;
+            static IMAGE_PULL_CACHE: std::sync::OnceLock<Arc<parking_lot::Mutex<InnerMap>>> =
+                std::sync::OnceLock::new();
+
+            IMAGE_PULL_CACHE.get_or_init(|| {
+                let cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+                tokio::spawn({
+                    let cache = Arc::clone(&cache);
+                    let config = Arc::clone(&self.app_config);
+
+                    async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+                            let mut cache = cache.lock();
+                            let now = std::time::Instant::now();
+                            let duration = config.load().docker.registry_image_fetch_cache.duration;
+                            cache.retain(
+                                |_,
+                                 timestamp: &mut Arc<
+                                    tokio::sync::Mutex<Option<std::time::Instant>>,
+                                >| {
+                                    timestamp.try_lock().is_ok_and(|t| {
+                                        now.duration_since(t.unwrap_or(std::time::Instant::now()))
+                                            .as_secs()
+                                            < duration
+                                    })
+                                },
+                            );
+                        }
+                    }
+                });
+
+                cache
+            })
+        };
+
+        let cache_config = self.app_config.load().docker.registry_image_fetch_cache;
+
+        let mut last_pull = if cache_config.enabled {
+            let entry = {
+                let mut cache = pull_cache.lock();
+                Arc::clone(cache.entry(image.into()).or_default())
+            };
+
+            Some(entry.lock_owned().await)
+        } else {
+            None
+        };
+
+        if let Some(guard) = &last_pull
+            && let Some(pulled_at) = **guard
+            && pulled_at.elapsed().as_secs() < cache_config.duration
+            && self.image_exists(image_name).await
+        {
+            tracing::debug!(
+                image = %image_name,
+                "image pull skipped, cached as recently pulled"
+            );
+
             return Ok(());
         }
 
@@ -213,8 +304,6 @@ impl DockerExecutor {
             }
         }
 
-        let (image_name, tag) = image.split_once(':').unwrap_or((image, "latest"));
-
         let mut stream = self.docker.create_image(
             Some(bollard::query_parameters::CreateImageOptions {
                 from_image: Some(image_name.to_string()),
@@ -226,26 +315,29 @@ impl DockerExecutor {
         );
 
         while let Some(status) = stream.next().await {
-            if let Err(err) = status {
-                let exists = self
-                    .docker
-                    .list_images(Some(bollard::query_parameters::ListImagesOptions {
-                        all: true,
-                        filters: Some(HashMap::from([(
-                            "reference".to_string(),
-                            vec![image_name.to_string()],
-                        )])),
-                        ..Default::default()
-                    }))
-                    .await
-                    .is_ok_and(|images| !images.is_empty());
+            match status {
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::error!(
+                        image = %image_name,
+                        "failed to pull image: {:?}",
+                        err
+                    );
 
-                if !exists {
-                    return Err(err.into());
+                    if !self.image_exists(image_name).await {
+                        return Err(err.into());
+                    }
+
+                    tracing::warn!(
+                        image = %image_name,
+                        "image already exists locally, ignoring pull error"
+                    );
                 }
-
-                tracing::warn!(image = %image_name, "image pull failed, using local copy");
             }
+        }
+
+        if let Some(guard) = &mut last_pull {
+            **guard = Some(std::time::Instant::now());
         }
 
         Ok(())

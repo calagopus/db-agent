@@ -87,7 +87,26 @@ fn docker_container_pid_limit() -> i64 {
     512
 }
 fn docker_timezone() -> String {
-    "UTC".to_string()
+    if let Ok(tz) = std::env::var("TZ") {
+        return tz;
+    } else if let Ok(tz) = File::open("/etc/timezone") {
+        use std::io::BufRead;
+        let mut buf = String::new();
+        if std::io::BufReader::new(tz).read_line(&mut buf).is_ok() {
+            let tz = buf.trim();
+            if !tz.is_empty() {
+                return tz.to_string();
+            }
+        }
+    }
+
+    chrono::Local::now().offset().to_string()
+}
+fn docker_registry_image_fetch_cache_enabled() -> bool {
+    true
+}
+fn docker_registry_image_fetch_cache_duration() -> u64 {
+    5 * 60
 }
 fn docker_log_config_type() -> String {
     "local".to_string()
@@ -208,6 +227,15 @@ nestify::nest! {
             pub timezone: String,
             #[serde(default)]
             pub userns_mode: String,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub registry_image_fetch_cache: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerRegistryImageFetchCache {
+                #[serde(default = "docker_registry_image_fetch_cache_enabled")]
+                pub enabled: bool,
+                #[serde(default = "docker_registry_image_fetch_cache_duration")]
+                pub duration: u64,
+            },
 
             #[serde(default)]
             #[schema(inline)]
