@@ -1,5 +1,10 @@
-use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
-use crate::{config::Config, subsystems::status::SubsystemConnections, utils::bad};
+use crate::{
+    config::Config,
+    instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
+    subsystems::status::SubsystemConnections,
+    tls::ReloadableAcceptor,
+    utils::bad,
+};
 use bson::doc;
 use protocol::{
     OP_MSG, OP_QUERY, binary, hello_doc, op_msg_doc, read_message, sasl_error, write_op_msg,
@@ -11,7 +16,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::{TcpListener, TcpStream},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::server::TlsStream;
 
 mod protocol;
 mod scram;
@@ -34,6 +39,16 @@ pub async fn run(
             None
         }
     };
+    if let Some(acceptor) = &acceptor {
+        let config = Arc::clone(&config);
+        acceptor.spawn_reloader("mongodb", move || {
+            let config = config.load();
+            (
+                config.mongodb.tls.cert.clone(),
+                config.mongodb.tls.key.clone(),
+            )
+        });
+    }
     let bind = config.load().mongodb.bind;
 
     let listener = TcpListener::bind(bind).await?;
@@ -56,7 +71,7 @@ async fn handle(
     tcp: TcpStream,
     status: Arc<SubsystemConnections>,
     routes: Arc<DatabaseRouteManager>,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ReloadableAcceptor>,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     match negotiate(tcp, &acceptor).await? {
@@ -71,7 +86,7 @@ async fn handle(
     }
 }
 
-async fn negotiate(tcp: TcpStream, acceptor: &Option<TlsAcceptor>) -> std::io::Result<Conn> {
+async fn negotiate(tcp: TcpStream, acceptor: &Option<ReloadableAcceptor>) -> std::io::Result<Conn> {
     let mut b = [0; 1];
     let n = tcp.peek(&mut b).await?;
     match acceptor {

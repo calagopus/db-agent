@@ -1,7 +1,8 @@
-use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
 use crate::{
     config::Config,
+    instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
     subsystems::status::SubsystemConnections,
+    tls::ReloadableAcceptor,
     utils::{SafeSliceExt, SafeSliceMutExt, bad, get_array},
 };
 use protocol::{read_packet, write_packet};
@@ -11,7 +12,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::{TcpListener, TcpStream, UnixStream},
 };
-use tokio_rustls::TlsAcceptor;
 
 mod auth;
 mod protocol;
@@ -29,6 +29,16 @@ pub async fn run(
             None
         }
     };
+    if let Some(acceptor) = &acceptor {
+        let config = Arc::clone(&config);
+        acceptor.spawn_reloader("mariadb", move || {
+            let config = config.load();
+            (
+                config.mariadb.tls.cert.clone(),
+                config.mariadb.tls.key.clone(),
+            )
+        });
+    }
     let bind = config.load().mariadb.bind;
 
     let listener = TcpListener::bind(bind).await?;
@@ -51,7 +61,7 @@ async fn handle(
     mut tcp: TcpStream,
     status: Arc<SubsystemConnections>,
     routes: Arc<DatabaseRouteManager>,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ReloadableAcceptor>,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     let mut scramble = [0; 20];

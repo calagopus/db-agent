@@ -425,7 +425,7 @@ async fn main_rt() -> anyhow::Result<()> {
 
                 async move {
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+                        tokio::time::sleep(std::time::Duration::from_hours(24)).await;
                         tracing::info!("reloading tls certs");
 
                         if let Err(err) = rustls_config

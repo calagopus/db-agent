@@ -1,11 +1,15 @@
-use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
-use crate::{config::Config, subsystems::status::SubsystemConnections};
+use crate::{
+    config::Config,
+    instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
+    subsystems::status::SubsystemConnections,
+    tls::ReloadableAcceptor,
+};
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixStream},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::server::TlsStream;
 
 mod resp;
 
@@ -27,6 +31,13 @@ pub async fn run(
             None
         }
     };
+    if let Some(acceptor) = &acceptor {
+        let config = Arc::clone(&config);
+        acceptor.spawn_reloader("redis", move || {
+            let config = config.load();
+            (config.redis.tls.cert.clone(), config.redis.tls.key.clone())
+        });
+    }
     let bind = config.load().redis.bind;
 
     let listener = TcpListener::bind(bind).await?;
@@ -49,7 +60,7 @@ async fn handle(
     tcp: TcpStream,
     status: &Arc<SubsystemConnections>,
     routes: &DatabaseRouteManager,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ReloadableAcceptor>,
     peer: SocketAddr,
 ) -> io::Result<()> {
     match negotiate(tcp, &acceptor).await? {
@@ -64,7 +75,7 @@ async fn handle(
     }
 }
 
-async fn negotiate(tcp: TcpStream, acceptor: &Option<TlsAcceptor>) -> io::Result<Conn> {
+async fn negotiate(tcp: TcpStream, acceptor: &Option<ReloadableAcceptor>) -> io::Result<Conn> {
     let mut b = [0; 1];
     let n = tcp.peek(&mut b).await?;
     match acceptor {

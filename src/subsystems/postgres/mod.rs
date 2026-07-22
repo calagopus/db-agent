@@ -1,7 +1,8 @@
-use crate::instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager};
 use crate::{
     config::Config,
+    instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
     subsystems::status::SubsystemConnections,
+    tls::ReloadableAcceptor,
     utils::{SafeSliceExt, bad},
 };
 use protocol::Params;
@@ -10,7 +11,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UnixStream},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::server::TlsStream;
 
 mod protocol;
 mod scram;
@@ -33,6 +34,16 @@ pub async fn run(
             None
         }
     };
+    if let Some(acceptor) = &acceptor {
+        let config = Arc::clone(&config);
+        acceptor.spawn_reloader("postgres", move || {
+            let config = config.load();
+            (
+                config.postgres.tls.cert.clone(),
+                config.postgres.tls.key.clone(),
+            )
+        });
+    }
     let bind = config.load().postgres.bind;
 
     let listener = TcpListener::bind(bind).await?;
@@ -55,7 +66,7 @@ async fn handle(
     tcp: TcpStream,
     status: Arc<SubsystemConnections>,
     routes: Arc<DatabaseRouteManager>,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<ReloadableAcceptor>,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     let (conn, preread) = negotiate(tcp, &acceptor).await?;
@@ -73,7 +84,7 @@ async fn handle(
 
 async fn negotiate(
     mut tcp: TcpStream,
-    acceptor: &Option<TlsAcceptor>,
+    acceptor: &Option<ReloadableAcceptor>,
 ) -> std::io::Result<(Conn, Option<Params>)> {
     loop {
         let body = protocol::read_startup_body(&mut tcp).await?;
