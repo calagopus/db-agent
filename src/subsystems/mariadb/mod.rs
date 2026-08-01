@@ -21,13 +21,11 @@ pub async fn run(
     status: Arc<SubsystemConnections>,
     routes: Arc<DatabaseRouteManager>,
 ) -> anyhow::Result<()> {
-    let acceptor = {
-        let config = config.load();
-        if config.mariadb.tls.enabled {
-            crate::tls::build_acceptor(&config.mariadb.tls.cert, &config.mariadb.tls.key)?
-        } else {
-            None
-        }
+    let tls = config.load().mariadb.tls.clone();
+    let acceptor = if tls.enabled {
+        Some(crate::tls::build_acceptor(&tls, &[]).await?)
+    } else {
+        None
     };
     if let Some(acceptor) = &acceptor {
         let config = Arc::clone(&config);
@@ -45,7 +43,7 @@ pub async fn run(
     status.mark_running();
     tracing::info!(
         "mariadb listening on {bind} (client TLS: {})",
-        if acceptor.is_some() { "on" } else { "off" }
+        acceptor.as_ref().map_or("off", ReloadableAcceptor::mode)
     );
 
     crate::utils::accept_loop(&listener, "mariadb", |tcp, peer| {

@@ -119,10 +119,12 @@ fn docker_log_config_config() -> std::collections::BTreeMap<String, String> {
     ])
 }
 
-#[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)]
+#[derive(Clone, ToSchema, Deserialize, Serialize, DefaultFromSerde)]
 pub struct Tls {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub ktls_enabled: bool,
     #[serde(default = "tls_cert")]
     pub cert: String,
     #[serde(default = "tls_key")]
@@ -308,6 +310,17 @@ pub struct Config {
 }
 
 impl Config {
+    pub const DEFAULT_PATH: &'static str = "/etc/calagopus-db-agent/config.yml";
+
+    pub fn find() -> Option<&'static str> {
+        let paths = ["/etc/calagopus-db-agent/config.yml", "./config.yml"];
+
+        paths
+            .iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .copied()
+    }
+
     pub fn open(path: &str) -> anyhow::Result<Arc<Self>> {
         let inner: InnerConfig = if Path::new(path).exists() {
             let file = File::open(path).context(format!("failed to open config file {path}"))?;

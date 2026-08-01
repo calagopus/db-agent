@@ -47,6 +47,10 @@ pub fn is_silent_error(err: &std::io::Error) -> bool {
         std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::UnexpectedEof
+            // kTLS reports a peer close_notify as a zero-length write, which the copy loop
+            // turns into WriteZero
+            | std::io::ErrorKind::WriteZero
+            | std::io::ErrorKind::TimedOut
     )
 }
 

@@ -10,7 +10,7 @@ pub struct DiagnosticsArgs {
         short = 'l',
         long = "log-lines",
         help = "number of log lines to include in the report",
-        default_value_t = 100
+        default_value_t = 500
     )]
     pub log_lines: usize,
 }
@@ -29,10 +29,11 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
 
                 let config_path = arg_matches
                     .get_one::<String>("config")
-                    .expect("config path is required")
-                    .to_string();
+                    .map(|path| path.as_str())
+                    .or_else(|| crate::config::Config::find())
+                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
 
-                let config = match crate::config::Config::open(&config_path) {
+                let config = match crate::config::Config::open(config_path) {
                     Ok(config) => config,
                     Err(err) => {
                         eprintln!("{}: {err:#}", "failed to load config".red());
@@ -80,6 +81,11 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                     &mut output,
                     "api tls enabled",
                     &config.api.tls.enabled.to_string(),
+                )?;
+                write_line(
+                    &mut output,
+                    "api tls kernel",
+                    &config.api.tls.ktls_enabled.to_string(),
                 )?;
                 writeln!(output)?;
                 write_line(&mut output, "socket directory", &config.socket_dir)?;

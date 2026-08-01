@@ -1,6 +1,6 @@
 [package]
 name = "db-agent"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.97.0"
 
@@ -15,7 +15,7 @@ bytes = "1.11.1"
 rand = "0.10.1"
 sha2 = "0.11.0"
 hmac = "0.13.0"
-base64 = "0.22.1"
+base64 = "0.23.0"
 sha1 = "0.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
@@ -64,6 +64,7 @@ mysql_async = { version = "0.37.0", default-features = false, features = ["minim
 redis = { version = "1.3.0", default-features = false, features = ["tokio-comp"] }
 mongodb = "3.7.0"
 bson = "3.1.0"
+ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }
 
 [profile.dev.package."*"]
 opt-level = 2

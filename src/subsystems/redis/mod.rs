@@ -2,20 +2,19 @@ use crate::{
     config::Config,
     instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
     subsystems::status::SubsystemConnections,
-    tls::ReloadableAcceptor,
+    tls::{MaybeKtlsStream, ReloadableAcceptor},
 };
 use std::{io, net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UnixStream},
 };
-use tokio_rustls::server::TlsStream;
 
 mod resp;
 
 enum Conn {
     Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Tls(MaybeKtlsStream),
 }
 
 pub async fn run(
@@ -23,13 +22,11 @@ pub async fn run(
     status: Arc<SubsystemConnections>,
     routes: Arc<DatabaseRouteManager>,
 ) -> anyhow::Result<()> {
-    let acceptor = {
-        let config = config.load();
-        if config.redis.tls.enabled {
-            crate::tls::build_acceptor(&config.redis.tls.cert, &config.redis.tls.key)?
-        } else {
-            None
-        }
+    let tls = config.load().redis.tls.clone();
+    let acceptor = if tls.enabled {
+        Some(crate::tls::build_acceptor(&tls, &[]).await?)
+    } else {
+        None
     };
     if let Some(acceptor) = &acceptor {
         let config = Arc::clone(&config);
@@ -44,7 +41,7 @@ pub async fn run(
     status.mark_running();
     tracing::info!(
         "redis listening on {bind} (client TLS: {})",
-        if acceptor.is_some() { "on" } else { "off" }
+        acceptor.as_ref().map_or("off", ReloadableAcceptor::mode)
     );
 
     crate::utils::accept_loop(&listener, "redis", |tcp, peer| {
@@ -70,7 +67,7 @@ async fn handle(
         }
         Conn::Tls(s) => {
             tracing::debug!("[{peer}] connection (tls)");
-            session(*s, status, routes, peer).await
+            session(s, status, routes, peer).await
         }
     }
 }
@@ -79,7 +76,7 @@ async fn negotiate(tcp: TcpStream, acceptor: &Option<ReloadableAcceptor>) -> io:
     let mut b = [0; 1];
     let n = tcp.peek(&mut b).await?;
     match acceptor {
-        Some(acc) if n == 1 && b[0] == 0x16 => Ok(Conn::Tls(Box::new(acc.accept(tcp).await?))),
+        Some(acc) if n == 1 && b[0] == 0x16 => Ok(Conn::Tls(acc.accept(tcp).await?)),
         _ => Ok(Conn::Plain(tcp)),
     }
 }

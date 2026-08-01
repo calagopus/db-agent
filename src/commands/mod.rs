@@ -38,7 +38,6 @@ impl CliCommandGroupBuilder {
                         .long("config")
                         .alias("config-file")
                         .alias("config-path")
-                        .default_value(crate::DEFAULT_CONFIG_PATH)
                         .global(true)
                         .required(false),
                 )
@@ -148,7 +147,7 @@ pub fn commands(cli: CliCommandGroupBuilder) -> CliCommandGroupBuilder {
     )
     .add_command(
         "configure",
-        "Sets the API token in the configuration file.",
+        "Use a token or join data to configure db-agent automatically.",
         configure::ConfigureCommand,
     )
     .add_command(

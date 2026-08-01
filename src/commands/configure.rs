@@ -1,10 +1,21 @@
 use anyhow::Context;
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Args, FromArgMatches};
 use colored::Colorize;
-use dialoguer::{Input, theme::ColorfulTheme};
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 
 #[derive(Args)]
 pub struct ConfigureArgs {
+    #[arg(
+        short = 'o',
+        long = "override",
+        help = "override the current configuration if it exists"
+    )]
+    pub r#override: bool,
+
+    #[arg(long = "join-data", help = "base64 encoded join data from the panel")]
+    pub join_data: Option<String>,
+
     #[arg(long = "token", help = "the API token clients authenticate with")]
     pub token: Option<String>,
 }
@@ -23,30 +34,62 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
 
                 let config_path = arg_matches
                     .get_one::<String>("config")
-                    .expect("config path is required")
-                    .to_string();
+                    .map(|path| path.as_str())
+                    .or_else(|| crate::config::Config::find())
+                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
 
-                let mut inner = load_or_default(&config_path)?;
+                if std::path::Path::new(config_path).exists() && !args.r#override {
+                    let confirm = Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt("do you want to override the current configuration?")
+                        .default(false)
+                        .interact()?;
 
-                let token = match args.token {
-                    Some(token) => token,
-                    None => Input::with_theme(&ColorfulTheme::default())
-                        .with_prompt("api token")
-                        .with_initial_text(inner.api.token.clone())
-                        .interact_text()?,
-                };
-
-                if token.is_empty() {
-                    eprintln!("{}", "api token cannot be empty".red());
-                    return Ok(1);
+                    if !confirm {
+                        return Ok(1);
+                    }
                 }
 
-                inner.api.token = token;
-                crate::config::Config::save_new(&config_path, &inner)?;
+                if let Some(join_data) = args.join_data {
+                    let decoded = match B64.decode(&join_data) {
+                        Ok(decoded) => decoded,
+                        Err(_) => {
+                            eprintln!("{}", "failed to decode join data!".red());
+                            return Ok(1);
+                        }
+                    };
+
+                    let inner = match serde_norway::from_slice(&decoded) {
+                        Ok(inner) => inner,
+                        Err(_) => {
+                            eprintln!("{}", "failed to decode join data payload!".red());
+                            return Ok(1);
+                        }
+                    };
+
+                    crate::config::Config::save_new(config_path, &inner)?;
+                } else {
+                    let mut inner = load_or_default(config_path)?;
+
+                    let token = match args.token {
+                        Some(token) => token,
+                        None => Input::with_theme(&ColorfulTheme::default())
+                            .with_prompt("api token")
+                            .with_initial_text(inner.api.token.clone())
+                            .interact_text()?,
+                    };
+
+                    if token.is_empty() {
+                        eprintln!("{}", "api token cannot be empty".red());
+                        return Ok(1);
+                    }
+
+                    inner.api.token = token;
+                    crate::config::Config::save_new(config_path, &inner)?;
+                }
 
                 println!(
                     "{}",
-                    format!("wrote configuration to {config_path}").green()
+                    format!("successfully configured db-agent in {config_path}.").green()
                 );
 
                 Ok(0)

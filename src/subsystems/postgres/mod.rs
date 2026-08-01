@@ -2,7 +2,7 @@ use crate::{
     config::Config,
     instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
     subsystems::status::SubsystemConnections,
-    tls::ReloadableAcceptor,
+    tls::{MaybeKtlsStream, ReloadableAcceptor},
     utils::{SafeSliceExt, bad},
 };
 use protocol::Params;
@@ -11,14 +11,13 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream, UnixStream},
 };
-use tokio_rustls::server::TlsStream;
 
 mod protocol;
 mod scram;
 
 enum Conn {
     Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Tls(MaybeKtlsStream),
 }
 
 pub async fn run(
@@ -26,13 +25,11 @@ pub async fn run(
     status: Arc<SubsystemConnections>,
     routes: Arc<DatabaseRouteManager>,
 ) -> anyhow::Result<()> {
-    let acceptor = {
-        let config = config.load();
-        if config.postgres.tls.enabled {
-            crate::tls::build_acceptor(&config.postgres.tls.cert, &config.postgres.tls.key)?
-        } else {
-            None
-        }
+    let tls = config.load().postgres.tls.clone();
+    let acceptor = if tls.enabled {
+        Some(crate::tls::build_acceptor(&tls, &[]).await?)
+    } else {
+        None
     };
     if let Some(acceptor) = &acceptor {
         let config = Arc::clone(&config);
@@ -50,7 +47,7 @@ pub async fn run(
     status.mark_running();
     tracing::info!(
         "postgres listening on {bind} (client TLS: {})",
-        if acceptor.is_some() { "on" } else { "off" }
+        acceptor.as_ref().map_or("off", ReloadableAcceptor::mode)
     );
 
     crate::utils::accept_loop(&listener, "postgres", |tcp, peer| {
@@ -77,7 +74,7 @@ async fn handle(
         }
         Conn::Tls(s) => {
             tracing::debug!("[{peer}] connection (tls)");
-            session(*s, preread, &status, &routes, peer).await
+            session(s, preread, &status, &routes, peer).await
         }
     }
 }
@@ -92,7 +89,7 @@ async fn negotiate(
             protocol::SSL_REQUEST => match acceptor {
                 Some(acc) => {
                     tcp.write_all(b"S").await?;
-                    return Ok((Conn::Tls(Box::new(acc.accept(tcp).await?)), None));
+                    return Ok((Conn::Tls(acc.accept(tcp).await?), None));
                 }
                 None => tcp.write_all(b"N").await?,
             },

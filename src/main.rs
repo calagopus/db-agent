@@ -39,8 +39,6 @@ const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
 const TARGET: &str = env!("CARGO_TARGET");
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/calagopus-db-agent/config.yml";
-
 fn full_version() -> String {
     if GIT_BRANCH == "unknown" {
         VERSION.to_string()
@@ -154,10 +152,11 @@ async fn main_rt() -> anyhow::Result<()> {
         .set(cli.get_command())
         .expect("failed to set CLAP_COMMAND");
 
-    let config_path = matches
-        .get_one::<String>("config")
-        .expect("config path is required")
-        .to_string();
+    let config_path = matches.get_one::<String>("config").cloned();
+    let config_path = config_path
+        .as_deref()
+        .or_else(|| config::Config::find())
+        .unwrap_or(config::Config::DEFAULT_PATH);
     let debug = *matches
         .get_one::<bool>("debug")
         .expect("debug flag is required");
@@ -176,7 +175,7 @@ async fn main_rt() -> anyhow::Result<()> {
         }
     }
 
-    let config = config::Config::open(&config_path)?;
+    let config = config::Config::open(config_path)?;
     let _log_guard = config.setup_logging(debug)?;
 
     if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
@@ -409,48 +408,31 @@ async fn main_rt() -> anyhow::Result<()> {
         if state.config.load().api.tls.enabled {
             tracing::info!("loading tls certs");
 
-            let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                state.config.load().api.tls.cert.as_str(),
-                state.config.load().api.tls.key.as_str(),
-            )
-            .await
-            {
-                Ok(config) => config,
+            let tls = state.config.load().api.tls.clone();
+            let acceptor = match crate::tls::build_acceptor(&tls, crate::tls::API_ALPN).await {
+                Ok(acceptor) => acceptor,
                 Err(err) => exit_error!("failed to load TLS certificate and key: {:?}", err),
             };
 
-            tokio::spawn({
-                let rustls_config = rustls_config.clone();
+            acceptor.spawn_reloader("api", {
                 let config = Arc::clone(&config);
 
-                async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_hours(24)).await;
-                        tracing::info!("reloading tls certs");
-
-                        if let Err(err) = rustls_config
-                            .reload_from_pem_file(
-                                config.load().api.tls.cert.as_str(),
-                                config.load().api.tls.key.as_str(),
-                            )
-                            .await
-                        {
-                            tracing::error!("failed to reload TLS certificate and key: {:?}", err);
-                        } else {
-                            tracing::info!("tls certs reloaded successfully");
-                        }
-                    }
+                move || {
+                    let config = config.load();
+                    (config.api.tls.cert.clone(), config.api.tls.key.clone())
                 }
             });
 
             tracing::info!(
-                "https listening on {} (db-agent {}, {}ms)",
+                "https listening on {} (db-agent {}, {}ms, tls: {})",
                 address,
                 state.version,
-                state.start_time.elapsed().as_millis()
+                state.start_time.elapsed().as_millis(),
+                acceptor.mode()
             );
 
-            match axum_server::bind_rustls(address, rustls_config)
+            match axum_server::bind(address)
+                .acceptor(acceptor)
                 .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {

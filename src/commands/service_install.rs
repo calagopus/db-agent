@@ -43,10 +43,11 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
 
                 let config_path = arg_matches
                     .get_one::<String>("config")
-                    .expect("config path is required")
-                    .to_string();
+                    .map(|path| path.as_str())
+                    .or_else(|| crate::config::Config::find())
+                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
 
-                let config = config.or_else(|| crate::config::Config::open(&config_path).ok());
+                let config = config.or_else(|| crate::config::Config::open(config_path).ok());
 
                 if std::env::consts::OS != "linux" {
                     eprintln!("{}", "this command is only available on Linux".red());
