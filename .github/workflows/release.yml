@@ -8,6 +8,8 @@ on:
 env:
   BIN_NAME: db-agent
   PROJECT_NAME: db-agent
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DOCKERHUB_IMAGE: docker.io/${{ github.repository }} 
 
 jobs:
   generate-sbom:
@@ -151,6 +153,9 @@ jobs:
         with:
           path: dist
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2 
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
@@ -163,6 +168,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }} 
 
       - name: Prepare binaries
         run: |
@@ -180,18 +191,25 @@ jobs:
           RAW_TAG="${{ github.ref_name }}"
           VERSION="${RAW_TAG#release-}"
 
-          DOCKER_TAGS="ghcr.io/${{ github.repository }}:${VERSION}"
+          # Tag suffixes shared across both registries.
+          SUFFIXES=("${VERSION}")
 
           if [[ "$VERSION" == *-* ]]; then
-            DOCKER_TAGS="$DOCKER_TAGS,ghcr.io/${{ github.repository }}:latest-pre"
+            SUFFIXES+=("latest-pre")
 
             if [[ "$VERSION" == 1.0.0-* ]]; then
-              DOCKER_TAGS="$DOCKER_TAGS,ghcr.io/${{ github.repository }}:latest"
+              SUFFIXES+=("latest")
             fi
           else
-            # 4. It's a stable release (no hyphen): Add 'latest'
-            DOCKER_TAGS="$DOCKER_TAGS,ghcr.io/${{ github.repository }}:latest"
+            # Stable release (no hyphen): add 'latest'
+            SUFFIXES+=("latest")
           fi
+
+          # Emit each suffix for both registries.
+          DOCKER_TAGS=""
+          for t in "${SUFFIXES[@]}"; do
+            DOCKER_TAGS="${DOCKER_TAGS}${DOCKER_TAGS:+,}${GHCR_IMAGE}:${t},${DOCKERHUB_IMAGE}:${t}"
+          done
 
           echo "DOCKER_TAGS=$DOCKER_TAGS" >> $GITHUB_ENV
 
@@ -207,11 +225,24 @@ jobs:
           provenance: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Attach source SBOM attestation to image
-        uses: actions/attest-sbom@v4
+      - name: Attach source SBOM attestation to image (GHCR)
+        uses: actions/attest@v4
         with:
-          subject-name: ghcr.io/${{ github.repository }}
+          subject-name: ${{ env.GHCR_IMAGE }}
           subject-digest: ${{ steps.build.outputs.digest }}
           sbom-path: sbom/sbom-source.cyclonedx.json
           push-to-registry: true
+
+      - name: Attach source SBOM attestation to image (Docker Hub)
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.DOCKERHUB_IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom/sbom-source.cyclonedx.json
+          push-to-registry: true
+
+      - name: Sign image (GHCR)
+        run: cosign sign --yes ${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}
+
+      - name: Sign image (Docker Hub)
+        run: cosign sign --yes ${{ env.DOCKERHUB_IMAGE }}@${{ steps.build.outputs.digest }}
