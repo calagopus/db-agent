@@ -3,7 +3,6 @@ use crate::{
     instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
     subsystems::status::SubsystemConnections,
     tls::{MaybeKtlsStream, ReloadableAcceptor},
-    utils::{SafeSliceExt, bad},
 };
 use protocol::Params;
 use std::{net::SocketAddr, sync::Arc};
@@ -89,18 +88,16 @@ async fn negotiate(
             protocol::SSL_REQUEST => match acceptor {
                 Some(acc) => {
                     tcp.write_all(b"S").await?;
-                    return Ok((Conn::Tls(acc.accept(tcp).await?), None));
+                    let tls = crate::utils::handshake_step(acc.accept(tcp)).await?;
+                    return Ok((Conn::Tls(tls), None));
                 }
                 None => tcp.write_all(b"N").await?,
             },
             protocol::GSS_REQUEST => tcp.write_all(b"N").await?,
-            protocol::PROTOCOL_30 => {
-                return Ok((
-                    Conn::Plain(tcp),
-                    Some(protocol::parse_params(body.get_slice(4..)?)),
-                ));
+            _ => {
+                let params = protocol::accept_startup(&mut tcp, &body).await?;
+                return Ok((Conn::Plain(tcp), Some(params)));
             }
-            other => return Err(bad(&format!("unsupported startup code {other}"))),
         }
     }
 }

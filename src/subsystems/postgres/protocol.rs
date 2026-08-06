@@ -1,4 +1,4 @@
-use crate::utils::{SafeSliceExt, bad};
+use crate::utils::{SafeSliceExt, bad, handshake_step};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -7,25 +7,61 @@ pub const SSL_REQUEST: i32 = 80877103;
 pub const GSS_REQUEST: i32 = 80877104;
 
 const MAX_MSG_LEN: i32 = 16 * 1024 * 1024;
+const PROTOCOL_OPTION_PREFIX: &str = "_pq_.";
 
 pub type Params = HashMap<String, String>;
 
 pub async fn read_startup_body<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
-    let len = stream.read_i32().await?;
-    if !(8..=1 << 20).contains(&len) {
-        return Err(bad("implausible startup length"));
-    }
-    let mut body = vec![0; (len - 4) as usize];
-    stream.read_exact(&mut body).await?;
-    Ok(body)
+    handshake_step(async {
+        let len = stream.read_i32().await?;
+        if !(8..=1 << 20).contains(&len) {
+            return Err(bad("implausible startup length"));
+        }
+        let mut body = vec![0; (len - 4) as usize];
+        stream.read_exact(&mut body).await?;
+        Ok(body)
+    })
+    .await
 }
 
-pub async fn read_startup_message<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Params> {
+pub async fn read_startup_message<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<Params> {
     let body = read_startup_body(stream).await?;
-    if startup_code(&body) != PROTOCOL_30 {
-        return Err(bad("expected StartupMessage after TLS"));
+    accept_startup(stream, &body).await
+}
+
+pub async fn accept_startup<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    body: &[u8],
+) -> std::io::Result<Params> {
+    let code = startup_code(body);
+    if code >> 16 != PROTOCOL_30 >> 16 {
+        return Err(bad(&format!("unsupported startup code {code}")));
     }
-    Ok(parse_params(body.get_slice(4..)?))
+
+    let mut params = parse_params(body.get_slice(4..)?);
+    let options: Vec<String> = params
+        .keys()
+        .filter(|key| key.starts_with(PROTOCOL_OPTION_PREFIX))
+        .cloned()
+        .collect();
+
+    if code != PROTOCOL_30 || !options.is_empty() {
+        for key in &options {
+            params.remove(key);
+        }
+
+        let mut msg = PROTOCOL_30.to_be_bytes().to_vec();
+        msg.extend_from_slice(&(options.len() as i32).to_be_bytes());
+        for key in &options {
+            msg.extend_from_slice(key.as_bytes());
+            msg.push(0);
+        }
+        write_msg(stream, b'v', &msg).await?;
+    }
+
+    Ok(params)
 }
 
 pub fn startup_code(body: &[u8]) -> i32 {
@@ -55,17 +91,20 @@ fn next_cstr(buf: &mut &[u8]) -> Option<String> {
 }
 
 pub async fn read_msg<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
-    let tag = s.read_u8().await?;
-    let len = s.read_i32().await?;
-    if len < 4 {
-        return Err(bad("short message"));
-    }
-    if len > MAX_MSG_LEN {
-        return Err(bad("message too large"));
-    }
-    let mut body = vec![0; (len - 4) as usize];
-    s.read_exact(&mut body).await?;
-    Ok((tag, body))
+    handshake_step(async {
+        let tag = s.read_u8().await?;
+        let len = s.read_i32().await?;
+        if len < 4 {
+            return Err(bad("short message"));
+        }
+        if len > MAX_MSG_LEN {
+            return Err(bad("message too large"));
+        }
+        let mut body = vec![0; (len - 4) as usize];
+        s.read_exact(&mut body).await?;
+        Ok((tag, body))
+    })
+    .await
 }
 
 pub async fn write_msg<S: AsyncWrite + Unpin>(

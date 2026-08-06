@@ -1,4 +1,5 @@
-use crate::utils::{SafeSliceExt, bad, get_array};
+use crate::utils::{SafeSliceExt, bad, get_array, handshake_step};
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
@@ -34,6 +35,14 @@ const BACKEND_FORWARDABLE_CAPS: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_TRANSACTIONS
     | CLIENT_MULTI_STATEMENTS
     | CLIENT_MULTI_RESULTS;
+
+// Must be printable ASCII, matching upstream's create_random_string(): Connector/J reads the
+// seed as a NUL-terminated string and re-encodes it with the connection charset, so a 0x00
+// truncates it and any byte >= 0x80 is mangled, yielding a token that never matches.
+pub fn random_scramble() -> [u8; 20] {
+    let mut rng = rand::rng();
+    std::array::from_fn(|_| rng.random_range(33..=126))
+}
 
 pub fn server_handshake(scramble: &[u8; 20], ssl: bool) -> Vec<u8> {
     let mut caps = CAPS;
@@ -224,14 +233,17 @@ fn read_lenenc(p: &[u8], i: &mut usize) -> std::io::Result<u64> {
 }
 
 pub async fn read_packet<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
-    let mut hdr = [0; 4];
-    s.read_exact(&mut hdr).await?;
-    let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], 0]) as usize;
-    let seq = hdr[3];
-    let mut payload = vec![0; len];
-    s.read_exact(&mut payload).await?;
+    handshake_step(async {
+        let mut hdr = [0; 4];
+        s.read_exact(&mut hdr).await?;
+        let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], 0]) as usize;
+        let seq = hdr[3];
+        let mut payload = vec![0; len];
+        s.read_exact(&mut payload).await?;
 
-    Ok((seq, payload))
+        Ok((seq, payload))
+    })
+    .await
 }
 
 pub async fn write_packet<S: AsyncWrite + Unpin>(

@@ -1,4 +1,4 @@
-use crate::utils::bad;
+use crate::utils::{bad, handshake_step};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const MAX_ARGS: i64 = 1024;
@@ -6,6 +6,12 @@ const MAX_COMMAND_LEN: usize = 1024 * 1024;
 const MAX_LINE_LEN: usize = 64 * 1024;
 
 pub async fn read_command<S: AsyncRead + Unpin>(
+    s: &mut S,
+) -> std::io::Result<Option<(Vec<Vec<u8>>, Vec<u8>)>> {
+    handshake_step(read_command_inner(s)).await
+}
+
+async fn read_command_inner<S: AsyncRead + Unpin>(
     s: &mut S,
 ) -> std::io::Result<Option<(Vec<Vec<u8>>, Vec<u8>)>> {
     let mut raw = Vec::new();

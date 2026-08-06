@@ -41,6 +41,16 @@ pub fn bad(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
 }
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub async fn handshake_step<T>(
+    fut: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+}
+
 pub fn is_silent_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -67,10 +77,13 @@ pub async fn accept_loop<
             Ok((tcp, peer)) => {
                 let fut = on_accept(tcp, peer);
                 tokio::spawn(async move {
-                    if let Err(err) = fut.await
-                        && !is_silent_error(&err)
-                    {
-                        tracing::error!("[{peer}] error: {err}");
+                    match fut.await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                            tracing::debug!("[{peer}] protocol error: {err}");
+                        }
+                        Err(err) if is_silent_error(&err) => {}
+                        Err(err) => tracing::error!("[{peer}] error: {err}"),
                     }
                 });
             }

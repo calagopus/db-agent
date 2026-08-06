@@ -85,9 +85,11 @@ async fn handle(
 
 async fn negotiate(tcp: TcpStream, acceptor: &Option<ReloadableAcceptor>) -> std::io::Result<Conn> {
     let mut b = [0; 1];
-    let n = tcp.peek(&mut b).await?;
+    let n = crate::utils::handshake_step(tcp.peek(&mut b)).await?;
     match acceptor {
-        Some(acc) if n == 1 && b[0] == 0x16 => Ok(Conn::Tls(acc.accept(tcp).await?)),
+        Some(acc) if n == 1 && b[0] == 0x16 => Ok(Conn::Tls(
+            crate::utils::handshake_step(acc.accept(tcp)).await?,
+        )),
         _ => Ok(Conn::Plain(tcp)),
     }
 }

@@ -1,4 +1,4 @@
-use crate::utils::bad;
+use crate::utils::{bad, handshake_step};
 use bson::{Bson, Document, doc, spec::BinarySubtype};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -50,17 +50,20 @@ pub fn sasl_error(msg: &str) -> Document {
 pub async fn read_message<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
 ) -> std::io::Result<(i32, i32, Vec<u8>)> {
-    let mut hdr = [0; 16];
-    s.read_exact(&mut hdr).await?;
-    let mlen = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-    let reqid = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-    let opcode = i32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
-    if !(16..=MAX_MSG).contains(&mlen) {
-        return Err(bad("implausible message length"));
-    }
-    let mut body = vec![0; mlen - 16];
-    s.read_exact(&mut body).await?;
-    Ok((reqid, opcode, body))
+    handshake_step(async {
+        let mut hdr = [0; 16];
+        s.read_exact(&mut hdr).await?;
+        let mlen = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        let reqid = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let opcode = i32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
+        if !(16..=MAX_MSG).contains(&mlen) {
+            return Err(bad("implausible message length"));
+        }
+        let mut body = vec![0; mlen - 16];
+        s.read_exact(&mut body).await?;
+        Ok((reqid, opcode, body))
+    })
+    .await
 }
 
 pub fn op_msg_doc(body: &[u8]) -> Option<Document> {

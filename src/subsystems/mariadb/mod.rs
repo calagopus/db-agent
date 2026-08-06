@@ -6,7 +6,6 @@ use crate::{
     utils::{SafeSliceExt, SafeSliceMutExt, bad, get_array},
 };
 use protocol::{read_packet, write_packet};
-use rand::Rng;
 use std::{net::SocketAddr, path::Path, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
@@ -62,8 +61,7 @@ async fn handle(
     acceptor: Option<ReloadableAcceptor>,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
-    let mut scramble = [0; 20];
-    rand::rng().fill_bytes(&mut scramble);
+    let scramble = protocol::random_scramble();
     let ssl_offered = acceptor.is_some();
     write_packet(
         &mut tcp,
@@ -77,10 +75,8 @@ async fn handle(
 
     if ssl_offered && caps & protocol::CLIENT_SSL != 0 {
         tracing::debug!("[{peer}] connection (tls)");
-        let tls = acceptor
-            .ok_or_else(|| bad("ssl requested without acceptor"))?
-            .accept(tcp)
-            .await?;
+        let acceptor = acceptor.ok_or_else(|| bad("ssl requested without acceptor"))?;
+        let tls = crate::utils::handshake_step(acceptor.accept(tcp)).await?;
         session(tls, &status, &routes, scramble, None, peer).await
     } else {
         tracing::debug!("[{peer}] connection (plain)");
