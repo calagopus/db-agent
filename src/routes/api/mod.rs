@@ -9,49 +9,64 @@ use axum::{
 };
 use utoipa_axum::router::OpenApiRouter;
 
+mod health;
 mod instances;
 mod status;
 mod system;
 
-pub async fn auth(state: GetState, req: Request, next: Next) -> Result<Response<Body>, StatusCode> {
-    let key = req
-        .headers()
+enum AuthResult {
+    Ok,
+    InvalidHeader,
+    InvalidToken,
+}
+
+fn check_auth(state: &State, headers: &axum::http::HeaderMap) -> AuthResult {
+    let key = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
     let (r#type, token) = match key.split_once(' ') {
         Some((t, tok)) => (t, tok),
-        None => {
-            return Ok(ApiResponse::error("invalid authorization header")
-                .with_status(StatusCode::UNAUTHORIZED)
-                .with_header("WWW-Authenticate", "Bearer")
-                .into_response());
-        }
+        None => return AuthResult::InvalidHeader,
     };
 
     if r#type != "Bearer" {
-        return Ok(ApiResponse::error("invalid authorization header")
-            .with_status(StatusCode::UNAUTHORIZED)
-            .with_header("WWW-Authenticate", "Bearer")
-            .into_response());
+        return AuthResult::InvalidHeader;
     }
 
     let expected = state.config.load().api.token.clone();
     if expected.is_empty()
         || !constant_time_eq::constant_time_eq(token.as_bytes(), expected.as_bytes())
     {
-        return Ok(ApiResponse::error("invalid authorization token")
-            .with_status(StatusCode::UNAUTHORIZED)
-            .with_header("WWW-Authenticate", "Bearer")
-            .into_response());
+        return AuthResult::InvalidToken;
     }
 
-    Ok(next.run(req).await)
+    AuthResult::Ok
+}
+
+/// Whether the request carries a valid api token, for routes that are reachable without one but
+/// reveal more when it is present.
+pub fn is_authenticated(state: &State, headers: &axum::http::HeaderMap) -> bool {
+    matches!(check_auth(state, headers), AuthResult::Ok)
+}
+
+pub async fn auth(state: GetState, req: Request, next: Next) -> Result<Response<Body>, StatusCode> {
+    let error = match check_auth(&state, req.headers()) {
+        AuthResult::Ok => return Ok(next.run(req).await),
+        AuthResult::InvalidHeader => "invalid authorization header",
+        AuthResult::InvalidToken => "invalid authorization token",
+    };
+
+    Ok(ApiResponse::error(error)
+        .with_status(StatusCode::UNAUTHORIZED)
+        .with_header("WWW-Authenticate", "Bearer")
+        .into_response())
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/health", health::router(state))
         .nest(
             "/instances",
             instances::router(state)
