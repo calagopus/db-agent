@@ -4,16 +4,19 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod post {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
-        routes::{ApiError, api::instances::_instance_::GetInstance},
+        routes::{ApiError, GetState, api::instances::_instance_::GetInstance},
     };
-    use axum::{extract::Query, http::StatusCode};
-    use futures_util::TryStreamExt;
+    use axum::http::StatusCode;
     use garde::Validate;
     use serde::{Deserialize, Serialize};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Validate, Deserialize)]
-    pub struct Params {
+    pub struct Payload {
+        #[garde(url, length(max = 2048))]
+        url: String,
+        #[garde(inner(custom(crate::instance::validate_source_database_name)))]
+        source_db: Option<String>,
         #[garde(inner(custom(crate::instance::validate_database_name)))]
         db: Option<String>,
         #[garde(skip)]
@@ -28,34 +31,34 @@ mod post {
         (status = OK, body = inline(Response)),
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
+        (status = EXPECTATION_FAILED, body = ApiError),
     ), params(
         ("instance" = uuid::Uuid, description = "The instance uuid"),
-        (
-            "db" = Option<String>, Query,
-            description = "The db to import into, whole instance if omitted; must be omitted for redis",
-        ),
-        (
-            "wipe" = Option<bool>, Query,
-            description = "Clear existing data in the target before importing, requires db except for redis",
-        ),
-    ), request_body = String)]
+    ), request_body = inline(Payload))]
     pub async fn route(
+        state: GetState,
         instance: GetInstance,
-        Query(params): Query<Params>,
-        body: axum::body::Body,
+        crate::Payload(data): crate::Payload<Payload>,
     ) -> ApiResponseResult {
-        if let Err(errors) = crate::utils::validate_data(&params) {
+        if state.config.load().api.disable_remote_import {
+            return ApiResponse::error("remote imports are disabled")
+                .with_status(StatusCode::EXPECTATION_FAILED)
+                .ok();
+        }
+
+        if let Err(errors) = crate::utils::validate_data(&data) {
             return ApiResponse::error(&errors.join(", "))
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
         }
 
-        let mut reader = tokio_util::io::StreamReader::new(
-            body.into_data_stream().map_err(std::io::Error::other),
-        );
-
         instance
-            .import(params.db.as_deref(), params.wipe, &mut reader)
+            .import_remote(
+                &data.url,
+                data.source_db.as_deref(),
+                data.db.as_deref(),
+                data.wipe,
+            )
             .await?;
 
         ApiResponse::new_serialized(Response {}).ok()

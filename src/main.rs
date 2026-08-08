@@ -34,6 +34,8 @@ mod utils;
 
 pub use payload::Payload;
 
+const SERVICE_NAME: &str = "calagopus-db-agent";
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");

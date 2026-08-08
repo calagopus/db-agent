@@ -7,6 +7,7 @@ use std::{
     fs::File,
     net::SocketAddr,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, OnceLock},
 };
 use tracing::level_filters::LevelFilter;
@@ -75,6 +76,23 @@ fn redis_bind() -> SocketAddr {
 }
 fn api_bind() -> String {
     "0.0.0.0:8090".to_string()
+}
+fn api_remote_import_blocked_cidrs() -> Vec<cidr::IpCidr> {
+    // SAFETY: every literal below is a valid cidr
+    unsafe {
+        Vec::from([
+            cidr::IpCidr::from_str("0.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("127.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("10.0.0.0/8").unwrap_unchecked(),
+            cidr::IpCidr::from_str("100.64.0.0/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
+            cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+        ])
+    }
 }
 
 fn docker_socket() -> String {
@@ -267,6 +285,11 @@ nestify::nest! {
             pub disable_openapi_docs: bool,
             #[serde(default)]
             pub ignore_upgrades: bool,
+            #[serde(default)]
+            pub disable_remote_import: bool,
+            #[serde(default = "api_remote_import_blocked_cidrs")]
+            #[schema(value_type = Vec<String>)]
+            pub remote_import_blocked_cidrs: Vec<cidr::IpCidr>,
 
             #[serde(default)]
             pub tls: Tls,

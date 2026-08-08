@@ -14,7 +14,10 @@ pub mod disk_checker;
 pub mod executor;
 pub mod identifier;
 pub mod manager;
+pub mod remote;
 pub mod resources;
+
+pub const STDERR_CAPTURE_LIMIT: usize = 8192;
 
 pub fn validate_database_name(value: &str, _ctx: &()) -> garde::Result {
     if !(1..=63).contains(&value.len()) {
@@ -22,6 +25,22 @@ pub fn validate_database_name(value: &str, _ctx: &()) -> garde::Result {
     }
     if !value.bytes().all(|b| b.is_ascii_alphanumeric()) {
         return Err(garde::Error::new("must be ascii alphanumeric"));
+    }
+
+    Ok(())
+}
+
+/// database names on a foreign server are not ours to name, this only rejects what
+/// would break the value out of its slot on a dump command line
+pub fn validate_source_database_name(value: &str, _ctx: &()) -> garde::Result {
+    if !(1..=64).contains(&value.len()) {
+        return Err(garde::Error::new("must be between 1 and 64 characters"));
+    }
+    if value.starts_with('-') {
+        return Err(garde::Error::new("must not start with '-'"));
+    }
+    if value.contains(char::is_control) {
+        return Err(garde::Error::new("must not contain control characters"));
     }
 
     Ok(())
@@ -603,33 +622,40 @@ impl Instance {
 
         let command = match data.database_type {
             DatabaseType::Postgres => {
-                let dir = socket.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let dir =
+                    crate::utils::shell_quote(socket.rsplit_once('/').map_or("", |(dir, _)| dir));
                 match db {
-                    Some(db) => {
-                        format!("pg_dump --no-owner --no-privileges -h '{dir}' -U postgres '{db}'")
-                    }
-                    None => format!("pg_dumpall --no-owner --no-privileges -h '{dir}' -U postgres"),
+                    Some(db) => format!(
+                        "pg_dump --no-owner --no-privileges -h {dir} -U postgres {}",
+                        crate::utils::shell_quote(db)
+                    ),
+                    None => format!("pg_dumpall --no-owner --no-privileges -h {dir} -U postgres"),
                 }
             }
             DatabaseType::Mariadb => {
-                let strip = r"| sed -e 's/DEFINER=`[^`]*`@`[^`]*`//g'";
+                let socket = crate::utils::shell_quote(socket);
                 match db {
-                    Some(db) => {
-                        format!("mariadb-dump --socket='{socket}' -u root '{db}' {strip}")
-                    }
-                    None => {
-                        format!("mariadb-dump --socket='{socket}' -u root --all-databases {strip}")
-                    }
+                    Some(db) => format!(
+                        "mariadb-dump --socket={socket} -u root {}",
+                        crate::utils::shell_quote(db)
+                    ),
+                    None => format!("mariadb-dump --socket={socket} -u root --all-databases"),
                 }
             }
             DatabaseType::Mongodb => {
                 let auth = mongodb_shell_auth(&data);
+                let uri = crate::utils::shell_quote(&mongodb_socket_uri(socket));
                 match db {
-                    Some(db) => format!("mongodump --host='{socket}'{auth} --archive -d '{db}'"),
-                    None => format!("mongodump --host='{socket}'{auth} --archive"),
+                    Some(db) => format!(
+                        "mongodump --uri={uri}{auth} --archive -d {}",
+                        crate::utils::shell_quote(db)
+                    ),
+                    None => format!("mongodump --uri={uri}{auth} --archive"),
                 }
             }
-            DatabaseType::Redis => format!("redis-cli -s '{socket}' --rdb -"),
+            DatabaseType::Redis => {
+                format!("redis-cli -s {} --rdb -", crate::utils::shell_quote(socket))
+            }
         };
         drop(data);
 
@@ -649,23 +675,28 @@ impl Instance {
     pub async fn import(
         &self,
         db: Option<&str>,
+        source_db: Option<&str>,
         wipe: bool,
         reader: &mut (dyn tokio::io::AsyncRead + Send + Unpin),
     ) -> anyhow::Result<()> {
         let data = self.data.read().await;
         let socket = &data.socket_path;
+        let database_type = data.database_type;
 
-        if wipe && db.is_none() && !matches!(data.database_type, DatabaseType::Redis) {
+        if wipe && db.is_none() && !matches!(database_type, DatabaseType::Redis) {
             return Err(crate::response::DisplayError::new("wipe requires a db").into());
         }
 
-        let (wipe_command, command) = match data.database_type {
+        let (wipe_command, command) = match database_type {
             DatabaseType::Postgres => {
-                let dir = socket.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let dir =
+                    crate::utils::shell_quote(socket.rsplit_once('/').map_or("", |(dir, _)| dir));
                 match db {
                     Some(db) => {
-                        let base =
-                            format!("psql -q -v ON_ERROR_STOP=1 -h '{dir}' -U postgres -d '{db}'");
+                        let base = format!(
+                            "psql -q -v ON_ERROR_STOP=1 -h {dir} -U postgres -d {}",
+                            crate::utils::shell_quote(db)
+                        );
                         let wipe = wipe.then(|| {
                             format!("{base} -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'")
                         });
@@ -674,31 +705,46 @@ impl Instance {
                     // no ON_ERROR_STOP: pg_dumpall output recreates existing roles
                     None => (
                         None,
-                        format!("psql -q -h '{dir}' -U postgres -d postgres -o /dev/null"),
+                        format!("psql -q -h {dir} -U postgres -d postgres -o /dev/null"),
                     ),
                 }
             }
-            DatabaseType::Mariadb => match db {
-                Some(db) => {
-                    let import = format!("mariadb --socket='{socket}' -u root '{db}'");
-                    let wipe = wipe.then(|| {
-                        format!(
-                            "mariadb --socket='{socket}' -u root -e \
-                             'DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`;'"
-                        )
-                    });
-                    (wipe, import)
+            DatabaseType::Mariadb => {
+                let strip = r"sed -e 's/DEFINER=`[^`]*`@`[^`]*`//g' |";
+                let socket = crate::utils::shell_quote(socket);
+                match db {
+                    Some(db) => {
+                        let import = format!(
+                            "{strip} mariadb --socket={socket} -u root {}",
+                            crate::utils::shell_quote(db)
+                        );
+                        let wipe = wipe.then(|| {
+                            format!(
+                                "mariadb --socket={socket} -u root -e {}",
+                                crate::utils::shell_quote(&format!(
+                                    "DROP DATABASE IF EXISTS `{db}`; CREATE DATABASE `{db}`;"
+                                ))
+                            )
+                        });
+                        (wipe, import)
+                    }
+                    None => (None, format!("{strip} mariadb --socket={socket} -u root")),
                 }
-                None => (None, format!("mariadb --socket='{socket}' -u root")),
-            },
+            }
             DatabaseType::Mongodb => {
                 let auth = mongodb_shell_auth(&data);
-                let drop = if wipe { " --drop" } else { "" };
-                let import = match db {
-                    Some(db) => {
-                        format!("mongorestore --host='{socket}'{auth} --archive{drop} -d '{db}'")
-                    }
-                    None => format!("mongorestore --host='{socket}'{auth} --archive{drop}"),
+                let uri = crate::utils::shell_quote(&mongodb_socket_uri(socket));
+                let import = match (db, source_db) {
+                    (Some(db), Some(source_db)) => format!(
+                        "mongorestore --uri={uri}{auth} --archive --nsFrom={} --nsTo={}",
+                        crate::utils::shell_quote(&format!("{source_db}.*")),
+                        crate::utils::shell_quote(&format!("{db}.*"))
+                    ),
+                    (Some(db), None) => format!(
+                        "mongorestore --uri={uri}{auth} --archive -d {}",
+                        crate::utils::shell_quote(db)
+                    ),
+                    (None, _) => format!("mongorestore --uri={uri}{auth} --archive"),
                 };
                 (None, import)
             }
@@ -708,11 +754,20 @@ impl Instance {
                         crate::response::DisplayError::new("redis has no named databases").into(),
                     );
                 }
-                let wipe = wipe.then(|| format!("redis-cli -s '{socket}' FLUSHALL"));
-                (wipe, format!("redis-cli -s '{socket}' --pipe"))
+                let socket = crate::utils::shell_quote(socket);
+                let wipe = wipe.then(|| format!("redis-cli -s {socket} FLUSHALL"));
+                (wipe, format!("redis-cli -s {socket} --pipe"))
             }
         };
         drop(data);
+
+        // --drop only drops the collections the archive carries, stale ones would survive
+        if wipe
+            && database_type == DatabaseType::Mongodb
+            && let Some(db) = db
+        {
+            self.connection().await?.delete_database(db).await?;
+        }
 
         if let Some(wipe_command) = wipe_command {
             let mut stream = self
@@ -740,15 +795,17 @@ impl Instance {
             .await?;
 
         let write = async {
-            tokio::io::copy(reader, &mut stdin).await?;
-            stdin.shutdown().await?;
+            let copied = tokio::io::copy(reader, &mut stdin).await;
+            let shutdown = stdin.shutdown().await;
+            copied?;
+            shutdown?;
             Ok::<_, anyhow::Error>(())
         };
         let drain = async {
             let mut buf = Vec::new();
             while let Some(chunk) = output.next().await {
                 match chunk {
-                    Ok(bytes) if buf.len() < 8192 => buf.extend_from_slice(&bytes),
+                    Ok(bytes) if buf.len() < STDERR_CAPTURE_LIMIT => buf.extend_from_slice(&bytes),
                     Ok(_) => {}
                     Err(err) => {
                         let msg = String::from_utf8_lossy(&buf);
@@ -767,8 +824,10 @@ impl Instance {
         let mut write = std::pin::pin!(write);
         let mut drain = std::pin::pin!(drain);
         tokio::select! {
+            // the side that failed first has the useful error, a dead source leaves
+            // the target failing on a truncated dump
             drained = &mut drain => drained,
-            written = &mut write => drain.await.and(written),
+            written = &mut write => written.and(drain.await),
         }
     }
 
@@ -813,13 +872,23 @@ impl Instance {
     }
 }
 
+/// the mongo shell tools reject a unix socket path given to --host, it has to be a
+/// percent encoded uri host instead
+fn mongodb_socket_uri(socket: &str) -> String {
+    format!(
+        "mongodb://{}",
+        percent_encoding::utf8_percent_encode(socket, percent_encoding::NON_ALPHANUMERIC)
+    )
+}
+
 fn mongodb_shell_auth(data: &crate::database::data::StoredInstance) -> String {
     data.root_password
         .as_deref()
         .map_or_else(String::new, |pw| {
             format!(
-                " -u {} -p '{pw}' --authenticationDatabase admin",
-                connection::mongodb::ROOT_USERNAME
+                " -u {} -p {} --authenticationDatabase admin",
+                connection::mongodb::ROOT_USERNAME,
+                crate::utils::shell_quote(pw)
             )
         })
 }

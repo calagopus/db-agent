@@ -4,10 +4,11 @@ use crate::{
     instance::resources::{ContainerState, ResourceUsage},
 };
 use anyhow::Context;
-use bollard::errors::Error::DockerResponseServerError;
+use bollard::errors::Error::{DockerContainerWaitError, DockerResponseServerError};
 use futures_util::StreamExt;
 use itertools::Itertools;
 use parking_lot::RwLock;
+use rand::distr::SampleString;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -15,6 +16,9 @@ use std::{
 };
 
 pub mod host_mounts;
+
+const CONTAINER_TYPE_DATABASE: &str = "database";
+const CONTAINER_TYPE_SCRIPT_RUNNER: &str = "script_runner";
 
 #[inline]
 fn string_to_option(s: &str) -> Option<String> {
@@ -25,153 +29,184 @@ fn string_to_option(s: &str) -> Option<String> {
     }
 }
 
-fn convert_resources(
-    data: &StoredInstance,
-    config: &crate::config::Config,
-) -> bollard::models::Resources {
-    let memory = if data.memory > 0 {
-        data.memory * 1024 * 1024
-    } else {
-        0
-    };
+trait DockerStoredInstanceExt {
+    fn convert_resources(&self, config: &crate::config::Config) -> bollard::models::Resources;
 
-    let mut resources = bollard::models::Resources {
-        memory: (memory > 0).then_some(memory),
-        memory_reservation: (memory > 0).then_some(memory),
-        memory_swap: match data.swap {
-            0 => None,
-            -1 => Some(-1),
-            swap => Some(memory + (swap * 1024 * 1024)),
-        },
-        blkio_weight: data.io_weight.and_then(|w| u16::try_from(w).ok()),
-        pids_limit: match config.load().docker.container_pid_limit {
-            0 => None,
-            limit => Some(limit),
-        },
-        ..Default::default()
-    };
-
-    if data.cpu > 0 {
-        resources.cpu_quota = Some(data.cpu * 1000);
-        resources.cpu_period = Some(100_000);
-        resources.cpu_shares = Some(1024);
-    } else {
-        resources.cpu_quota = Some(-1);
-    }
-
-    resources
+    fn base_host_config(&self, config: &crate::config::Config) -> bollard::models::HostConfig;
+    fn host_config(
+        &self,
+        config: &crate::config::Config,
+        host_mounts: Option<&host_mounts::HostMountTable>,
+    ) -> bollard::models::HostConfig;
+    fn container_config(
+        &self,
+        config: &crate::config::Config,
+        host_mounts: Option<&host_mounts::HostMountTable>,
+    ) -> bollard::models::ContainerCreateBody;
 }
 
-fn host_config(
-    data: &StoredInstance,
-    config: &crate::config::Config,
-    host_mounts: Option<&host_mounts::HostMountTable>,
-) -> bollard::models::HostConfig {
-    let resources = convert_resources(data, config);
+impl DockerStoredInstanceExt for StoredInstance {
+    fn convert_resources(&self, config: &crate::config::Config) -> bollard::models::Resources {
+        let memory = if self.memory > 0 {
+            self.memory * 1024 * 1024
+        } else {
+            0
+        };
 
-    let mut mounts = vec![bollard::models::Mount {
-        typ: Some(bollard::models::MountType::BIND),
-        source: Some(host_mounts::translate_source(
-            host_mounts,
-            &config.socket_path(data.uuid).to_string_lossy(),
-        )),
-        target: Some(
-            data.socket_path
-                .split('/')
-                .rev()
-                .skip(1)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .join("/"),
-        ),
-        ..Default::default()
-    }];
+        let mut resources = bollard::models::Resources {
+            memory: (memory > 0).then_some(memory),
+            memory_reservation: (memory > 0).then_some(memory),
+            memory_swap: match self.swap {
+                0 => None,
+                -1 => Some(-1),
+                swap => Some(memory + (swap * 1024 * 1024)),
+            },
+            blkio_weight: self.io_weight.and_then(|w| u16::try_from(w).ok()),
+            pids_limit: match config.load().docker.container_pid_limit {
+                0 => None,
+                limit => Some(limit),
+            },
+            ..Default::default()
+        };
 
-    for mapping in &data.volumes {
-        mounts.push(bollard::models::Mount {
+        if self.cpu > 0 {
+            resources.cpu_quota = Some(self.cpu * 1000);
+            resources.cpu_period = Some(100_000);
+            resources.cpu_shares = Some(1024);
+        } else {
+            resources.cpu_quota = Some(-1);
+        }
+
+        resources
+    }
+
+    fn base_host_config(&self, config: &crate::config::Config) -> bollard::models::HostConfig {
+        let resources = self.convert_resources(config);
+        let cfg = config.load();
+
+        bollard::models::HostConfig {
+            memory: resources.memory,
+            memory_reservation: resources.memory_reservation,
+            memory_swap: resources.memory_swap,
+            cpu_quota: resources.cpu_quota,
+            cpu_period: resources.cpu_period,
+            cpu_shares: resources.cpu_shares,
+            blkio_weight: resources.blkio_weight,
+            pids_limit: resources.pids_limit,
+
+            tmpfs: Some(HashMap::from([(
+                "/tmp".to_string(),
+                format!("rw,exec,nosuid,size={}M", cfg.docker.tmpfs_size),
+            )])),
+            security_opt: Some(vec!["no-new-privileges".to_string()]),
+            cap_drop: Some(vec![
+                "setpcap".to_string(),
+                "mknod".to_string(),
+                "audit_write".to_string(),
+                "net_raw".to_string(),
+                "dac_override".to_string(),
+                "fowner".to_string(),
+                "fsetid".to_string(),
+                "net_bind_service".to_string(),
+                "sys_chroot".to_string(),
+                "setfcap".to_string(),
+                "sys_ptrace".to_string(),
+            ]),
+            userns_mode: if cfg.docker.rootless.enabled {
+                Some(format!(
+                    "keep-id:uid={},gid={}",
+                    self.image_uid, self.image_gid
+                ))
+            } else {
+                string_to_option(&cfg.docker.userns_mode)
+            },
+            ..Default::default()
+        }
+    }
+
+    fn host_config(
+        &self,
+        config: &crate::config::Config,
+        host_mounts: Option<&host_mounts::HostMountTable>,
+    ) -> bollard::models::HostConfig {
+        let mut mounts = vec![bollard::models::Mount {
             typ: Some(bollard::models::MountType::BIND),
             source: Some(host_mounts::translate_source(
                 host_mounts,
-                &mapping.host_path(config, data.uuid).to_string_lossy(),
+                &config.socket_path(self.uuid).to_string_lossy(),
             )),
-            target: Some(mapping.container_path().to_string_lossy().into_owned()),
-            ..Default::default()
-        });
-    }
-
-    let config = config.load();
-
-    bollard::models::HostConfig {
-        memory: resources.memory,
-        memory_reservation: resources.memory_reservation,
-        memory_swap: resources.memory_swap,
-        cpu_quota: resources.cpu_quota,
-        cpu_period: resources.cpu_period,
-        cpu_shares: resources.cpu_shares,
-        blkio_weight: resources.blkio_weight,
-        pids_limit: resources.pids_limit,
-
-        mounts: Some(mounts),
-        tmpfs: Some(HashMap::from([(
-            "/tmp".to_string(),
-            format!("rw,exec,nosuid,size={}M", config.docker.tmpfs_size),
-        )])),
-        log_config: Some(bollard::models::HostConfigLogConfig {
-            typ: Some(config.docker.log_config.r#type.clone()),
-            config: Some(
-                config
-                    .docker
-                    .log_config
-                    .config
-                    .clone()
+            target: Some(
+                self.socket_path
+                    .split('/')
+                    .rev()
+                    .skip(1)
+                    .collect::<Vec<_>>()
                     .into_iter()
-                    .collect(),
+                    .rev()
+                    .join("/"),
             ),
-        }),
-        network_mode: Some("none".to_string()),
-        userns_mode: if config.docker.rootless.enabled {
-            Some(format!(
-                "keep-id:uid={},gid={}",
-                data.image_uid, data.image_gid
-            ))
-        } else {
-            string_to_option(&config.docker.userns_mode)
-        },
-        ..Default::default()
+            ..Default::default()
+        }];
+
+        for mapping in &self.volumes {
+            mounts.push(bollard::models::Mount {
+                typ: Some(bollard::models::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    host_mounts,
+                    &mapping.host_path(config, self.uuid).to_string_lossy(),
+                )),
+                target: Some(mapping.container_path().to_string_lossy().into_owned()),
+                ..Default::default()
+            });
+        }
+
+        let cfg = config.load();
+
+        bollard::models::HostConfig {
+            mounts: Some(mounts),
+            log_config: Some(bollard::models::HostConfigLogConfig {
+                typ: Some(cfg.docker.log_config.r#type.clone()),
+                config: Some(cfg.docker.log_config.config.clone().into_iter().collect()),
+            }),
+            network_mode: Some("none".to_string()),
+            ..self.base_host_config(config)
+        }
     }
-}
 
-fn container_config(
-    data: &StoredInstance,
-    config: &crate::config::Config,
-    host_mounts: Option<&host_mounts::HostMountTable>,
-) -> bollard::models::ContainerCreateBody {
-    let cfg = config.load();
-    let timezone = data
-        .timezone
-        .clone()
-        .unwrap_or_else(|| cfg.docker.timezone.clone());
+    fn container_config(
+        &self,
+        config: &crate::config::Config,
+        host_mounts: Option<&host_mounts::HostMountTable>,
+    ) -> bollard::models::ContainerCreateBody {
+        let cfg = config.load();
+        let timezone = self
+            .timezone
+            .clone()
+            .unwrap_or_else(|| cfg.docker.timezone.clone());
 
-    let mut env = vec![format!("TZ={timezone}")];
-    env.extend(data.env.iter().map(|(k, v)| format!("{k}={v}")));
+        let mut env = vec![format!("TZ={timezone}")];
+        env.extend(self.env.iter().map(|(k, v)| format!("{k}={v}")));
 
-    bollard::models::ContainerCreateBody {
-        hostname: Some(data.uuid.to_string()),
-        image: Some(data.image.trim_end_matches('~').to_string()),
-        env: Some(env),
-        cmd: data.cmd.clone(),
-        labels: Some(HashMap::from([
-            ("Service".to_string(), "calagopus-db-agent".to_string()),
-            ("ContainerType".to_string(), "database".to_string()),
-        ])),
-        host_config: Some(host_config(data, config, host_mounts)),
-        attach_stdin: Some(true),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        open_stdin: Some(true),
-        tty: Some(true),
-        ..Default::default()
+        bollard::models::ContainerCreateBody {
+            hostname: Some(self.uuid.to_string()),
+            image: Some(self.image.trim_end_matches('~').to_string()),
+            env: Some(env),
+            cmd: self.cmd.clone(),
+            labels: Some(HashMap::from([
+                ("Service".to_string(), crate::SERVICE_NAME.to_string()),
+                (
+                    "ContainerType".to_string(),
+                    CONTAINER_TYPE_DATABASE.to_string(),
+                ),
+            ])),
+            host_config: Some(self.host_config(config, host_mounts)),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            open_stdin: Some(true),
+            tty: Some(true),
+            ..Default::default()
+        }
     }
 }
 
@@ -344,14 +379,30 @@ impl DockerExecutor {
     }
 }
 
-async fn find_container(docker: &bollard::Docker, name: &str) -> Option<String> {
+fn container_filters(
+    name_filter: &str,
+    container_type: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    let mut filters = HashMap::from([("name".to_string(), vec![name_filter.to_string()])]);
+    if let Some(container_type) = container_type {
+        filters.insert(
+            "label".to_string(),
+            vec![format!("ContainerType={container_type}")],
+        );
+    }
+
+    filters
+}
+
+async fn find_container(
+    docker: &bollard::Docker,
+    name_filter: &str,
+    container_type: Option<&str>,
+) -> Option<String> {
     let containers = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
             all: true,
-            filters: Some(HashMap::from([(
-                "name".to_string(),
-                vec![name.to_string()],
-            )])),
+            filters: Some(container_filters(name_filter, container_type)),
             ..Default::default()
         }))
         .await
@@ -630,7 +681,7 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn update_resources(&self, data: &StoredInstance) -> Result<(), anyhow::Error> {
-        let r = convert_resources(data, &self.app_config);
+        let r = data.convert_resources(&self.app_config);
 
         self.docker
             .update_container(
@@ -762,7 +813,7 @@ impl super::ContainerExecutor for DockerExecutor {
             std::os::unix::fs::chown(&socket_dir, Some(data.image_uid), Some(data.image_gid))?;
         }
 
-        let config = container_config(&data, &self.app_config, self.host_mounts());
+        let config = data.container_config(&self.app_config, self.host_mounts());
 
         let container = self
             .docker
@@ -787,7 +838,12 @@ impl super::ContainerExecutor for DockerExecutor {
         &self,
         database: &super::super::Instance,
     ) -> Result<Option<Arc<dyn super::ProcessHandle>>, anyhow::Error> {
-        let Some(container_id) = find_container(&self.docker, &database.uuid.to_string()).await
+        let Some(container_id) = find_container(
+            &self.docker,
+            &database.uuid.to_string(),
+            Some(CONTAINER_TYPE_DATABASE),
+        )
+        .await
         else {
             return Ok(None);
         };
@@ -808,10 +864,10 @@ impl super::ContainerExecutor for DockerExecutor {
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
-                filters: Some(HashMap::from([(
-                    "name".to_string(),
-                    vec![database.uuid.to_string()],
-                )])),
+                filters: Some(container_filters(
+                    &database.uuid.to_string(),
+                    Some(CONTAINER_TYPE_DATABASE),
+                )),
                 ..Default::default()
             }))
             .await?;
@@ -834,5 +890,149 @@ impl super::ContainerExecutor for DockerExecutor {
         }
 
         Ok(())
+    }
+
+    async fn run_networked_container(
+        &self,
+        database: &super::super::Instance,
+        options: super::NetworkedContainerOptions,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>,
+        anyhow::Error,
+    > {
+        let data = database.data.read().await.clone();
+        self.pull_image(&data.image).await?;
+
+        let name = format!(
+            "{}_{CONTAINER_TYPE_SCRIPT_RUNNER}_{}",
+            database.uuid,
+            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
+        );
+
+        let container = self
+            .docker
+            .create_container(
+                Some(bollard::query_parameters::CreateContainerOptions {
+                    name: Some(name),
+                    ..Default::default()
+                }),
+                bollard::models::ContainerCreateBody {
+                    image: Some(data.image.trim_end_matches('~').to_string()),
+                    entrypoint: Some(vec![String::new()]),
+                    cmd: Some(options.command),
+                    env: Some(options.env),
+                    labels: Some(HashMap::from([
+                        ("Service".to_string(), crate::SERVICE_NAME.to_string()),
+                        (
+                            "ContainerType".to_string(),
+                            CONTAINER_TYPE_SCRIPT_RUNNER.to_string(),
+                        ),
+                    ])),
+                    host_config: Some(bollard::models::HostConfig {
+                        extra_hosts: Some(options.extra_hosts),
+                        log_config: Some(bollard::models::HostConfigLogConfig {
+                            typ: Some("none".to_string()),
+                            config: None,
+                        }),
+                        auto_remove: Some(true),
+                        ..data.base_host_config(&self.app_config)
+                    }),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let attach = self
+            .docker
+            .attach_container(
+                &container.id,
+                Some(bollard::query_parameters::AttachContainerOptions {
+                    stream: true,
+                    stdout: true,
+                    stderr: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn({
+            let docker = Arc::clone(&self.docker);
+            let id = container.id.clone();
+
+            async move {
+                exit_tx.send(
+                    docker
+                        .wait_container(
+                            &id,
+                            Some(bollard::query_parameters::WaitContainerOptions {
+                                condition: "removed".to_string(),
+                            }),
+                        )
+                        .next()
+                        .await,
+                )
+            }
+        });
+
+        self.docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await?;
+
+        let stderr = Arc::new(RwLock::new(Vec::new()));
+
+        Ok(attach
+            .output
+            .filter_map({
+                let stderr = Arc::clone(&stderr);
+
+                move |result| {
+                    std::future::ready(match result {
+                        Ok(bollard::container::LogOutput::StdOut { message }) => Some(Ok(message)),
+                        Ok(bollard::container::LogOutput::StdErr { message }) => {
+                            let mut stderr = stderr.write();
+                            if stderr.len() < crate::instance::STDERR_CAPTURE_LIMIT {
+                                stderr.extend_from_slice(&message);
+                            }
+
+                            None
+                        }
+                        Ok(_) => None,
+                        Err(err) => Some(Err(anyhow::Error::from(err))),
+                    })
+                }
+            })
+            .chain(futures_util::stream::once(async move {
+                let code = match exit_rx.await {
+                    Ok(Some(Err(DockerContainerWaitError { code, .. }))) => code,
+                    Ok(Some(Err(err))) => return Err(err.into()),
+                    Ok(Some(Ok(_))) => 0,
+                    Ok(None) | Err(_) => {
+                        anyhow::bail!("could not determine the exit status of the container");
+                    }
+                };
+
+                if code != 0 {
+                    let message = {
+                        let stderr = stderr.read();
+                        String::from_utf8_lossy(&stderr).trim().to_string()
+                    };
+
+                    return Err(if message.is_empty() {
+                        anyhow::anyhow!("container exited with code {code}")
+                    } else {
+                        anyhow::anyhow!("container exited with code {code}: {message}")
+                    });
+                }
+
+                Ok(bytes::Bytes::new())
+            }))
+            .boxed())
     }
 }

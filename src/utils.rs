@@ -3,6 +3,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     ops::{Bound, RangeBounds},
+    str::FromStr,
     time::Duration,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -35,6 +36,28 @@ pub fn generate_password() -> String {
     }
 
     String::from_utf8_lossy(&password).into_owned()
+}
+
+/// quotes a value for interpolation into a `sh -c` command line
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// parses a uri host as a literal address, `None` for a hostname
+pub fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    std::net::IpAddr::from_str(host).ok()
+}
+
+pub fn is_blocked_ip(cidrs: &[cidr::IpCidr], ip: &std::net::IpAddr) -> bool {
+    // ipv4-mapped addresses have to match the ipv4 ranges
+    let ip = ip.to_canonical();
+
+    cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
 
 pub fn bad(msg: &str) -> std::io::Error {

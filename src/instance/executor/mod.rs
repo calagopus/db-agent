@@ -26,6 +26,33 @@ pub struct ExecStream {
     pub stdin: Pin<Box<dyn AsyncWrite + Send>>,
 }
 
+pub struct NetworkedContainerOptions {
+    pub command: Vec<String>,
+    pub env: Vec<String>,
+    /// `hostname:ip` entries pinned into the container's hosts file
+    pub extra_hosts: Vec<String>,
+}
+
+impl NetworkedContainerOptions {
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            env: Vec::new(),
+            extra_hosts: Vec::new(),
+        }
+    }
+
+    pub fn with_env(mut self, env: Vec<String>) -> Self {
+        self.env = env;
+        self
+    }
+
+    pub fn with_extra_hosts(mut self, extra_hosts: Vec<String>) -> Self {
+        self.extra_hosts = extra_hosts;
+        self
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ProcessHandle: Send + Sync {
     async fn resource_usage(&self) -> Result<super::resources::ResourceUsage, anyhow::Error>;
@@ -63,4 +90,13 @@ pub trait ContainerExecutor: Send + Sync {
         database: &super::Instance,
     ) -> Result<Option<Arc<dyn ProcessHandle>>, anyhow::Error>;
     async fn destroy_container(&self, database: &super::Instance) -> Result<(), anyhow::Error>;
+
+    async fn run_networked_container(
+        &self,
+        database: &super::Instance,
+        options: NetworkedContainerOptions,
+    ) -> Result<
+        futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>,
+        anyhow::Error,
+    >;
 }
