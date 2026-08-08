@@ -19,6 +19,11 @@ impl ExecOptions {
             working_dir: None,
         }
     }
+
+    pub fn with_user(mut self, user: String) -> Self {
+        self.user = Some(user);
+        self
+    }
 }
 
 pub struct ExecStream {
@@ -55,17 +60,12 @@ impl NetworkedContainerOptions {
 
 #[async_trait::async_trait]
 pub trait ProcessHandle: Send + Sync {
-    async fn resource_usage(&self) -> Result<super::resources::ResourceUsage, anyhow::Error>;
-
     async fn exec(&self, options: ExecOptions) -> Result<ExecStream, anyhow::Error>;
 
     async fn logs(
         &self,
         lines: Option<usize>,
-    ) -> Result<
-        futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>,
-        anyhow::Error,
-    >;
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, anyhow::Error>;
 
     async fn update_resources(
         &self,
@@ -81,19 +81,22 @@ pub trait ProcessHandle: Send + Sync {
 pub trait ContainerExecutor: Send + Sync {
     async fn boot(&self) -> Result<(), anyhow::Error>;
 
-    async fn create_container(
+    async fn setup_instance_process(
         &self,
-        database: &super::Instance,
+        instance: &super::Instance,
     ) -> Result<Arc<dyn ProcessHandle>, anyhow::Error>;
-    async fn attach_container(
+    async fn attach_instance_process(
         &self,
-        database: &super::Instance,
-    ) -> Result<Option<Arc<dyn ProcessHandle>>, anyhow::Error>;
-    async fn destroy_container(&self, database: &super::Instance) -> Result<(), anyhow::Error>;
+        instance: &super::Instance,
+    ) -> Result<Arc<dyn ProcessHandle>, anyhow::Error>;
+    async fn cleanup_instance_process(
+        &self,
+        instance: &super::Instance,
+    ) -> Result<(), anyhow::Error>;
 
     async fn run_networked_container(
         &self,
-        database: &super::Instance,
+        instance: &super::Instance,
         options: NetworkedContainerOptions,
     ) -> Result<
         futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>,

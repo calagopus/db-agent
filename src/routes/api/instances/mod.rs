@@ -50,12 +50,9 @@ mod post {
     ), request_body = inline(StoredInstanceCreate))]
     pub async fn route(
         state: GetState,
-        crate::Payload(create): crate::Payload<StoredInstanceCreate>,
+        crate::Payload(data): crate::Payload<StoredInstanceCreate>,
     ) -> ApiResponseResult {
-        let instance = state
-            .instance_manager
-            .create_instance(state.0.clone(), create)
-            .await?;
+        let instance = state.instance_manager.create_instance(&state, data).await?;
 
         ApiResponse::new_serialized(Response {
             instance: instance.to_api_response().await,
@@ -66,8 +63,8 @@ mod post {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
-        .nest("/{instance}", _instance_::router(state))
         .nest("/utilization", utilization::router(state))
+        .nest("/{instance}", _instance_::router(state))
         .routes(routes!(get::route))
         .routes(routes!(post::route))
         .with_state(state.clone())

@@ -14,7 +14,7 @@ use scram::Scram;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UnixStream},
 };
 
 mod protocol;
@@ -73,11 +73,11 @@ async fn handle(
 ) -> std::io::Result<()> {
     match negotiate(tcp, &acceptor).await? {
         Conn::Plain(s) => {
-            tracing::debug!("[{peer}] connection (plain)");
+            tracing::debug!(%peer, "connection (plain)");
             session(s, &status, &routes, peer).await
         }
         Conn::Tls(s) => {
-            tracing::debug!("[{peer}] connection (tls)");
+            tracing::debug!(%peer, "connection (tls)");
             session(s, &status, &routes, peer).await
         }
     }
@@ -102,7 +102,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> std::io::Result<()> {
     let mut scram: Option<Scram> = None;
 
-    loop {
+    let (st, mut backend) = loop {
         let (reqid, opcode, body) = read_message(&mut stream).await?;
 
         if opcode == OP_QUERY {
@@ -127,7 +127,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                 let client_first = String::from_utf8_lossy(payload).into_owned();
                 let (bare, cnonce, user) = scram::parse_client_first(&client_first)
                     .ok_or_else(|| bad("bad client-first"))?;
-                tracing::debug!("[{peer}] saslStart user={user:?} db={db:?}");
+                tracing::debug!(%peer, %user, database = %db, "saslStart received");
 
                 let creds = user
                     .parse::<UserIdentifier>()
@@ -138,17 +138,22 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     return Ok(());
                 };
 
-                if creds.instance.is_suspended().await {
+                if creds.instance.locked_state().is_some() {
                     tracing::debug!(
-                        "[{peer}] rejected: database {} suspended",
-                        creds.instance.uuid
+                        %peer,
+                        instance = %creds.instance.uuid,
+                        "rejected: instance suspended"
                     );
                     write_op_msg(&mut stream, reqid, &sasl_error("database is suspended")).await?;
                     return Ok(());
                 }
 
                 if let Err(err) = creds.instance.verify_mongodb_auth().await {
-                    tracing::error!("[{peer}] rejected: instance {}: {err}", creds.instance.uuid);
+                    tracing::error!(
+                        %peer,
+                        instance = %creds.instance.uuid,
+                        "rejected: {err}"
+                    );
                     write_op_msg(
                         &mut stream,
                         reqid,
@@ -179,7 +184,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
             }
             "saslContinue" => {
                 let st = scram
-                    .as_ref()
+                    .take()
                     .ok_or_else(|| bad("saslContinue before saslStart"))?;
                 let payload = msg
                     .get_binary_generic("payload")
@@ -189,6 +194,29 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     write_op_msg(&mut stream, reqid, &sasl_error("authentication failed")).await?;
                     return Ok(());
                 };
+
+                // the backend answers before the client is told it is in, an offline instance
+                // would otherwise reach the client as a dropped connection instead of an error
+                let mut backend = match UnixStream::connect(&st.socket).await {
+                    Ok(backend) => backend,
+                    Err(err) => {
+                        write_op_msg(&mut stream, reqid, &sasl_error("database is offline"))
+                            .await?;
+                        tracing::debug!(%peer, "rejected: backend unreachable: {err}");
+                        return Ok(());
+                    }
+                };
+                if let Err(err) = scram::backend_auth(&mut backend, &st.user, &st.password).await {
+                    write_op_msg(
+                        &mut stream,
+                        reqid,
+                        &sasl_error("backend refused authentication"),
+                    )
+                    .await?;
+                    tracing::debug!(%peer, "rejected: backend refused authentication: {err}");
+                    return Ok(());
+                }
+
                 let reply = doc! {
                     "conversationId": 1,
                     "done": true,
@@ -196,18 +224,16 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     "ok": 1.0,
                 };
                 write_op_msg(&mut stream, reqid, &reply).await?;
-                break;
+                break (st, backend);
             }
             _ => {
                 write_op_msg(&mut stream, reqid, &doc! { "ok": 1.0 }).await?;
             }
         }
-    }
+    };
 
-    let st = scram.ok_or_else(|| bad("not authenticated"))?;
-    tracing::info!("[{peer}] {:?}@{:?} authenticated", st.user, st.db);
-    let mut backend = scram::backend_auth(&st.socket, &st.user, &st.password).await?;
-    tracing::debug!("[{peer}] backend ready, relaying");
+    tracing::info!(%peer, user = %st.user, database = %st.db, "client authenticated");
+    tracing::debug!(%peer, "backend ready, relaying");
 
     let _guard = st
         .user
@@ -215,7 +241,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .ok()
         .map(|id| status.connect(id, Some(st.db.to_string()).filter(|s| !s.is_empty())));
     let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
-    tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
+    tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
 
     Ok(())
 }

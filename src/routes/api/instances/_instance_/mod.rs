@@ -13,10 +13,12 @@ pub mod databases;
 mod export;
 mod import;
 mod logs;
+mod operations;
 mod power;
 mod query;
 pub mod users;
 mod utilization;
+mod ws;
 
 pub type GetInstance = axum::extract::Extension<crate::instance::Instance>;
 
@@ -29,12 +31,12 @@ pub async fn auth(
     let uuid = match parts.first().map(|s| s.parse::<uuid::Uuid>()) {
         Some(Ok(uuid)) => uuid,
         Some(Err(_)) => {
-            return Ok(ApiResponse::error("invalid database uuid")
+            return Ok(ApiResponse::error("invalid instance uuid")
                 .with_status(StatusCode::BAD_REQUEST)
                 .into_response());
         }
         None => {
-            return Ok(ApiResponse::error("missing database uuid")
+            return Ok(ApiResponse::error("missing instance uuid")
                 .with_status(StatusCode::BAD_REQUEST)
                 .into_response());
         }
@@ -71,7 +73,11 @@ mod get {
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ))]
     pub async fn route(instance: GetInstance) -> ApiResponseResult {
         ApiResponse::new_serialized(Response {
@@ -97,7 +103,11 @@ mod patch {
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ), request_body = inline(StoredInstanceUpdate))]
     pub async fn route(
         instance: GetInstance,
@@ -109,16 +119,16 @@ mod patch {
             update
                 .apply(&instance.app_state.database, &mut data)
                 .await?;
+            instance
+                .suspended
+                .store(data.suspended, std::sync::atomic::Ordering::SeqCst);
             !was_suspended && data.suspended
         };
 
-        instance.sync_container_resources().await?;
+        instance.sync_container().await?;
 
         if newly_suspended && let Err(err) = instance.stop().await {
-            tracing::error!(
-                "failed to stop instance {} after being suspended: {err}",
-                instance.uuid
-            );
+            tracing::error!(instance = %instance.uuid, "failed to stop instance after being suspended: {err}");
         }
 
         ApiResponse::new_serialized(Response {}).ok()
@@ -140,7 +150,11 @@ mod delete {
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ))]
     pub async fn route(state: GetState, instance: GetInstance) -> ApiResponseResult {
         state.instance_manager.delete_instance(&instance).await?;
@@ -154,9 +168,11 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/export", export::router(state))
         .nest("/import", import::router(state))
         .nest("/logs", logs::router(state))
+        .nest("/operations", operations::router(state))
         .nest("/power", power::router(state))
         .nest("/query", query::router(state))
         .nest("/utilization", utilization::router(state))
+        .nest("/ws", ws::router(state))
         .nest("/databases", databases::router(state))
         .nest("/users", users::router(state))
         .routes(routes!(get::route))

@@ -1,4 +1,7 @@
-use crate::utils::{SafeSliceExt, bad, get_array, handshake_step};
+use crate::{
+    io::SafeSliceExt,
+    utils::{bad, get_array, handshake_step},
+};
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -15,6 +18,8 @@ pub const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
 pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 
 pub const NATIVE: &str = "mysql_native_password";
+
+const MAX_PACKET_LEN: usize = 1024 * 1024;
 
 const CAPS: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_LONG_FLAG
@@ -204,8 +209,9 @@ fn read_cstr_bytes(p: &[u8], i: &mut usize) -> std::io::Result<Vec<u8>> {
 }
 
 fn read_n(p: &[u8], i: &mut usize, n: usize) -> std::io::Result<Vec<u8>> {
-    let v = p.get(*i..*i + n).ok_or_else(|| bad("eof"))?.to_vec();
-    *i += n;
+    let end = i.checked_add(n).ok_or_else(|| bad("eof"))?;
+    let v = p.get(*i..end).ok_or_else(|| bad("eof"))?.to_vec();
+    *i = end;
     Ok(v)
 }
 
@@ -232,14 +238,18 @@ fn read_lenenc(p: &[u8], i: &mut usize) -> std::io::Result<u64> {
     })
 }
 
-pub async fn read_packet<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
+pub async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
     handshake_step(async {
         let mut hdr = [0; 4];
-        s.read_exact(&mut hdr).await?;
+        stream.read_exact(&mut hdr).await?;
         let len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], 0]) as usize;
+        if len > MAX_PACKET_LEN {
+            return Err(bad("packet too large"));
+        }
+
         let seq = hdr[3];
         let mut payload = vec![0; len];
-        s.read_exact(&mut payload).await?;
+        stream.read_exact(&mut payload).await?;
 
         Ok((seq, payload))
     })
@@ -247,12 +257,13 @@ pub async fn read_packet<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(u8
 }
 
 pub async fn write_packet<S: AsyncWrite + Unpin>(
-    s: &mut S,
+    stream: &mut S,
     seq: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
     let len = payload.len();
-    s.write_all(&[len as u8, (len >> 8) as u8, (len >> 16) as u8, seq])
+    stream
+        .write_all(&[len as u8, (len >> 8) as u8, (len >> 16) as u8, seq])
         .await?;
-    s.write_all(payload).await
+    stream.write_all(payload).await
 }

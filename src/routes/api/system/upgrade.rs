@@ -44,7 +44,7 @@ mod post {
             .ok();
         }
 
-        if state.config.load().api.ignore_upgrades {
+        if state.config.load().ignore_upgrades {
             return ApiResponse::new_serialized(Response { applied: false }).ok();
         }
 
@@ -94,7 +94,7 @@ mod post {
         file.seek(std::io::SeekFrom::Start(0)).await?;
 
         let mut hasher = sha2::Sha256::new();
-        let mut buffer = vec![0; 32 * 1024];
+        let mut buffer = vec![0; crate::BUFFER_SIZE];
         loop {
             match file.read(&mut buffer).await? {
                 0 => break,
@@ -103,12 +103,7 @@ mod post {
         }
         drop(file);
 
-        let digest: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if digest != data.sha256 {
+        if hex::encode(hasher.finalize()) != data.sha256 {
             tokio::fs::remove_file(tmp_file).await.ok();
 
             return ApiResponse::error("downloaded file does not match provided sha256")
@@ -131,7 +126,7 @@ mod post {
             };
 
             if let Err(err) = run().await {
-                tracing::error!("error while upgrading binary: {err:?}");
+                tracing::error!("error while upgrading binary: {:?}", err);
             }
         });
 

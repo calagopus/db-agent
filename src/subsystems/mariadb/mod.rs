@@ -1,12 +1,13 @@
 use crate::{
     config::Config,
     instance::{DatabaseType, identifier::UserIdentifier, manager::DatabaseRouteManager},
+    io::{SafeSliceExt, SafeSliceMutExt},
     subsystems::status::SubsystemConnections,
     tls::ReloadableAcceptor,
-    utils::{SafeSliceExt, SafeSliceMutExt, bad, get_array},
+    utils::{bad, get_array},
 };
 use protocol::{read_packet, write_packet};
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::{TcpListener, TcpStream, UnixStream},
@@ -74,12 +75,12 @@ async fn handle(
     let caps = u32::from_le_bytes(get_array(&first, 0)?);
 
     if ssl_offered && caps & protocol::CLIENT_SSL != 0 {
-        tracing::debug!("[{peer}] connection (tls)");
+        tracing::debug!(%peer, "connection (tls)");
         let acceptor = acceptor.ok_or_else(|| bad("ssl requested without acceptor"))?;
         let tls = crate::utils::handshake_step(acceptor.accept(tcp)).await?;
         session(tls, &status, &routes, scramble, None, peer).await
     } else {
-        tracing::debug!("[{peer}] connection (plain)");
+        tracing::debug!(%peer, "connection (plain)");
         session(tcp, &status, &routes, scramble, Some((seq, first)), peer).await
     }
 }
@@ -98,10 +99,11 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let hr = protocol::parse_handshake_response(&resp)?;
     tracing::debug!(
-        "[{peer}] handshake: user={:?} database={:?} plugin={:?}",
-        hr.user,
-        hr.database,
-        hr.plugin
+        %peer,
+        user = %hr.user,
+        database = %hr.database,
+        plugin = %hr.plugin,
+        "handshake received"
     );
 
     let user_id = hr.user.parse::<UserIdentifier>().ok();
@@ -112,14 +114,14 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
             &protocol::err_packet(
                 1045,
                 "28000",
-                &format!("no credential for user {:?}", hr.user),
+                &format!("no credential for user {}", hr.user),
             ),
         )
         .await?;
         return Ok(());
     };
 
-    if creds.instance.is_suspended().await {
+    if creds.instance.locked_state().is_some() {
         write_packet(
             &mut stream,
             cseq + 1,
@@ -127,8 +129,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         )
         .await?;
         tracing::debug!(
-            "[{peer}] rejected: database {} suspended",
-            creds.instance.uuid
+            %peer,
+            instance = %creds.instance.uuid,
+            "rejected: instance suspended"
         );
         return Ok(());
     }
@@ -158,56 +161,79 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .await?;
         return Ok(());
     }
-    write_packet(&mut stream, seq + 1, &protocol::ok_packet()).await?;
-    tracing::info!("[{peer}] {:?}@{:?} authenticated", hr.user, hr.database);
+    // the backend answers before the client is told it is in, an offline instance or a refused
+    // database would otherwise reach the client as a dropped connection instead of an error
+    let mut backend = match UnixStream::connect(&creds.instance.get_socket_path().await).await {
+        Ok(backend) => backend,
+        Err(err) => {
+            write_packet(
+                &mut stream,
+                seq + 1,
+                &protocol::err_packet(1053, "08S01", "database is offline"),
+            )
+            .await?;
+            tracing::debug!(
+                %peer,
+                instance = %creds.instance.uuid,
+                "rejected: backend unreachable: {err}"
+            );
+            return Ok(());
+        }
+    };
 
-    let mut backend = backend_auth(
-        &creds.instance.get_socket_path().await,
+    if let Some(refusal) = backend_auth(
+        &mut backend,
         &hr.user,
         &creds.password,
         &hr.database,
         hr.caps,
     )
-    .await?;
-    tracing::debug!("[{peer}] backend ready, relaying");
+    .await?
+    {
+        write_packet(&mut stream, seq + 1, &refusal).await?;
+        tracing::debug!(
+            %peer,
+            instance = %creds.instance.uuid,
+            "rejected: backend refused the relayed credentials"
+        );
+        return Ok(());
+    }
+
+    write_packet(&mut stream, seq + 1, &protocol::ok_packet()).await?;
+    tracing::info!(%peer, user = %hr.user, database = %hr.database, "client authenticated");
+    tracing::debug!(%peer, "backend ready, relaying");
 
     let _guard = user_id
         .map(|id| status.connect(id, Some(hr.database.to_string()).filter(|s| !s.is_empty())));
     let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
-    tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
+    tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }
 
+/// yields the backend's err packet when it refuses the relayed credentials, so the session can
+/// hand it to the client verbatim
 async fn backend_auth(
-    socket: &Path,
+    be: &mut UnixStream,
     user: &str,
     password: &str,
     database: &str,
     client_caps: u32,
-) -> std::io::Result<UnixStream> {
-    let mut be = UnixStream::connect(socket).await?;
-    let (seq, hs) = read_packet(&mut be).await?;
+) -> std::io::Result<Option<Vec<u8>>> {
+    let (seq, hs) = read_packet(be).await?;
     let (scramble, _plugin) = protocol::parse_server_handshake(&hs)?;
     let token = auth::native_token(&scramble, password.as_bytes());
     write_packet(
-        &mut be,
+        be,
         seq + 1,
         &protocol::handshake_response(user, &token, database, client_caps),
     )
     .await?;
 
     loop {
-        let (rseq, r) = read_packet(&mut be).await?;
+        let (rseq, r) = read_packet(be).await?;
         match r.first() {
-            Some(0x00) => return Ok(be),
-            Some(0xff) => {
-                let msg = if r.len() > 9 {
-                    String::from_utf8_lossy(r.get_slice(9..)?).into_owned()
-                } else {
-                    "backend error".into()
-                };
-                return Err(bad(&format!("backend refused auth: {msg}")));
-            }
+            Some(0x00) => return Ok(None),
+            Some(0xff) => return Ok(Some(r)),
             Some(0xfe) => {
                 // AuthSwitchRequest: 0xfe, plugin CString, auth data
                 let mut i = 1usize;
@@ -218,7 +244,7 @@ async fn backend_auth(
                     .get_slice_mut(..avail)?
                     .copy_from_slice(r.get_slice(i..i + avail)?);
                 let token = auth::native_token(&new_scramble, password.as_bytes());
-                write_packet(&mut be, rseq + 1, &token).await?;
+                write_packet(be, rseq + 1, &token).await?;
             }
             _ => return Err(bad("unexpected backend auth packet")),
         }

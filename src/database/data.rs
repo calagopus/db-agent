@@ -38,12 +38,13 @@ impl<'a> VolumeMappingEntry<'a> {
         path
     }
 
+    #[inline]
     pub fn container_path(&self) -> &std::path::Path {
         std::path::Path::new(self.container_path)
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct VolumeMapping(BTreeMap<String, String>);
 
@@ -71,7 +72,7 @@ impl<'a> IntoIterator for &'a VolumeMapping {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct StoredInstance {
     pub uuid: uuid::Uuid,
     pub uuid_short: i64,
@@ -151,7 +152,7 @@ impl FromRow<'_, SqliteRow> for StoredInstance {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[derive(ToSchema, Debug, Clone, Deserialize)]
 pub struct StoredInstanceCreate {
     pub database_type: DatabaseType,
     #[serde(default)]
@@ -188,7 +189,7 @@ impl StoredInstanceCreate {
             )
             .bind(uuid)
             .bind(uuid_short)
-            .bind(self.database_type.as_str())
+            .bind(self.database_type.to_str())
             .bind(self.suspended)
             .bind(self.memory)
             .bind(self.swap)
@@ -237,7 +238,7 @@ impl StoredInstanceCreate {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[derive(ToSchema, Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct StoredInstanceUpdate {
     pub suspended: Option<bool>,
@@ -342,7 +343,7 @@ impl StoredInstanceUpdate {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct StoredDatabase {
     pub uuid: uuid::Uuid,
     pub instance_uuid: uuid::Uuid,
@@ -361,7 +362,7 @@ impl FromRow<'_, SqliteRow> for StoredDatabase {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
 pub struct StoredUser {
     pub uuid: uuid::Uuid,
     pub uuid_short: i64,

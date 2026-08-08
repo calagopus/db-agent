@@ -1,4 +1,7 @@
-use crate::utils::{SafeSliceExt, bad, handshake_step};
+use crate::{
+    io::SafeSliceExt,
+    utils::{bad, handshake_step},
+};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -6,7 +9,7 @@ pub const PROTOCOL_30: i32 = 0x30000;
 pub const SSL_REQUEST: i32 = 80877103;
 pub const GSS_REQUEST: i32 = 80877104;
 
-const MAX_MSG_LEN: i32 = 16 * 1024 * 1024;
+const MAX_MSG_LEN: i32 = 1024 * 1024;
 const PROTOCOL_OPTION_PREFIX: &str = "_pq_.";
 
 pub type Params = HashMap<String, String>;
@@ -14,7 +17,7 @@ pub type Params = HashMap<String, String>;
 pub async fn read_startup_body<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Vec<u8>> {
     handshake_step(async {
         let len = stream.read_i32().await?;
-        if !(8..=1 << 20).contains(&len) {
+        if !(8..=MAX_MSG_LEN).contains(&len) {
             return Err(bad("implausible startup length"));
         }
         let mut body = vec![0; (len - 4) as usize];
@@ -90,10 +93,10 @@ fn next_cstr(buf: &mut &[u8]) -> Option<String> {
     Some(s)
 }
 
-pub async fn read_msg<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
+pub async fn read_msg<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
     handshake_step(async {
-        let tag = s.read_u8().await?;
-        let len = s.read_i32().await?;
+        let tag = stream.read_u8().await?;
+        let len = stream.read_i32().await?;
         if len < 4 {
             return Err(bad("short message"));
         }
@@ -101,24 +104,24 @@ pub async fn read_msg<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<(u8, V
             return Err(bad("message too large"));
         }
         let mut body = vec![0; (len - 4) as usize];
-        s.read_exact(&mut body).await?;
+        stream.read_exact(&mut body).await?;
         Ok((tag, body))
     })
     .await
 }
 
 pub async fn write_msg<S: AsyncWrite + Unpin>(
-    s: &mut S,
+    stream: &mut S,
     tag: u8,
     body: &[u8],
 ) -> std::io::Result<()> {
-    s.write_u8(tag).await?;
-    s.write_i32((body.len() + 4) as i32).await?;
-    s.write_all(body).await
+    stream.write_u8(tag).await?;
+    stream.write_i32((body.len() + 4) as i32).await?;
+    stream.write_all(body).await
 }
 
 pub async fn send_error<S: AsyncWrite + Unpin>(
-    s: &mut S,
+    stream: &mut S,
     code: &str,
     msg: &str,
 ) -> std::io::Result<()> {
@@ -131,7 +134,7 @@ pub async fn send_error<S: AsyncWrite + Unpin>(
     body.extend_from_slice(msg.as_bytes());
     body.push(0);
     body.push(0);
-    write_msg(s, b'E', &body).await
+    write_msg(stream, b'E', &body).await
 }
 
 pub async fn send_startup<S: AsyncWrite + Unpin>(

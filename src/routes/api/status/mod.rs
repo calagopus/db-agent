@@ -23,10 +23,10 @@ mod get {
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
         ApiResponse::new_serialized(Response {
-            postgres: state.subsystem_registry.postgres.snapshot(),
-            mariadb: state.subsystem_registry.mariadb.snapshot(),
-            mongodb: state.subsystem_registry.mongodb.snapshot(),
-            redis: state.subsystem_registry.redis.snapshot(),
+            postgres: state.subsystem_registry.postgres.to_api_response(),
+            mariadb: state.subsystem_registry.mariadb.to_api_response(),
+            mongodb: state.subsystem_registry.mongodb.to_api_response(),
+            redis: state.subsystem_registry.redis.to_api_response(),
         })
         .ok()
     }

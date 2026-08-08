@@ -32,7 +32,11 @@ mod post {
         (status = EXPECTATION_FAILED, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ), request_body = inline(Payload))]
     pub async fn route(
         instance: GetInstance,
@@ -49,10 +53,7 @@ mod post {
         };
 
         if let Err(err) = result {
-            tracing::error!(
-                "failed to run power action on instance {}: {err}",
-                instance.uuid
-            );
+            tracing::error!(instance = %instance.uuid, "failed to run power action: {err}");
 
             return ApiResponse::error(&format!(
                 "failed to run power action on instance {}: {err}",

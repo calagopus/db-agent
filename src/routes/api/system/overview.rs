@@ -84,7 +84,7 @@ mod get {
 
         for instance in state.instance_manager.get_instances().await.iter() {
             instances.total += 1;
-            if instance.resource_usage().await.state == ContainerState::Offline {
+            if instance.resource_usage().state == ContainerState::Offline {
                 instances.offline += 1;
             } else {
                 instances.online += 1;

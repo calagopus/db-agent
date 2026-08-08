@@ -29,6 +29,10 @@ fn value_to_json(value: redis::Value) -> serde_json::Value {
     }
 }
 
+fn no_databases() -> anyhow::Error {
+    crate::response::DisplayError::new("redis has no named databases").into()
+}
+
 pub struct RedisConnection {
     client: redis::Client,
 }
@@ -68,11 +72,11 @@ impl DatabaseConnection for RedisConnection {
     }
 
     async fn create_database(&self, _name: &str) -> anyhow::Result<()> {
-        anyhow::bail!("redis has no named databases");
+        Err(no_databases())
     }
 
     async fn delete_database(&self, _name: &str) -> anyhow::Result<()> {
-        anyhow::bail!("redis has no named databases");
+        Err(no_databases())
     }
 
     async fn recreate_database(
@@ -80,11 +84,11 @@ impl DatabaseConnection for RedisConnection {
         _name: &str,
         _users: &[UserIdentifier],
     ) -> anyhow::Result<()> {
-        anyhow::bail!("redis has no named databases");
+        Err(no_databases())
     }
 
     async fn get_size(&self, _name: &str) -> anyhow::Result<i64> {
-        anyhow::bail!("redis has no named databases");
+        Err(no_databases())
     }
 
     async fn query(&self, _db: Option<&str>, query: &str) -> anyhow::Result<QueryResult> {

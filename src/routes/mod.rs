@@ -5,7 +5,7 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub mod api;
 
-#[derive(Debug, ToSchema, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, ToSchema, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum AppContainerType {
     Official,
@@ -15,8 +15,8 @@ pub enum AppContainerType {
 
 pub struct AppState {
     pub start_time: Instant,
-    pub version: String,
     pub container_type: AppContainerType,
+    pub version: String,
 
     pub config: Arc<crate::config::Config>,
     pub database: Arc<crate::database::Database>,

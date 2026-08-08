@@ -41,14 +41,6 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
             Box::pin(async move {
                 let args = ServiceInstallArgs::from_arg_matches(&arg_matches)?;
 
-                let config_path = arg_matches
-                    .get_one::<String>("config")
-                    .map(|path| path.as_str())
-                    .or_else(|| crate::config::Config::find())
-                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
-
-                let config = config.or_else(|| crate::config::Config::open(config_path).ok());
-
                 if std::env::consts::OS != "linux" {
                     eprintln!("{}", "this command is only available on Linux".red());
                     return Ok(1);
@@ -113,7 +105,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
 
                         if let Err(err) = Command::new("systemctl")
                             .arg("enable")
-                            .args(if config.is_some() {
+                            .args(if config.is_loaded() {
                                 &["--now"]
                             } else {
                                 &[] as &[&str]
@@ -126,7 +118,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                             return Ok(1);
                         }
 
-                        if config.is_some() {
+                        if config.is_loaded() {
                             println!("service enabled on startup and started");
                         } else {
                             println!("service enabled on startup");
@@ -180,7 +172,7 @@ impl crate::commands::CliCommand<ServiceInstallArgs> for ServiceInstallCommand {
                             return Ok(1);
                         }
 
-                        if config.is_some() {
+                        if config.is_loaded() {
                             if let Err(err) = Command::new("rc-service")
                                 .arg("db-agent")
                                 .arg("start")

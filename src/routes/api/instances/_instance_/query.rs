@@ -30,7 +30,11 @@ mod post {
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ), request_body = inline(Payload))]
     pub async fn route(
         instance: GetInstance,
@@ -46,7 +50,8 @@ mod post {
             .connection()
             .await?
             .query(data.db.as_deref(), &data.query)
-            .await?;
+            .await
+            .map_err(crate::instance::connection::query_error)?;
 
         ApiResponse::new_serialized(Response { result }).ok()
     }

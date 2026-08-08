@@ -3,12 +3,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod post {
     use crate::{
+        Path,
         response::{ApiResponse, ApiResponseResult},
-        routes::{
-            ApiError,
-            api::instances::_instance_::{GetInstance, users::_user_::GetUser},
-        },
+        routes::{ApiError, api::instances::_instance_::GetInstance},
     };
+    use axum::http::StatusCode;
     use serde::Serialize;
     use utoipa::ToSchema;
 
@@ -21,10 +20,30 @@ mod post {
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
-        ("user" = uuid::Uuid, description = "The user uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (
+            "user" = uuid::Uuid,
+            description = "The user uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ))]
-    pub async fn route(instance: GetInstance, user: GetUser) -> ApiResponseResult {
+    pub async fn route(
+        instance: GetInstance,
+        Path((_instance, user_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    ) -> ApiResponseResult {
+        let user = match instance.get_user(user_id).await? {
+            Some(user) => user,
+            None => {
+                return ApiResponse::error("user not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         let password = instance.rotate_password(&user).await?;
 
         ApiResponse::new_serialized(Response { password }).ok()

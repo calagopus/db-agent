@@ -9,6 +9,7 @@ mod post {
     use axum::http::StatusCode;
     use garde::Validate;
     use serde::{Deserialize, Serialize};
+    use std::sync::{Arc, atomic::AtomicU64};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Validate, Deserialize)]
@@ -25,15 +26,22 @@ mod post {
     }
 
     #[derive(ToSchema, Serialize)]
-    struct Response {}
+    struct Response {
+        operation: uuid::Uuid,
+    }
 
     #[utoipa::path(post, path = "/", responses(
         (status = OK, body = inline(Response)),
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
         (status = EXPECTATION_FAILED, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ), request_body = inline(Payload))]
     pub async fn route(
         state: GetState,
@@ -52,16 +60,37 @@ mod post {
                 .ok();
         }
 
+        let import = instance
+            .prepare_remote_import(&data.url, data.source_db.as_deref())
+            .await?;
         instance
-            .import_remote(
-                &data.url,
-                data.source_db.as_deref(),
-                data.db.as_deref(),
-                data.wipe,
-            )
+            .check_import(data.db.as_deref(), import.source_db.as_deref(), data.wipe)
             .await?;
 
-        ApiResponse::new_serialized(Response {}).ok()
+        let bytes_processed = Arc::new(AtomicU64::new(0));
+        let operation = crate::instance::operations::DatabaseOperation::RemoteImport {
+            source_host: import.source_host.clone(),
+            source_db: import.source_db.clone(),
+            db: data.db.clone(),
+            wipe: data.wipe,
+            start_time: chrono::Utc::now(),
+            bytes_processed: Arc::clone(&bytes_processed),
+        };
+
+        let (operation, _) = instance
+            .operations
+            .add_operation(operation, {
+                let instance = instance.0.clone();
+
+                async move {
+                    instance
+                        .run_remote_import(import, data.db.as_deref(), data.wipe, bytes_processed)
+                        .await
+                }
+            })
+            .await;
+
+        ApiResponse::new_serialized(Response { operation }).ok()
     }
 }
 

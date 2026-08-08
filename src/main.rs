@@ -7,6 +7,7 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
+use colored::Colorize;
 use std::{
     net::SocketAddr,
     sync::{
@@ -23,7 +24,10 @@ pub static CLAP_COMMAND: OnceLock<clap::Command> = OnceLock::new();
 mod commands;
 mod config;
 mod database;
+mod extract;
 mod instance;
+mod io;
+mod net;
 mod payload;
 mod response;
 mod routes;
@@ -32,7 +36,8 @@ mod subsystems;
 mod tls;
 mod utils;
 
-pub use payload::Payload;
+use extract::{Path, Query};
+use payload::Payload;
 
 const SERVICE_NAME: &str = "calagopus-db-agent";
 
@@ -40,6 +45,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
 const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
 const TARGET: &str = env!("CARGO_TARGET");
+
+/// 32 KiB - used for general IO
+const BUFFER_SIZE: usize = 32 * 1024;
 
 fn full_version() -> String {
     if GIT_BRANCH == "unknown" {
@@ -52,17 +60,6 @@ fn full_version() -> String {
 #[inline(always)]
 #[cold]
 fn cold_path() {}
-
-#[allow(dead_code)]
-#[inline(always)]
-fn likely(b: bool) -> bool {
-    if b {
-        true
-    } else {
-        cold_path();
-        false
-    }
-}
 
 #[inline(always)]
 fn unlikely(b: bool) -> bool {
@@ -119,7 +116,7 @@ fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> 
 }
 
 async fn handle_request(
-    state: axum::extract::State<Arc<crate::routes::AppState>>,
+    state: crate::routes::GetState,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response<Body>, StatusCode> {
@@ -144,7 +141,7 @@ async fn handle_request(
         .await)
 }
 
-async fn main_rt() -> anyhow::Result<()> {
+async fn main_rt() {
     let cli =
         commands::CliCommandGroupBuilder::new("calagopus-db-agent", "Calagopus database agent.");
     let mut cli = commands::commands(cli);
@@ -163,28 +160,59 @@ async fn main_rt() -> anyhow::Result<()> {
         .get_one::<bool>("debug")
         .expect("debug flag is required");
 
-    if let Some((command, arg_matches)) = matches.remove_subcommand() {
-        if let Some((func, arg_matches)) = cli.match_command(command, arg_matches) {
-            match func(None, arg_matches).await {
-                Ok(exit_code) => std::process::exit(exit_code),
-                Err(err) => exit_error!(format!(
-                    "an error occurred while running cli command: {err:#?}"
-                )),
+    // open writes the defaults when the file is missing, so afterwards a subcommand can no
+    // longer tell a fresh machine from a configured one
+    let configured = std::path::Path::new(config_path).exists();
+    let config = config::Config::open(config_path, debug, matches.subcommand().is_some());
+
+    match matches.remove_subcommand() {
+        Some((command, arg_matches)) => {
+            if let Some((func, arg_matches)) = cli.match_command(command, arg_matches) {
+                let state = if configured {
+                    match &config {
+                        Ok((config, _)) => commands::ConfigState::Loaded(Arc::clone(config)),
+                        Err(err) => commands::ConfigState::Unparseable(format!("{err:#}")),
+                    }
+                } else {
+                    commands::ConfigState::Missing
+                };
+
+                match func(state, arg_matches).await {
+                    Ok(exit_code) => {
+                        drop(config);
+                        std::process::exit(exit_code);
+                    }
+                    Err(err) => {
+                        drop(config);
+                        eprintln!(
+                            "{}: {:#?}",
+                            "an error occurred while running cli command".red(),
+                            err
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                cli.print_help();
+                std::process::exit(0);
             }
-        } else {
-            cli.print_help();
-            std::process::exit(0);
+        }
+        None => {
+            tracing::info!("db-agent {}", full_version());
+            tracing::info!("github.com/calagopus/db-agent#{}\n", GIT_COMMIT);
         }
     }
 
-    let config = config::Config::open(config_path)?;
-    let _log_guard = config.setup_logging(debug)?;
+    let (config, _guard) = match config {
+        Ok(config) => config,
+        Err(err) => exit_error!("failed to load config from {}: {:?}", config_path, err),
+    };
 
     if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
         exit_error!("Failed to install rustls crypto provider: {:?}", err);
     }
 
-    tracing::info!("db-agent {} loaded from {}", full_version(), config_path);
+    tracing::info!("config loaded from {}", config_path);
 
     spawn_subsystem("ntp clock drift check", async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -246,7 +274,10 @@ async fn main_rt() -> anyhow::Result<()> {
         Ok(())
     });
 
-    let database = Arc::new(database::Database::new(Arc::clone(&config)).await?);
+    let database = match database::Database::new(Arc::clone(&config)).await {
+        Ok(database) => Arc::new(database),
+        Err(err) => exit_error!("failed to initialize database: {:?}", err),
+    };
     let registry = Arc::new(subsystems::SubsystemRegistry::default());
     let database_route_manager = Arc::new(instance::manager::DatabaseRouteManager::default());
 
@@ -310,18 +341,19 @@ async fn main_rt() -> anyhow::Result<()> {
         instance::executor::docker::DockerExecutor::new(Arc::clone(&docker), Arc::clone(&config)),
     );
 
+    tracing::info!("running container executor boot tasks");
     if let Err(err) = container_executor.boot().await {
         exit_error!("failed to boot server executor: {:?}", err);
     }
 
     let state = Arc::new(routes::AppState {
         start_time: Instant::now(),
-        version: full_version(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
             Ok("official") => routes::AppContainerType::Official,
             Ok(_) => routes::AppContainerType::Unknown,
             Err(_) => routes::AppContainerType::None,
         },
+        version: full_version(),
         config: Arc::clone(&config),
         database: Arc::clone(&database),
         stats_manager: Arc::new(stats::StatsManager::default()),
@@ -331,9 +363,13 @@ async fn main_rt() -> anyhow::Result<()> {
         container_executor,
     });
 
-    if let Err(err) = state.instance_manager.initialize(state.clone()).await {
-        exit_error!("failed to initialize database manager: {:?}", err);
-    }
+    tokio::spawn({
+        let state = Arc::clone(&state);
+
+        async move {
+            state.instance_manager.boot(&state).await;
+        }
+    });
 
     let app = OpenApiRouter::new()
         .merge(routes::router(&state))
@@ -365,10 +401,6 @@ async fn main_rt() -> anyhow::Result<()> {
     }
 
     for (path, item) in openapi.paths.paths.iter_mut() {
-        let path = path
-            .replace('/', "_")
-            .replace(|c| ['{', '}'].contains(&c), "");
-
         let operations = [
             ("get", &mut item.get),
             ("post", &mut item.post),
@@ -377,9 +409,13 @@ async fn main_rt() -> anyhow::Result<()> {
             ("delete", &mut item.delete),
         ];
 
+        let path = path
+            .replace('/', "_")
+            .replace(|c| ['{', '}'].contains(&c), "");
+
         for (method, operation) in operations {
             if let Some(operation) = operation {
-                operation.operation_id = Some(format!("{method}{path}"));
+                operation.operation_id = Some(format!("{method}{path}"))
             }
         }
     }
@@ -491,12 +527,11 @@ async fn main_rt() -> anyhow::Result<()> {
             );
 
             let router = router.layer(axum::middleware::from_fn(
-                |mut req: Request<Body>, next: Next| async move {
-                    req.extensions_mut()
-                        .insert(axum::extract::ConnectInfo(SocketAddr::from((
-                            std::net::IpAddr::from([127, 0, 0, 1]),
-                            0,
-                        ))));
+                |mut req: Request, next: Next| async move {
+                    req.extensions_mut().insert(ConnectInfo(SocketAddr::from((
+                        std::net::IpAddr::from([127, 0, 0, 1]),
+                        0,
+                    ))));
                     next.run(req).await
                 },
             ));
@@ -514,8 +549,6 @@ async fn main_rt() -> anyhow::Result<()> {
         #[cfg(not(unix))]
         exit_error!("unix socket support is only available on unix systems");
     }
-
-    Ok(())
 }
 
 fn main() {
@@ -525,11 +558,10 @@ fn main() {
         .enable_all()
         .thread_name_fn(move || {
             let count = thread_count.fetch_add(1, Ordering::SeqCst);
-            format!("db-agent-rt-{count}")
+            format!("{SERVICE_NAME}-rt-{count}")
         })
-        .name("db-agent-rt")
+        .name(SERVICE_NAME)
         .build()
         .expect("failed to build Tokio runtime")
-        .block_on(main_rt())
-        .unwrap_or_else(|err: anyhow::Error| exit_error!("fatal: {:?}", err));
+        .block_on(main_rt());
 }

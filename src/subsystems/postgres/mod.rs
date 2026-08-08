@@ -68,11 +68,11 @@ async fn handle(
     let (conn, preread) = negotiate(tcp, &acceptor).await?;
     match conn {
         Conn::Plain(s) => {
-            tracing::debug!("[{peer}] connection (plain)");
+            tracing::debug!(%peer, "connection (plain)");
             session(s, preread, &status, &routes, peer).await
         }
         Conn::Tls(s) => {
-            tracing::debug!("[{peer}] connection (tls)");
+            tracing::debug!(%peer, "connection (tls)");
             session(s, preread, &status, &routes, peer).await
         }
     }
@@ -118,7 +118,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .get("database")
         .cloned()
         .unwrap_or_else(|| user.clone());
-    tracing::debug!("[{peer}] startup: user={user:?} database={database:?}");
+    tracing::debug!(%peer, %user, %database, "startup received");
 
     let user_id = user.parse::<UserIdentifier>().ok();
     let creds = user_id.and_then(|id| routes.find(DatabaseType::Postgres, &id));
@@ -126,17 +126,18 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         protocol::send_error(
             &mut stream,
             "28P01",
-            &format!("no credential for user {user:?}"),
+            &format!("no credential for user {user}"),
         )
         .await?;
         return Ok(());
     };
 
-    if creds.instance.is_suspended().await {
+    if creds.instance.locked_state().is_some() {
         protocol::send_error(&mut stream, "28P01", "database is suspended").await?;
         tracing::debug!(
-            "[{peer}] rejected: database {} suspended",
-            creds.instance.uuid
+            %peer,
+            instance = %creds.instance.uuid,
+            "rejected: instance suspended"
         );
         return Ok(());
     }
@@ -145,17 +146,33 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         protocol::send_error(&mut stream, "28P01", "authentication failed").await?;
         return Ok(());
     }
-    protocol::write_msg(&mut stream, b'R', &0i32.to_be_bytes()).await?; // AuthenticationOk
-    tracing::info!("[{peer}] {user:?}@{database:?} authenticated");
-
-    let mut backend = UnixStream::connect(&creds.instance.get_socket_path().await).await?;
+    // the backend socket has to be reachable before the client is told it is in, an offline
+    // instance would otherwise reach the client as a dropped connection instead of an error.
+    // AuthenticationOk still precedes authenticate_backend, which relays the backend's
+    // ParameterStatus/BackendKeyData/ReadyForQuery straight to the client
+    let mut backend = match UnixStream::connect(&creds.instance.get_socket_path().await).await {
+        Ok(backend) => backend,
+        Err(err) => {
+            protocol::send_error(&mut stream, "57P03", "database is offline").await?;
+            tracing::debug!(
+                %peer,
+                instance = %creds.instance.uuid,
+                "rejected: backend unreachable: {err}"
+            );
+            return Ok(());
+        }
+    };
     protocol::send_startup(&mut backend, &params).await?;
+
+    protocol::write_msg(&mut stream, b'R', &0i32.to_be_bytes()).await?; // AuthenticationOk
+    tracing::info!(%peer, %user, %database, "client authenticated");
+
     scram::authenticate_backend(&mut backend, &mut stream, &creds.password).await?;
-    tracing::debug!("[{peer}] backend ready, relaying");
+    tracing::debug!(%peer, "backend ready, relaying");
 
     let _guard =
         user_id.map(|id| status.connect(id, Some(database.to_string()).filter(|s| !s.is_empty())));
     let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
-    tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
+    tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }

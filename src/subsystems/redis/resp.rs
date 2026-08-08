@@ -78,6 +78,9 @@ async fn read_line<S: AsyncRead + Unpin>(s: &mut S, raw: &mut Vec<u8>) -> std::i
         if line.len() > MAX_LINE_LEN {
             return Err(bad("protocol line too long"));
         }
+        if raw.len() > MAX_COMMAND_LEN {
+            return Err(bad("command too large"));
+        }
         let b = s.read_u8().await?;
         raw.push(b);
         if b == b'\r' {
@@ -99,7 +102,7 @@ fn parse_int(bytes: &[u8]) -> std::io::Result<i64> {
     std::str::from_utf8(bytes)
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad integer"))
+        .ok_or_else(|| bad("bad integer"))
 }
 
 pub fn encode_command(args: &[Vec<u8>]) -> Vec<u8> {

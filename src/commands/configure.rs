@@ -1,8 +1,8 @@
-use anyhow::Context;
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Args, FromArgMatches};
 use colored::Colorize;
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use std::sync::Arc;
 
 #[derive(Args)]
 pub struct ConfigureArgs {
@@ -20,6 +20,20 @@ pub struct ConfigureArgs {
     pub token: Option<String>,
 }
 
+fn apply(
+    config: Option<&Arc<crate::config::Config>>,
+    patch: serde_json::Value,
+) -> anyhow::Result<crate::config::InnerConfig> {
+    let mut inner = match config {
+        Some(config) => serde_json::to_value(&**config.load())?,
+        None => serde_json::to_value(crate::config::InnerConfig::default())?,
+    };
+
+    json_patch::merge(&mut inner, &patch);
+
+    Ok(serde_json::from_value(inner)?)
+}
+
 pub struct ConfigureCommand;
 
 impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
@@ -28,19 +42,44 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
     }
 
     fn get_executor(self) -> Box<crate::commands::ExecutorFunc> {
-        Box::new(|_config, arg_matches| {
+        Box::new(|config, arg_matches| {
             Box::pin(async move {
                 let args = ConfigureArgs::from_arg_matches(&arg_matches)?;
 
-                let config_path = arg_matches
-                    .get_one::<String>("config")
-                    .map(|path| path.as_str())
-                    .or_else(|| crate::config::Config::find())
-                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
+                let exists = config.exists();
+                let config = match config {
+                    crate::commands::ConfigState::Loaded(config) => Some(config),
+                    crate::commands::ConfigState::Unparseable(err) => {
+                        eprintln!(
+                            "{}: {err}",
+                            "the existing configuration could not be read, its values will not be kept"
+                                .yellow()
+                        );
 
-                if std::path::Path::new(config_path).exists() && !args.r#override {
+                        None
+                    }
+                    crate::commands::ConfigState::Missing => None,
+                };
+
+                let config_path = match config.as_ref() {
+                    Some(config) => config.path.clone(),
+                    None => arg_matches
+                        .get_one::<String>("config")
+                        .cloned()
+                        .or_else(|| crate::config::Config::find().map(String::from))
+                        .unwrap_or_else(|| crate::config::Config::DEFAULT_PATH.to_string()),
+                };
+
+                if exists && !args.r#override {
                     let confirm = Confirm::with_theme(&ColorfulTheme::default())
-                        .with_prompt("do you want to override the current configuration?")
+                        .with_prompt(format!(
+                            "do you want to {} the configuration at {config_path}?",
+                            if config.is_some() {
+                                "update"
+                            } else {
+                                "override"
+                            }
+                        ))
                         .default(false)
                         .interact()?;
 
@@ -49,7 +88,7 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                     }
                 }
 
-                if let Some(join_data) = args.join_data {
+                let patch = if let Some(join_data) = args.join_data {
                     let decoded = match B64.decode(&join_data) {
                         Ok(decoded) => decoded,
                         Err(_) => {
@@ -58,23 +97,24 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    let inner = match serde_norway::from_slice(&decoded) {
-                        Ok(inner) => inner,
+                    match serde_norway::from_slice(&decoded) {
+                        Ok(patch) => patch,
                         Err(_) => {
                             eprintln!("{}", "failed to decode join data payload!".red());
                             return Ok(1);
                         }
-                    };
-
-                    crate::config::Config::save_new(config_path, &inner)?;
+                    }
                 } else {
-                    let mut inner = load_or_default(config_path)?;
-
                     let token = match args.token {
                         Some(token) => token,
                         None => Input::with_theme(&ColorfulTheme::default())
                             .with_prompt("api token")
-                            .with_initial_text(inner.api.token.clone())
+                            .with_initial_text(
+                                config
+                                    .as_ref()
+                                    .map(|config| config.load().api.token.clone())
+                                    .unwrap_or_default(),
+                            )
                             .interact_text()?,
                     };
 
@@ -83,9 +123,18 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         return Ok(1);
                     }
 
-                    inner.api.token = token;
-                    crate::config::Config::save_new(config_path, &inner)?;
-                }
+                    serde_json::json!({ "api": { "token": token } })
+                };
+
+                let inner = match apply(config.as_ref(), patch) {
+                    Ok(inner) => inner,
+                    Err(err) => {
+                        eprintln!("{} {err:#}", "failed to apply configuration:".red());
+                        return Ok(1);
+                    }
+                };
+
+                crate::config::Config::save_new(&config_path, inner)?;
 
                 println!(
                     "{}",
@@ -95,16 +144,5 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                 Ok(0)
             })
         })
-    }
-}
-
-fn load_or_default(path: &str) -> anyhow::Result<crate::config::InnerConfig> {
-    if std::path::Path::new(path).exists() {
-        let file =
-            std::fs::File::open(path).context(format!("failed to open config file {path}"))?;
-        serde_norway::from_reader(std::io::BufReader::new(file))
-            .context(format!("failed to parse config file {path}"))
-    } else {
-        Ok(crate::config::InnerConfig::default())
     }
 }

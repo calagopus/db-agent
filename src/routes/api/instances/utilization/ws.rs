@@ -24,7 +24,7 @@ pub async fn handle_ws(ws: WebSocketUpgrade, state: GetState) -> Response {
                     loop {
                         let mut utilization = HashMap::new();
                         for instance in state.instance_manager.get_instances().await.iter() {
-                            utilization.insert(instance.uuid, instance.resource_usage().await);
+                            utilization.insert(instance.uuid, instance.resource_usage());
                         }
 
                         let utilization_json = match serde_json::to_string(&utilization) {

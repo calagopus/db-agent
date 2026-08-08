@@ -14,6 +14,19 @@ fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+fn duplicate_database(err: anyhow::Error) -> anyhow::Error {
+    const ER_DB_CREATE_EXISTS: u16 = 1007;
+
+    match err.downcast_ref::<mysql_async::Error>() {
+        Some(mysql_async::Error::Server(server)) if server.code == ER_DB_CREATE_EXISTS => {
+            crate::response::DisplayError::new("database already exists")
+                .with_status(axum::http::StatusCode::CONFLICT)
+                .into()
+        }
+        _ => err,
+    }
+}
+
 fn value_to_json(value: mysql_async::Value) -> serde_json::Value {
     match value {
         mysql_async::Value::NULL => serde_json::Value::Null,
@@ -98,6 +111,7 @@ impl DatabaseConnection for MariadbConnection {
     async fn create_database(&self, name: &str) -> anyhow::Result<()> {
         self.execute(format!("CREATE DATABASE {}", quote_ident(name)))
             .await
+            .map_err(duplicate_database)
     }
 
     async fn delete_database(&self, name: &str) -> anyhow::Result<()> {

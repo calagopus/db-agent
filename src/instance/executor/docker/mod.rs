@@ -1,24 +1,119 @@
 use super::{ExecOptions, ExecStream};
 use crate::{
     database::data::StoredInstance,
-    instance::resources::{ContainerState, ResourceUsage},
+    instance::{
+        resources::{ContainerState, ResourceUsage, ResourceUsageWatchExt},
+        websocket::{WebsocketEvent, WebsocketMessage},
+    },
+    io::SafeSliceExt,
 };
-use anyhow::Context;
 use bollard::errors::Error::{DockerContainerWaitError, DockerResponseServerError};
 use futures_util::StreamExt;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use rand::distr::SampleString;
+use serde::Serialize;
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::io::ReadBuf;
 
 pub mod host_mounts;
 
 const CONTAINER_TYPE_DATABASE: &str = "database";
 const CONTAINER_TYPE_SCRIPT_RUNNER: &str = "script_runner";
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PullProgressStatus {
+    Pulling,
+    Extracting,
+}
+
+#[derive(Serialize)]
+struct PullProgress {
+    status: PullProgressStatus,
+    bytes_processed: i64,
+    bytes_total: i64,
+}
+
+fn pull_progress(
+    id: &str,
+    status: PullProgressStatus,
+    detail: Option<bollard::models::ProgressDetail>,
+) -> Option<WebsocketMessage> {
+    let detail = detail?;
+
+    Some(
+        WebsocketMessage::builder(WebsocketEvent::InstanceImagePullProgress)
+            .arg(id)
+            .structured_arg(PullProgress {
+                status,
+                bytes_processed: detail.current.unwrap_or_default(),
+                bytes_total: detail.total.unwrap_or_default(),
+            })
+            .build(),
+    )
+}
+
+/// force-removes a container when dropped. auto_remove only fires once the process
+/// exits by itself, an aborted or dropped stream would strand it forever
+struct ContainerGuard {
+    docker: Arc<bollard::Docker>,
+    container_id: String,
+}
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+
+        let docker = Arc::clone(&self.docker);
+        let container_id = std::mem::take(&mut self.container_id);
+
+        handle.spawn(async move {
+            match docker
+                .remove_container(
+                    &container_id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                // 404 is the container removing itself first, 409 a removal already
+                // in progress
+                Ok(())
+                | Err(DockerResponseServerError {
+                    status_code: 404 | 409,
+                    ..
+                }) => {}
+                Err(err) => {
+                    tracing::warn!(container = %container_id, "failed to remove container: {err}");
+                }
+            }
+        });
+    }
+}
+
+struct GuardedStream<S> {
+    stream: S,
+    _guard: ContainerGuard,
+}
+
+impl<S: futures_util::Stream + Unpin> futures_util::Stream for GuardedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().stream).poll_next(cx)
+    }
+}
 
 #[inline]
 fn string_to_option(s: &str) -> Option<String> {
@@ -30,7 +125,14 @@ fn string_to_option(s: &str) -> Option<String> {
 }
 
 trait DockerStoredInstanceExt {
-    fn convert_resources(&self, config: &crate::config::Config) -> bollard::models::Resources;
+    fn convert_container_resources(
+        &self,
+        config: &crate::config::Config,
+    ) -> bollard::models::Resources;
+    fn container_update_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> bollard::models::ContainerUpdateBody;
 
     fn base_host_config(&self, config: &crate::config::Config) -> bollard::models::HostConfig;
     fn host_config(
@@ -46,7 +148,10 @@ trait DockerStoredInstanceExt {
 }
 
 impl DockerStoredInstanceExt for StoredInstance {
-    fn convert_resources(&self, config: &crate::config::Config) -> bollard::models::Resources {
+    fn convert_container_resources(
+        &self,
+        config: &crate::config::Config,
+    ) -> bollard::models::Resources {
         let memory = if self.memory > 0 {
             self.memory * 1024 * 1024
         } else {
@@ -64,7 +169,7 @@ impl DockerStoredInstanceExt for StoredInstance {
             blkio_weight: self.io_weight.and_then(|w| u16::try_from(w).ok()),
             pids_limit: match config.load().docker.container_pid_limit {
                 0 => None,
-                limit => Some(limit),
+                limit => Some(limit as i64),
             },
             ..Default::default()
         };
@@ -80,8 +185,27 @@ impl DockerStoredInstanceExt for StoredInstance {
         resources
     }
 
+    fn container_update_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> bollard::models::ContainerUpdateBody {
+        let resources = self.convert_container_resources(config);
+
+        bollard::models::ContainerUpdateBody {
+            memory: resources.memory,
+            memory_reservation: resources.memory_reservation,
+            memory_swap: resources.memory_swap,
+            cpu_quota: resources.cpu_quota,
+            cpu_period: resources.cpu_period,
+            cpu_shares: resources.cpu_shares,
+            blkio_weight: resources.blkio_weight,
+            pids_limit: resources.pids_limit,
+            ..Default::default()
+        }
+    }
+
     fn base_host_config(&self, config: &crate::config::Config) -> bollard::models::HostConfig {
-        let resources = self.convert_resources(config);
+        let resources = self.convert_container_resources(config);
         let cfg = config.load();
 
         bollard::models::HostConfig {
@@ -192,6 +316,7 @@ impl DockerStoredInstanceExt for StoredInstance {
             image: Some(self.image.trim_end_matches('~').to_string()),
             env: Some(env),
             cmd: self.cmd.clone(),
+            user: Some(format!("{}:{}", self.image_uid, self.image_gid)),
             labels: Some(HashMap::from([
                 ("Service".to_string(), crate::SERVICE_NAME.to_string()),
                 (
@@ -244,10 +369,16 @@ impl DockerExecutor {
             .is_ok_and(|images| !images.is_empty())
     }
 
-    async fn pull_image(&self, image: &str) -> Result<(), anyhow::Error> {
+    async fn pull_image(
+        &self,
+        instance: &super::super::Instance,
+        image: &str,
+    ) -> Result<(), anyhow::Error> {
         if image.ends_with('~') {
             return Ok(());
         }
+
+        let uuid = instance.uuid;
 
         let (image_name, tag) = match image.rsplit_once(':') {
             Some((name, tag)) if !tag.is_empty() => {
@@ -319,12 +450,22 @@ impl DockerExecutor {
             && self.image_exists(image_name).await
         {
             tracing::debug!(
+                instance = %uuid,
                 image = %image_name,
                 "image pull skipped, cached as recently pulled"
             );
 
             return Ok(());
         }
+
+        instance
+            .websocket
+            .send(
+                WebsocketMessage::builder(WebsocketEvent::InstanceDaemonMessage)
+                    .arg("Pulling database image, this could take a few minutes to complete...")
+                    .build(),
+            )
+            .ok();
 
         let mut registry_auth = None;
         for (registry, config) in self.app_config.load().docker.registries.iter() {
@@ -351,9 +492,31 @@ impl DockerExecutor {
 
         while let Some(status) = stream.next().await {
             match status {
-                Ok(_) => {}
+                Ok(info) => {
+                    let Some(id) = info.id else { continue };
+
+                    let message = match info.status.as_deref().map(str::to_lowercase).as_deref() {
+                        Some("downloading") => {
+                            pull_progress(&id, PullProgressStatus::Pulling, info.progress_detail)
+                        }
+                        Some("extracting") => {
+                            pull_progress(&id, PullProgressStatus::Extracting, info.progress_detail)
+                        }
+                        Some("download complete" | "pull complete") => Some(
+                            WebsocketMessage::builder(WebsocketEvent::InstanceImagePullCompleted)
+                                .arg(id)
+                                .build(),
+                        ),
+                        _ => None,
+                    };
+
+                    if let Some(message) = message {
+                        instance.websocket.send(message).ok();
+                    }
+                }
                 Err(err) => {
                     tracing::error!(
+                        instance = %uuid,
                         image = %image_name,
                         "failed to pull image: {:?}",
                         err
@@ -364,6 +527,7 @@ impl DockerExecutor {
                     }
 
                     tracing::warn!(
+                        instance = %uuid,
                         image = %image_name,
                         "image already exists locally, ignoring pull error"
                     );
@@ -411,15 +575,53 @@ async fn find_container(
     containers.into_iter().find_map(|c| c.id)
 }
 
+struct LogsReader {
+    stream: futures_util::stream::BoxStream<'static, Result<Vec<u8>, std::io::Error>>,
+    buffer: Vec<u8>,
+    pos: usize,
+}
+
+impl tokio::io::AsyncRead for LogsReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if self.pos < self.buffer.len() {
+                let n = buf.remaining().min(self.buffer.len() - self.pos);
+                let buffer_slice = match self.buffer.get_slice(self.pos..self.pos + n) {
+                    Ok(slice) => slice,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                buf.put_slice(buffer_slice);
+                self.pos += n;
+
+                return Poll::Ready(Ok(()));
+            }
+
+            self.buffer.clear();
+            self.pos = 0;
+
+            match self.stream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => self.buffer = chunk,
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 struct DockerProcessHandle {
     container_id: String,
     docker: Arc<bollard::Docker>,
     app_config: Arc<crate::config::Config>,
 
-    resource_usage: Arc<RwLock<ResourceUsage>>,
+    resource_usage: tokio::sync::watch::Sender<ResourceUsage>,
 
-    stats_task: tokio::task::JoinHandle<()>,
     state_task: tokio::task::JoinHandle<()>,
+    stats_task: tokio::task::JoinHandle<()>,
 }
 
 impl DockerProcessHandle {
@@ -428,170 +630,155 @@ impl DockerProcessHandle {
         docker: Arc<bollard::Docker>,
         app_config: Arc<crate::config::Config>,
         uuid: uuid::Uuid,
+        resource_usage: tokio::sync::watch::Sender<ResourceUsage>,
     ) -> Self {
-        let resource_usage = Arc::new(RwLock::new(ResourceUsage::default()));
+        resource_usage.wipe(ContainerState::Offline);
 
-        let stats_task = tokio::spawn(Self::stats_loop(
-            Arc::clone(&docker),
-            container_id.clone(),
-            Arc::clone(&resource_usage),
-            uuid,
-        ));
-        let state_task = tokio::spawn(Self::state_loop(
-            Arc::clone(&docker),
-            container_id.clone(),
-            Arc::clone(&resource_usage),
-            uuid,
-        ));
+        let stats_docker = Arc::clone(&docker);
+        let stats_id = container_id.clone();
+        let stats_usage = resource_usage.clone();
+
+        let stats_task = tokio::spawn(async move {
+            let mut prev_cpu_total = 0;
+            let mut prev_instant = None;
+
+            loop {
+                let mut stream = stats_docker.stats(
+                    &stats_id,
+                    Some(bollard::query_parameters::StatsOptions {
+                        stream: false,
+                        one_shot: true,
+                    }),
+                );
+
+                let (stats, _) =
+                    tokio::join!(stream.next(), tokio::time::sleep(Duration::from_secs(1)));
+
+                let Some(stats) = stats else { break };
+                let stats = match stats {
+                    Ok(stats) => stats,
+                    Err(err) => {
+                        tracing::warn!(instance = %uuid, "failed to get container stats: {err:?}");
+                        continue;
+                    }
+                };
+
+                stats_usage.send_modify(|usage| {
+                    if let Some(memory_stats) = &stats.memory_stats {
+                        let mut memory_bytes = memory_stats.usage.unwrap_or(0);
+
+                        if let Some(stats) = &memory_stats.stats {
+                            if let Some(&inactive_file) = stats.get("total_inactive_file")
+                                && inactive_file < memory_bytes
+                            {
+                                memory_bytes -= inactive_file;
+                            } else if let Some(&inactive_file) = stats.get("inactive_file")
+                                && inactive_file < memory_bytes
+                            {
+                                memory_bytes -= inactive_file;
+                            }
+                        }
+
+                        usage.memory_bytes = memory_bytes;
+                        usage.memory_limit_bytes = memory_stats.limit.unwrap_or(0);
+                    }
+
+                    if let Some(cpu_stats) = &stats.cpu_stats
+                        && let Some(cpu_usage) = &cpu_stats.cpu_usage
+                    {
+                        let total_usage = cpu_usage.total_usage.unwrap_or(0);
+                        let now = Instant::now();
+
+                        usage.cpu_absolute = if let Some(prev) = prev_instant {
+                            let cpu_delta_ns = total_usage.saturating_sub(prev_cpu_total) as f64;
+                            let wall_delta_ns = now.duration_since(prev).as_nanos() as f64;
+
+                            if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
+                                ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+
+                        prev_cpu_total = total_usage;
+                        prev_instant = Some(now);
+                    }
+                });
+            }
+        });
+
+        let state_docker = Arc::clone(&docker);
+        let state_id = container_id.clone();
+        let state_usage = resource_usage.clone();
+
+        let state_task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                let inspect = match state_docker.inspect_container(&state_id, None).await {
+                    Ok(inspect) => inspect,
+                    Err(DockerResponseServerError {
+                        status_code: 404, ..
+                    }) => Default::default(),
+                    Err(err) => {
+                        tracing::warn!(instance = %uuid, "failed to inspect container for state: {err:?}");
+                        continue;
+                    }
+                };
+                let state = inspect.state.unwrap_or_default();
+
+                let (container_state, uptime) = match state.status {
+                    Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
+                        let uptime = state
+                            .started_at
+                            .as_deref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|started| {
+                                chrono::Utc::now()
+                                    .signed_duration_since(started.with_timezone(&chrono::Utc))
+                                    .num_milliseconds()
+                                    .max(0) as u64
+                            })
+                            .unwrap_or(0);
+                        (ContainerState::Running, uptime)
+                    }
+                    Some(bollard::models::ContainerStateStatusEnum::PAUSED) => {
+                        (ContainerState::Stopping, 0)
+                    }
+                    _ => (ContainerState::Offline, 0),
+                };
+
+                state_usage.send_modify(|usage| {
+                    usage.state = container_state;
+                    usage.uptime = uptime;
+                });
+            }
+        });
 
         Self {
             container_id,
             docker,
             app_config,
             resource_usage,
-            stats_task,
             state_task,
-        }
-    }
-
-    async fn stats_loop(
-        docker: Arc<bollard::Docker>,
-        container_id: String,
-        usage: Arc<RwLock<ResourceUsage>>,
-        uuid: uuid::Uuid,
-    ) {
-        let mut prev_cpu_total = 0;
-        let mut prev_instant = None;
-
-        loop {
-            let mut stream = docker.stats(
-                &container_id,
-                Some(bollard::query_parameters::StatsOptions {
-                    stream: false,
-                    one_shot: true,
-                }),
-            );
-
-            let (stats, _) =
-                tokio::join!(stream.next(), tokio::time::sleep(Duration::from_secs(1)));
-
-            let Some(stats) = stats else { break };
-            let stats = match stats {
-                Ok(stats) => stats,
-                Err(err) => {
-                    tracing::warn!(database = %uuid, "failed to get container stats: {err:?}");
-                    continue;
-                }
-            };
-
-            let mut usage = usage.write();
-
-            if let Some(memory_stats) = &stats.memory_stats {
-                let mut memory_bytes = memory_stats.usage.unwrap_or(0);
-
-                if let Some(stats) = &memory_stats.stats {
-                    if let Some(&inactive_file) = stats.get("total_inactive_file")
-                        && inactive_file < memory_bytes
-                    {
-                        memory_bytes -= inactive_file;
-                    } else if let Some(&inactive_file) = stats.get("inactive_file")
-                        && inactive_file < memory_bytes
-                    {
-                        memory_bytes -= inactive_file;
-                    }
-                }
-
-                usage.memory_bytes = memory_bytes;
-                usage.memory_limit_bytes = memory_stats.limit.unwrap_or(0);
-            }
-
-            if let Some(cpu_stats) = &stats.cpu_stats
-                && let Some(cpu_usage) = &cpu_stats.cpu_usage
-            {
-                let total_usage = cpu_usage.total_usage.unwrap_or(0);
-                let now = Instant::now();
-
-                usage.cpu_absolute = if let Some(prev) = prev_instant {
-                    let cpu_delta_ns = total_usage.saturating_sub(prev_cpu_total) as f64;
-                    let wall_delta_ns = now.duration_since(prev).as_nanos() as f64;
-
-                    if wall_delta_ns > 0.0 && cpu_delta_ns > 0.0 {
-                        ((cpu_delta_ns / wall_delta_ns) * 100.0 * 1000.0).round() / 1000.0
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                };
-
-                prev_cpu_total = total_usage;
-                prev_instant = Some(now);
-            }
-        }
-    }
-
-    async fn state_loop(
-        docker: Arc<bollard::Docker>,
-        container_id: String,
-        usage: Arc<RwLock<ResourceUsage>>,
-        uuid: uuid::Uuid,
-    ) {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            let inspect = match docker.inspect_container(&container_id, None).await {
-                Ok(inspect) => inspect,
-                Err(DockerResponseServerError {
-                    status_code: 404, ..
-                }) => Default::default(),
-                Err(err) => {
-                    tracing::warn!(database = %uuid, "failed to inspect container: {err:?}");
-                    continue;
-                }
-            };
-            let state = inspect.state.unwrap_or_default();
-
-            let (container_state, uptime) = match state.status {
-                Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
-                    let uptime = state
-                        .started_at
-                        .as_deref()
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|started| {
-                            chrono::Utc::now()
-                                .signed_duration_since(started.with_timezone(&chrono::Utc))
-                                .num_milliseconds()
-                                .max(0) as u64
-                        })
-                        .unwrap_or(0);
-                    (ContainerState::Running, uptime)
-                }
-                Some(bollard::models::ContainerStateStatusEnum::PAUSED) => {
-                    (ContainerState::Stopping, 0)
-                }
-                _ => (ContainerState::Offline, 0),
-            };
-
-            let mut usage = usage.write();
-            usage.state = container_state;
-            usage.uptime = uptime;
+            stats_task,
         }
     }
 }
 
 impl Drop for DockerProcessHandle {
     fn drop(&mut self) {
-        self.stats_task.abort();
         self.state_task.abort();
+        self.stats_task.abort();
+
+        self.resource_usage.wipe(ContainerState::Offline);
     }
 }
 
 #[async_trait::async_trait]
 impl super::ProcessHandle for DockerProcessHandle {
-    async fn resource_usage(&self) -> Result<ResourceUsage, anyhow::Error> {
-        Ok(*self.resource_usage.read())
-    }
-
     async fn exec(&self, options: ExecOptions) -> Result<ExecStream, anyhow::Error> {
         let exec = self
             .docker
@@ -625,18 +812,43 @@ impl super::ProcessHandle for DockerProcessHandle {
             bollard::exec::StartExecResults::Attached { output, input } => {
                 let docker = Arc::clone(&self.docker);
                 let exec_id = exec.id;
+                let stderr = Arc::new(RwLock::new(Vec::new()));
 
                 Ok(ExecStream {
+                    // stderr is kept out of the payload, a dump would carry the
+                    // tool's chatter otherwise
                     output: output
-                        .map(|result| {
-                            result
-                                .map(|log| log.into_bytes())
-                                .map_err(anyhow::Error::from)
+                        .filter_map({
+                            let stderr = Arc::clone(&stderr);
+
+                            move |result| {
+                                std::future::ready(match result {
+                                    Ok(bollard::container::LogOutput::StdErr { message }) => {
+                                        let mut stderr = stderr.write();
+                                        if stderr.len() < crate::instance::STDERR_CAPTURE_LIMIT {
+                                            stderr.extend_from_slice(&message);
+                                        }
+
+                                        None
+                                    }
+                                    Ok(log) => Some(Ok(log.into_bytes())),
+                                    Err(err) => Some(Err(anyhow::Error::from(err))),
+                                })
+                            }
                         })
                         .chain(futures_util::stream::once(async move {
                             match docker.inspect_exec(&exec_id).await?.exit_code {
                                 Some(code) if code != 0 => {
-                                    Err(anyhow::anyhow!("exec exited with code {code}"))
+                                    let message = {
+                                        let stderr = stderr.read();
+                                        String::from_utf8_lossy(&stderr).trim().to_string()
+                                    };
+
+                                    Err(if message.is_empty() {
+                                        anyhow::anyhow!("exec exited with code {code}")
+                                    } else {
+                                        anyhow::anyhow!("exec exited with code {code}: {message}")
+                                    })
                                 }
                                 _ => Ok(bytes::Bytes::new()),
                             }
@@ -654,10 +866,7 @@ impl super::ProcessHandle for DockerProcessHandle {
     async fn logs(
         &self,
         lines: Option<usize>,
-    ) -> Result<
-        futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>,
-        anyhow::Error,
-    > {
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, anyhow::Error> {
         let stream = self
             .docker
             .logs(
@@ -673,37 +882,30 @@ impl super::ProcessHandle for DockerProcessHandle {
             )
             .map(|result| {
                 result
-                    .map(|log| log.into_bytes())
-                    .map_err(anyhow::Error::from)
+                    .map(|log| log.into_bytes().to_vec())
+                    .map_err(std::io::Error::other)
             });
 
-        Ok(stream.boxed())
+        Ok(Box::new(LogsReader {
+            stream: stream.boxed(),
+            buffer: Vec::new(),
+            pos: 0,
+        }))
     }
 
     async fn update_resources(&self, data: &StoredInstance) -> Result<(), anyhow::Error> {
-        let r = data.convert_resources(&self.app_config);
-
         self.docker
             .update_container(
                 &self.container_id,
-                bollard::models::ContainerUpdateBody {
-                    memory: r.memory,
-                    memory_reservation: r.memory_reservation,
-                    memory_swap: r.memory_swap,
-                    cpu_quota: r.cpu_quota,
-                    cpu_period: r.cpu_period,
-                    cpu_shares: r.cpu_shares,
-                    blkio_weight: r.blkio_weight,
-                    pids_limit: r.pids_limit,
-                    ..Default::default()
-                },
+                data.container_update_config(&self.app_config),
             )
             .await
             .map_err(Into::into)
     }
 
     async fn start(&self) -> Result<(), anyhow::Error> {
-        self.resource_usage.write().state = ContainerState::Starting;
+        self.resource_usage
+            .send_modify(|usage| usage.state = ContainerState::Starting);
         self.docker
             .start_container(
                 &self.container_id,
@@ -714,7 +916,8 @@ impl super::ProcessHandle for DockerProcessHandle {
     }
 
     async fn stop(&self) -> Result<(), anyhow::Error> {
-        self.resource_usage.write().state = ContainerState::Stopping;
+        self.resource_usage
+            .send_modify(|usage| usage.state = ContainerState::Stopping);
         self.docker
             .stop_container(
                 &self.container_id,
@@ -744,13 +947,6 @@ impl super::ProcessHandle for DockerProcessHandle {
 impl super::ContainerExecutor for DockerExecutor {
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.docker.version().await?;
-
-        let config = self.app_config.load();
-        for dir in [&config.socket_dir, &config.data_dir] {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .with_context(|| format!("failed to create directory {dir}"))?;
-        }
 
         if std::env::var("OCI_CONTAINER").is_ok() {
             match host_mounts::HostMountTable::discover(&self.docker).await {
@@ -788,16 +984,16 @@ impl super::ContainerExecutor for DockerExecutor {
         Ok(())
     }
 
-    async fn create_container(
+    async fn setup_instance_process(
         &self,
-        database: &super::super::Instance,
+        instance: &super::super::Instance,
     ) -> Result<Arc<dyn super::ProcessHandle>, anyhow::Error> {
-        let data = database.data.read().await.clone();
+        let data = instance.data.read().await.clone();
         let data_dir = self.app_config.data_path(data.uuid);
 
         let rootless = self.app_config.load().docker.rootless.enabled;
 
-        self.pull_image(&data.image).await?;
+        self.pull_image(instance, &data.image).await?;
         tokio::fs::create_dir_all(data_dir.join("volumes")).await?;
         for mapping in &data.volumes {
             let host_path = mapping.host_path(&self.app_config, data.uuid);
@@ -813,7 +1009,7 @@ impl super::ContainerExecutor for DockerExecutor {
             std::os::unix::fs::chown(&socket_dir, Some(data.image_uid), Some(data.image_gid))?;
         }
 
-        let config = data.container_config(&self.app_config, self.host_mounts());
+        let bollard_config = data.container_config(&self.app_config, self.host_mounts());
 
         let container = self
             .docker
@@ -822,7 +1018,7 @@ impl super::ContainerExecutor for DockerExecutor {
                     name: Some(data.uuid.to_string()),
                     ..Default::default()
                 }),
-                config,
+                bollard_config,
             )
             .await?;
 
@@ -831,41 +1027,41 @@ impl super::ContainerExecutor for DockerExecutor {
             Arc::clone(&self.docker),
             Arc::clone(&self.app_config),
             data.uuid,
+            instance.resource_usage.clone(),
         )))
     }
 
-    async fn attach_container(
+    async fn attach_instance_process(
         &self,
-        database: &super::super::Instance,
-    ) -> Result<Option<Arc<dyn super::ProcessHandle>>, anyhow::Error> {
-        let Some(container_id) = find_container(
+        instance: &super::super::Instance,
+    ) -> Result<Arc<dyn super::ProcessHandle>, anyhow::Error> {
+        let container_id = find_container(
             &self.docker,
-            &database.uuid.to_string(),
+            &instance.uuid.to_string(),
             Some(CONTAINER_TYPE_DATABASE),
         )
         .await
-        else {
-            return Ok(None);
-        };
+        .ok_or_else(|| anyhow::anyhow!("no running database container found"))?;
 
-        Ok(Some(Arc::new(DockerProcessHandle::new(
+        Ok(Arc::new(DockerProcessHandle::new(
             container_id,
             Arc::clone(&self.docker),
             Arc::clone(&self.app_config),
-            database.uuid,
-        ))))
+            instance.uuid,
+            instance.resource_usage.clone(),
+        )))
     }
 
-    async fn destroy_container(
+    async fn cleanup_instance_process(
         &self,
-        database: &super::super::Instance,
+        instance: &super::super::Instance,
     ) -> Result<(), anyhow::Error> {
         let containers = self
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
                 all: true,
                 filters: Some(container_filters(
-                    &database.uuid.to_string(),
+                    &instance.uuid.to_string(),
                     Some(CONTAINER_TYPE_DATABASE),
                 )),
                 ..Default::default()
@@ -885,7 +1081,7 @@ impl super::ContainerExecutor for DockerExecutor {
                 )
                 .await
             {
-                tracing::error!(database = %database.uuid, container = %id, "failed to remove container: {err}");
+                tracing::error!(instance = %instance.uuid, container = %id, "failed to remove container: {err}");
             }
         }
 
@@ -894,18 +1090,18 @@ impl super::ContainerExecutor for DockerExecutor {
 
     async fn run_networked_container(
         &self,
-        database: &super::super::Instance,
+        instance: &super::super::Instance,
         options: super::NetworkedContainerOptions,
     ) -> Result<
         futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>>,
         anyhow::Error,
     > {
-        let data = database.data.read().await.clone();
-        self.pull_image(&data.image).await?;
+        let data = instance.data.read().await.clone();
+        self.pull_image(instance, &data.image).await?;
 
         let name = format!(
             "{}_{CONTAINER_TYPE_SCRIPT_RUNNER}_{}",
-            database.uuid,
+            instance.uuid,
             rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
         );
 
@@ -921,6 +1117,7 @@ impl super::ContainerExecutor for DockerExecutor {
                     entrypoint: Some(vec![String::new()]),
                     cmd: Some(options.command),
                     env: Some(options.env),
+                    user: Some(format!("{}:{}", data.image_uid, data.image_gid)),
                     labels: Some(HashMap::from([
                         ("Service".to_string(), crate::SERVICE_NAME.to_string()),
                         (
@@ -944,6 +1141,11 @@ impl super::ContainerExecutor for DockerExecutor {
                 },
             )
             .await?;
+
+        let guard = ContainerGuard {
+            docker: Arc::clone(&self.docker),
+            container_id: container.id.clone(),
+        };
 
         let attach = self
             .docker
@@ -987,7 +1189,7 @@ impl super::ContainerExecutor for DockerExecutor {
 
         let stderr = Arc::new(RwLock::new(Vec::new()));
 
-        Ok(attach
+        let stream = attach
             .output
             .filter_map({
                 let stderr = Arc::clone(&stderr);
@@ -1033,6 +1235,12 @@ impl super::ContainerExecutor for DockerExecutor {
 
                 Ok(bytes::Bytes::new())
             }))
-            .boxed())
+            .boxed();
+
+        Ok(GuardedStream {
+            stream,
+            _guard: guard,
+        }
+        .boxed())
     }
 }

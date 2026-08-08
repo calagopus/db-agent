@@ -1,9 +1,11 @@
-use crate::utils::{bad, handshake_step};
+use crate::utils::{bad, get_array, handshake_step};
 use bson::{Bson, Document, doc, spec::BinarySubtype};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_MSG: usize = 48 * 1000 * 1000;
+pub const MAX_MSG_LEN: usize = 48 * 1000 * 1000;
+const MAX_HANDSHAKE_LEN: usize = 1024 * 1024;
+
 pub const OP_REPLY: i32 = 1;
 pub const OP_QUERY: i32 = 2004;
 pub const OP_MSG: i32 = 2013;
@@ -25,7 +27,7 @@ pub fn hello_doc() -> Document {
         "ismaster": true,
         "isWritablePrimary": true,
         "maxBsonObjectSize": 16 * 1024 * 1024,
-        "maxMessageSizeBytes": MAX_MSG as i32,
+        "maxMessageSizeBytes": MAX_MSG_LEN as i32,
         "maxWriteBatchSize": 100000,
         "localTime": bson::DateTime::from_millis(now),
         "logicalSessionTimeoutMinutes": 30,
@@ -47,20 +49,20 @@ pub fn sasl_error(msg: &str) -> Document {
     }
 }
 
-pub async fn read_message<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut S,
+pub async fn read_message<S: AsyncRead + Unpin>(
+    stream: &mut S,
 ) -> std::io::Result<(i32, i32, Vec<u8>)> {
     handshake_step(async {
         let mut hdr = [0; 16];
-        s.read_exact(&mut hdr).await?;
+        stream.read_exact(&mut hdr).await?;
         let mlen = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
         let reqid = i32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
         let opcode = i32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
-        if !(16..=MAX_MSG).contains(&mlen) {
+        if !(16..=MAX_HANDSHAKE_LEN).contains(&mlen) {
             return Err(bad("implausible message length"));
         }
         let mut body = vec![0; mlen - 16];
-        s.read_exact(&mut body).await?;
+        stream.read_exact(&mut body).await?;
         Ok((reqid, opcode, body))
     })
     .await
@@ -71,25 +73,32 @@ pub fn op_msg_doc(body: &[u8]) -> Option<Document> {
         return None;
     }
 
-    Document::from_reader(body.get(5..)?).ok()
+    // bson reserves the declared length before reading a byte of it
+    let doc = body.get(5..)?;
+    let len = i32::from_le_bytes(get_array(doc, 0).ok()?);
+    if len < 5 || len as usize > doc.len() {
+        return None;
+    }
+
+    Document::from_reader(doc).ok()
 }
 
-pub async fn write_op_msg<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut S,
+pub async fn write_op_msg<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     response_to: i32,
     doc: &Document,
 ) -> std::io::Result<()> {
     let body = encode_op_msg(doc)?;
-    write_header(s, 0, response_to, OP_MSG, &body).await
+    write_header(stream, 0, response_to, OP_MSG, &body).await
 }
 
-pub async fn write_op_msg_request<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut S,
+pub async fn write_op_msg_request<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     request_id: i32,
     doc: &Document,
 ) -> std::io::Result<()> {
     let body = encode_op_msg(doc)?;
-    write_header(s, request_id, 0, OP_MSG, &body).await
+    write_header(stream, request_id, 0, OP_MSG, &body).await
 }
 
 fn encode_op_msg(doc: &Document) -> std::io::Result<Vec<u8>> {
@@ -100,8 +109,8 @@ fn encode_op_msg(doc: &Document) -> std::io::Result<Vec<u8>> {
     Ok(body)
 }
 
-pub async fn write_op_reply<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut S,
+pub async fn write_op_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     response_to: i32,
     doc: &Document,
 ) -> std::io::Result<()> {
@@ -111,11 +120,11 @@ pub async fn write_op_reply<S: AsyncRead + AsyncWrite + Unpin>(
     body.extend_from_slice(&0i32.to_le_bytes()); // startingFrom
     body.extend_from_slice(&1i32.to_le_bytes()); // numberReturned
     doc.to_writer(&mut body).map_err(|_| bad("bson encode"))?;
-    write_header(s, 0, response_to, OP_REPLY, &body).await
+    write_header(stream, 0, response_to, OP_REPLY, &body).await
 }
 
-async fn write_header<S: AsyncRead + AsyncWrite + Unpin>(
-    s: &mut S,
+async fn write_header<S: AsyncWrite + Unpin>(
+    stream: &mut S,
     request_id: i32,
     response_to: i32,
     opcode: i32,
@@ -127,6 +136,6 @@ async fn write_header<S: AsyncRead + AsyncWrite + Unpin>(
     hdr.extend_from_slice(&request_id.to_le_bytes());
     hdr.extend_from_slice(&response_to.to_le_bytes());
     hdr.extend_from_slice(&opcode.to_le_bytes());
-    s.write_all(&hdr).await?;
-    s.write_all(body).await
+    stream.write_all(&hdr).await?;
+    stream.write_all(body).await
 }

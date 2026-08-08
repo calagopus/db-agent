@@ -24,9 +24,12 @@ pub struct ApiResponse {
 
 impl ApiResponse {
     #[inline]
-    pub fn new(body: axum::body::Body) -> Self {
+    pub fn new_stream(stream: impl tokio::io::AsyncRead + Send + 'static) -> Self {
         Self {
-            body,
+            body: axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+                stream,
+                crate::BUFFER_SIZE,
+            )),
             status: axum::http::StatusCode::OK,
             headers: axum::http::HeaderMap::new(),
         }
@@ -178,10 +181,7 @@ impl<'a> DisplayError<'a> {
 
 impl std::fmt::Display for DisplayError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DisplayError")
-            .field("status", &self.status)
-            .field("message", &self.message)
-            .finish()
+        write!(f, "{}", self.message)
     }
 }
 

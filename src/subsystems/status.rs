@@ -20,6 +20,7 @@ pub struct SubsystemConnections {
 }
 
 impl SubsystemConnections {
+    #[inline]
     pub fn mark_running(&self) {
         self.running.store(true, Ordering::SeqCst);
     }
@@ -42,7 +43,7 @@ impl SubsystemConnections {
         }
     }
 
-    pub fn snapshot(&self) -> SubsystemStatus {
+    pub fn to_api_response(&self) -> SubsystemStatus {
         SubsystemStatus {
             running: self.running.load(Ordering::SeqCst),
             connections: Connections {

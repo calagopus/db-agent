@@ -1,11 +1,24 @@
 use super::{DatabaseType, executor::NetworkedContainerOptions};
-use futures_util::TryStreamExt;
+use crate::net::{host_to_ip, is_blocked_ip};
+use futures_util::{StreamExt, TryStreamExt};
 use mongodb::options::{ConnectionString, HostInfo, ServerAddress};
+use std::{
+    sync::{Arc, atomic::AtomicU64},
+    time::Duration,
+};
 use url::Url;
 
 /// libpq reads the real endpoint from these instead of the uri host, which would
 /// make any check against the host meaningless
 const POSTGRES_HOST_OVERRIDES: &[&str] = &["host", "hostaddr", "service", "servicefile"];
+
+/// how long a dump tool may spend reaching the source before it gives up
+const CONNECT_TIMEOUT: u64 = 10;
+
+/// a source that connects and then stalls holds the dump container, the operation
+/// and the target's import open for as long as it likes, so the dump is cut off
+/// once it goes quiet for this long
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn parse_url(url: &str, database_type: DatabaseType) -> anyhow::Result<Url> {
     let schemes: &[&str] = match database_type {
@@ -20,7 +33,7 @@ fn parse_url(url: &str, database_type: DatabaseType) -> anyhow::Result<Url> {
     if !schemes.contains(&url.scheme()) {
         return Err(crate::response::DisplayError::new(format!(
             "connection string for {} must use one of the schemes: {}",
-            database_type.as_str(),
+            database_type.to_str(),
             schemes.join(", ")
         ))
         .into());
@@ -30,6 +43,16 @@ fn parse_url(url: &str, database_type: DatabaseType) -> anyhow::Result<Url> {
         return Err(
             crate::response::DisplayError::new("connection string must contain a host").into(),
         );
+    }
+
+    // no scheme here has a fragment, but the url crate keeps everything past '#' out of
+    // query_pairs() and host_str() while as_str() still emits it, and libpq then reads
+    // the tail as more options. refusing beats rewriting what the user asked for
+    if url.fragment().is_some() {
+        return Err(crate::response::DisplayError::new(
+            "connection string must not contain a fragment",
+        )
+        .into());
     }
 
     if database_type == DatabaseType::Postgres
@@ -105,8 +128,8 @@ async fn vetted_hosts(
 
     let mut pinned = Vec::new();
     for host in hosts {
-        if let Some(ip) = crate::utils::host_to_ip(host) {
-            if crate::utils::is_blocked_ip(blocked, &ip) {
+        if let Some(ip) = host_to_ip(host) {
+            if is_blocked_ip(blocked, &ip) {
                 return Err(refuse(host, ip).into());
             }
 
@@ -122,7 +145,7 @@ async fn vetted_hosts(
             .collect();
 
         for address in &addresses {
-            if crate::utils::is_blocked_ip(blocked, &address.ip()) {
+            if is_blocked_ip(blocked, &address.ip()) {
                 return Err(refuse(host, address.ip()).into());
             }
         }
@@ -140,17 +163,52 @@ async fn vetted_hosts(
     Ok(pinned)
 }
 
+/// fails the dump once the source goes quiet for `timeout`, dropping the container
+/// stream with it
+fn with_idle_timeout<S>(
+    stream: S,
+    timeout: Duration,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Send + Unpin + 'static,
+{
+    futures_util::stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+
+        match tokio::time::timeout(timeout, stream.next()).await {
+            Ok(Some(chunk)) => Some((chunk, Some(stream))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(crate::response::DisplayError::new(format!(
+                    "the source sent no data for {} seconds",
+                    timeout.as_secs()
+                ))
+                .into()),
+                None,
+            )),
+        }
+    })
+}
+
+/// a validated remote import, ready to be run in the background. it holds the dump
+/// command, which carries the source's password
+pub struct RemoteImport {
+    pub source_host: String,
+    pub source_db: Option<String>,
+
+    command: String,
+    env: Vec<String>,
+    extra_hosts: Vec<String>,
+}
+
 impl super::Instance {
-    /// dumps a remote database of this instance's own type and imports it, see
-    /// [`super::Instance::import`] for the meaning of `db` and `wipe`. the dump runs
-    /// in a script runner container since instance containers have no networking
-    pub async fn import_remote(
+    /// validates a remote import of this instance's own type, resolving and vetting
+    /// the source. see [`super::Instance::import`] for the meaning of `db` and `wipe`
+    pub async fn prepare_remote_import(
         &self,
         url: &str,
         source_db: Option<&str>,
-        db: Option<&str>,
-        wipe: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<RemoteImport> {
         let blocked = self
             .app_state
             .config
@@ -169,6 +227,16 @@ impl super::Instance {
                 )?;
                 if let Some(source_db) = &source_db {
                     url.set_path(source_db);
+                }
+
+                // an explicit one is the caller's choice, and libpq takes the last
+                // occurrence of a parameter
+                if !url
+                    .query_pairs()
+                    .any(|(key, _)| key.as_ref() == "connect_timeout")
+                {
+                    url.query_pairs_mut()
+                        .append_pair("connect_timeout", &CONNECT_TIMEOUT.to_string());
                 }
 
                 // pg_dumpall does not hand a password in the connection string down to
@@ -197,9 +265,8 @@ impl super::Instance {
                     source_db.map(str::to_string).or_else(|| url_database(&url)),
                 )?;
 
-                // the source is live and not ours to lock, hence --single-transaction
                 let mut flags = format!(
-                    "-h {} -P {} --single-transaction",
+                    "-h {} -P {}",
                     crate::utils::shell_quote(url.host_str().unwrap_or_default()),
                     url.port().unwrap_or(3306)
                 );
@@ -213,13 +280,20 @@ impl super::Instance {
                     flags.push_str(" --ssl");
                 }
 
-                let command = match &source_db {
+                // the source is live and not ours to lock, hence --single-transaction
+                let dump = match &source_db {
                     Some(source_db) => format!(
-                        "mariadb-dump {flags} {}",
+                        "mariadb-dump {flags} --single-transaction {}",
                         crate::utils::shell_quote(source_db)
                     ),
-                    None => format!("mariadb-dump {flags} --all-databases"),
+                    None => format!("mariadb-dump {flags} --single-transaction --all-databases"),
                 };
+
+                // mariadb-dump has no connect timeout of its own, the client it ships
+                // with does, so reaching the source at all is bounded by a probe
+                let command = format!(
+                    "mariadb {flags} --connect-timeout={CONNECT_TIMEOUT} -e 'SELECT 1' > /dev/null && {dump}"
+                );
 
                 (
                     command,
@@ -266,9 +340,18 @@ impl super::Instance {
                     None => String::new(),
                 };
 
+                // mongodump refuses a flag the uri already sets
+                let mut timeouts = String::new();
+                if connection.connect_timeout.is_none() {
+                    timeouts.push_str(&format!(" --dialTimeout={CONNECT_TIMEOUT}"));
+                }
+                if connection.server_selection_timeout.is_none() {
+                    timeouts.push_str(&format!(" --serverSelectionTimeout={CONNECT_TIMEOUT}"));
+                }
+
                 (
                     format!(
-                        "mongodump --uri={} --archive{select}",
+                        "mongodump --uri={}{timeouts} --archive{select}",
                         crate::utils::shell_quote(url)
                     ),
                     Vec::new(),
@@ -285,25 +368,54 @@ impl super::Instance {
         };
 
         let pinned = vetted_hosts(&hosts, &blocked).await?;
+
+        Ok(RemoteImport {
+            source_host: hosts.join(","),
+            source_db,
+            command,
+            env,
+            extra_hosts: pinned
+                .into_iter()
+                .map(|(host, ip)| format!("{host}:{ip}"))
+                .collect(),
+        })
+    }
+
+    /// dumps the prepared source and imports it. the dump runs in a script runner
+    /// container since instance containers have no networking
+    pub async fn run_remote_import(
+        &self,
+        import: RemoteImport,
+        db: Option<&str>,
+        wipe: bool,
+        bytes_processed: Arc<AtomicU64>,
+    ) -> anyhow::Result<()> {
         let stream = self
             .app_state
             .container_executor
             .run_networked_container(
                 self,
-                NetworkedContainerOptions::new(vec!["sh".to_string(), "-c".to_string(), command])
-                    .with_env(env)
-                    .with_extra_hosts(
-                        pinned
-                            .into_iter()
-                            .map(|(host, ip)| format!("{host}:{ip}"))
-                            .collect(),
-                    ),
+                NetworkedContainerOptions::new(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    import.command,
+                ])
+                .with_env(import.env)
+                .with_extra_hosts(import.extra_hosts),
             )
             .await?;
 
-        let mut reader = tokio_util::io::StreamReader::new(stream.map_err(std::io::Error::other));
+        let mut reader = tokio_util::io::StreamReader::new(
+            with_idle_timeout(stream, IDLE_TIMEOUT)
+                .boxed()
+                .inspect_ok(move |chunk| {
+                    bytes_processed
+                        .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                })
+                .map_err(std::io::Error::other),
+        );
 
-        self.import(db, source_db.as_deref(), wipe, &mut reader)
+        self.import_inner(db, import.source_db.as_deref(), wipe, &mut reader)
             .await
     }
 }

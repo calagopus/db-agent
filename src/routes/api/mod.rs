@@ -37,9 +37,9 @@ pub async fn auth(state: GetState, req: Request, next: Next) -> Result<Response<
             .into_response());
     }
 
-    let expected = state.config.load().api.token.clone();
-    if expected.is_empty()
-        || !constant_time_eq::constant_time_eq(token.as_bytes(), expected.as_bytes())
+    let config = state.config.load();
+    if config.api.token.is_empty()
+        || !constant_time_eq::constant_time_eq(token.as_bytes(), config.api.token.as_bytes())
     {
         return Ok(ApiResponse::error("invalid authorization token")
             .with_status(StatusCode::UNAUTHORIZED)

@@ -9,50 +9,53 @@ pub struct InstanceManager {
 }
 
 impl InstanceManager {
-    pub async fn initialize(&self, app_state: crate::routes::State) -> anyhow::Result<()> {
+    pub async fn boot(&self, app_state: &crate::routes::State) {
         let mut write = self.instances.write().await;
 
         let mut instances_stream =
             sqlx::query_as::<_, crate::database::data::StoredInstance>("SELECT * FROM instances")
                 .fetch(app_state.database.read());
 
-        while let Some(instance) = instances_stream.try_next().await? {
-            let instance = super::Instance::new(app_state.clone(), instance)?;
-            instance.resync_users().await?;
-            if let Err(err) = instance.attach_container().await {
-                tracing::warn!(
-                    "failed to attach to container for instance {}: {err}",
-                    instance.uuid
-                );
+        loop {
+            let instance = match instances_stream.try_next().await {
+                Ok(Some(instance)) => instance,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::error!("failed to read stored instances: {err:#}");
+                    break;
+                }
+            };
+
+            let instance = super::Instance::new(instance, app_state.clone());
+            if let Err(err) = instance.resync_users().await {
+                tracing::warn!(instance = %instance.uuid, "failed to resync users: {err}");
             }
+            instance.attach_container().await;
 
             write.push(instance);
         }
-
-        Ok(())
     }
 
+    #[inline]
     pub async fn get_instances(&self) -> tokio::sync::RwLockReadGuard<'_, Vec<super::Instance>> {
         self.instances.read().await
     }
 
-    pub async fn get_instance(&self, uuid: uuid::Uuid) -> Option<super::Instance> {
-        self.instances
-            .read()
-            .await
-            .iter()
-            .find(|i| i.uuid == uuid)
-            .cloned()
+    #[inline]
+    pub async fn get_instance(&self, instance: uuid::Uuid) -> Option<super::Instance> {
+        let instances = self.instances.read().await;
+
+        instances.iter().find(|i| i.uuid == instance).cloned()
     }
 
     pub async fn create_instance(
         &self,
-        app_state: crate::routes::State,
+        app_state: &crate::routes::State,
         create: crate::database::data::StoredInstanceCreate,
     ) -> anyhow::Result<super::Instance> {
         let data = create.insert(&app_state.database).await?;
 
-        let instance = super::Instance::new(app_state.clone(), data)?;
+        let instance = super::Instance::new(data, app_state.clone());
         self.instances.write().await.push(instance.clone());
 
         Ok(instance)

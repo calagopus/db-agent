@@ -1,61 +1,15 @@
 use super::State;
-use crate::{response::ApiResponse, routes::api::instances::_instance_::GetInstance};
-use axum::{
-    body::Body,
-    extract::{Path, Request},
-    http::{Response, StatusCode},
-    middleware::Next,
-    response::IntoResponse,
-};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 mod rotate_password;
 
-pub type GetUser = axum::extract::Extension<crate::database::data::StoredUser>;
-
-pub async fn auth(
-    instance: GetInstance,
-    Path(parts): Path<Vec<String>>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response<Body>, StatusCode> {
-    let uuid = match parts.get(1).map(|s| s.parse::<uuid::Uuid>()) {
-        Some(Ok(uuid)) => uuid,
-        Some(Err(_)) => {
-            return Ok(ApiResponse::error("invalid user uuid")
-                .with_status(StatusCode::BAD_REQUEST)
-                .into_response());
-        }
-        None => {
-            return Ok(ApiResponse::error("missing user uuid")
-                .with_status(StatusCode::BAD_REQUEST)
-                .into_response());
-        }
-    };
-
-    let user = match instance.get_user(uuid).await {
-        Ok(Some(user)) => user,
-        Ok(None) => {
-            return Ok(ApiResponse::error("user not found")
-                .with_status(StatusCode::NOT_FOUND)
-                .into_response());
-        }
-        Err(err) => {
-            tracing::error!("failed to fetch user {uuid}: {err}");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    req.extensions_mut().insert(user);
-
-    Ok(next.run(req).await)
-}
-
 mod get {
     use crate::{
+        Path,
         response::{ApiResponse, ApiResponseResult},
-        routes::{ApiError, api::instances::_instance_::users::_user_::GetUser},
+        routes::{ApiError, api::instances::_instance_::GetInstance},
     };
+    use axum::http::StatusCode;
     use serde::Serialize;
     use utoipa::ToSchema;
 
@@ -68,22 +22,41 @@ mod get {
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
-        ("user" = uuid::Uuid, description = "The user uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (
+            "user" = uuid::Uuid,
+            description = "The user uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ))]
-    pub async fn route(user: GetUser) -> ApiResponseResult {
-        ApiResponse::new_serialized(Response { user: user.0 }).ok()
+    pub async fn route(
+        instance: GetInstance,
+        Path((_instance, user_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    ) -> ApiResponseResult {
+        let user = match instance.get_user(user_id).await? {
+            Some(user) => user,
+            None => {
+                return ApiResponse::error("user not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
+        ApiResponse::new_serialized(Response { user }).ok()
     }
 }
 
 mod delete {
     use crate::{
+        Path,
         response::{ApiResponse, ApiResponseResult},
-        routes::{
-            ApiError,
-            api::instances::_instance_::{GetInstance, users::_user_::GetUser},
-        },
+        routes::{ApiError, api::instances::_instance_::GetInstance},
     };
+    use axum::http::StatusCode;
     use serde::Serialize;
     use utoipa::ToSchema;
 
@@ -94,10 +67,30 @@ mod delete {
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
-        ("user" = uuid::Uuid, description = "The user uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (
+            "user" = uuid::Uuid,
+            description = "The user uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
     ))]
-    pub async fn route(instance: GetInstance, user: GetUser) -> ApiResponseResult {
+    pub async fn route(
+        instance: GetInstance,
+        Path((_instance, user_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    ) -> ApiResponseResult {
+        let user = match instance.get_user(user_id).await? {
+            Some(user) => user,
+            None => {
+                return ApiResponse::error("user not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
         instance.delete_user(&user).await?;
 
         ApiResponse::new_serialized(Response {}).ok()
@@ -109,6 +102,5 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .nest("/rotate-password", rotate_password::router(state))
         .routes(routes!(get::route))
         .routes(routes!(delete::route))
-        .route_layer(axum::middleware::from_fn(auth))
         .with_state(state.clone())
 }

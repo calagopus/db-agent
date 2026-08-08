@@ -62,11 +62,11 @@ async fn handle(
 ) -> io::Result<()> {
     match negotiate(tcp, &acceptor).await? {
         Conn::Plain(s) => {
-            tracing::debug!("[{peer}] connection (plain)");
+            tracing::debug!(%peer, "connection (plain)");
             session(s, status, routes, peer).await
         }
         Conn::Tls(s) => {
-            tracing::debug!("[{peer}] connection (tls)");
+            tracing::debug!(%peer, "connection (tls)");
             session(s, status, routes, peer).await
         }
     }
@@ -93,7 +93,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .await?
         .filter(|(a, _)| !a.is_empty())
     else {
-        tracing::debug!("[{peer}] no parseable command");
+        tracing::debug!(%peer, "no parseable command");
         return Ok(());
     };
 
@@ -127,7 +127,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
             )
         }
         other => {
-            tracing::debug!("[{peer}] first command {other:?} carries no identity");
+            tracing::debug!(%peer, command = %other, "first command carries no identity");
             return Ok(());
         }
     };
@@ -137,23 +137,35 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let Some(creds) =
         creds.filter(|c| constant_time_eq::constant_time_eq(&password, c.password.as_bytes()))
     else {
-        tracing::debug!("[{peer}] rejected auth for user {user:?}");
+        tracing::debug!(%peer, %user, "rejected auth");
         client
             .write_all(b"-WRONGPASS invalid username-password pair or user is disabled.\r\n")
             .await?;
         return Ok(());
     };
 
-    if creds.instance.is_suspended().await {
+    if creds.instance.locked_state().is_some() {
         tracing::debug!(
-            "[{peer}] rejected: database {} suspended",
-            creds.instance.uuid
+            %peer,
+            instance = %creds.instance.uuid,
+            "rejected: instance suspended"
         );
         client.write_all(b"-ERR database is suspended\r\n").await?;
         return Ok(());
     }
 
-    let mut backend = UnixStream::connect(&creds.instance.get_socket_path().await).await?;
+    let mut backend = match UnixStream::connect(&creds.instance.get_socket_path().await).await {
+        Ok(backend) => backend,
+        Err(err) => {
+            tracing::debug!(
+                %peer,
+                instance = %creds.instance.uuid,
+                "rejected: backend unreachable: {err}"
+            );
+            client.write_all(b"-ERR database is offline\r\n").await?;
+            return Ok(());
+        }
+    };
 
     match forward {
         Some(bytes) => backend.write_all(&bytes).await?,
@@ -162,6 +174,6 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let _guard = user_id.map(|id| status.connect(id, None));
     let (c2b, b2c) = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
-    tracing::debug!("[{peer}] closed (c->b {c2b} B, b->c {b2c} B)");
+    tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }

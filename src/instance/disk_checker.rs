@@ -1,16 +1,18 @@
-use super::{InnerInstance, Instance, resources::ContainerState};
+use super::{
+    InnerInstance, Instance,
+    resources::{ContainerState, ResourceUsage, ResourceUsageWatchExt},
+};
 use cap_std::{
     ambient_authority,
     fs::{Dir, MetadataExt},
 };
-use std::{
-    collections::HashSet,
-    path::Path,
-    sync::{Weak, atomic::Ordering},
-    time::Duration,
-};
+use std::{collections::HashSet, path::Path, sync::Weak, time::Duration};
 
-pub async fn run(app_state: crate::routes::State, database: Weak<InnerInstance>) {
+pub async fn run(
+    app_state: crate::routes::State,
+    database: Weak<InnerInstance>,
+    resource_usage: tokio::sync::watch::Sender<ResourceUsage>,
+) {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     loop {
@@ -20,9 +22,12 @@ pub async fn run(app_state: crate::routes::State, database: Weak<InnerInstance>)
         let database = Instance(database);
 
         {
-            let semaphore = app_state.config.disk_check_semaphore.load();
-            let _permit = semaphore.acquire().await;
-            database.check_disk_usage().await;
+            let semaphore = app_state.config.disk_check_concurrency_semaphore.load();
+            let _permit = semaphore
+                .acquire()
+                .await
+                .expect("failed to acquire disk check concurrency semaphore");
+            database.check_disk_usage(&resource_usage).await;
         }
 
         let interval = app_state.config.load().disk_check_interval.max(1);
@@ -31,34 +36,33 @@ pub async fn run(app_state: crate::routes::State, database: Weak<InnerInstance>)
 }
 
 impl Instance {
-    pub async fn check_disk_usage(&self) {
+    pub async fn check_disk_usage(
+        &self,
+        resource_usage: &tokio::sync::watch::Sender<ResourceUsage>,
+    ) {
         let path = self.app_state.config.data_path(self.uuid);
         let usage = match tokio::task::spawn_blocking(move || scan_path(&path)).await {
             Ok(Ok(usage)) => usage,
             Ok(Err(err)) => {
-                tracing::error!(database = %self.uuid, "disk usage scan failed: {err}");
+                tracing::error!(instance = %self.uuid, "disk usage check failed: {err}");
                 return;
             }
             Err(err) => {
-                tracing::error!(database = %self.uuid, "disk usage scan panicked: {err}");
+                tracing::error!(instance = %self.uuid, "disk usage check panicked: {err}");
                 return;
             }
         };
 
-        self.disk_usage.store(usage, Ordering::Relaxed);
+        resource_usage.publish_disk_usage(usage);
 
-        let disk_limit = self.data.read().await.disk;
-        if disk_limit > 0
-            && usage >= disk_limit as u64 * 1024 * 1024
-            && self.resource_usage().await.state == ContainerState::Running
-        {
+        if self.is_disk_full().await && self.resource_usage().state == ContainerState::Running {
             tracing::warn!(
-                database = %self.uuid,
-                "database is exceeding its disk limit ({usage} bytes), stopping",
+                instance = %self.uuid,
+                "instance is exceeding its disk limit ({usage} bytes), stopping",
             );
 
             if let Err(err) = self.stop().await {
-                tracing::error!(database = %self.uuid, "failed to stop database over disk limit: {err}");
+                tracing::error!(instance = %self.uuid, "failed to stop instance over disk limit: {err}");
             }
         }
     }

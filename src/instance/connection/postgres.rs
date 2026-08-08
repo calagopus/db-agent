@@ -1,6 +1,6 @@
 use super::{super::identifier::UserIdentifier, DatabaseConnection, QueryResult};
 use std::path::PathBuf;
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::{NoTls, SimpleQueryMessage, error::SqlState};
 
 const ADMIN_USER: &str = "postgres";
 const ADMIN_DATABASE: &str = "postgres";
@@ -13,6 +13,20 @@ fn quote_ident(s: &str) -> String {
 #[inline]
 fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+fn duplicate_database(err: anyhow::Error) -> anyhow::Error {
+    match err
+        .downcast_ref::<tokio_postgres::Error>()
+        .and_then(|err| err.code())
+    {
+        Some(code) if *code == SqlState::DUPLICATE_DATABASE => {
+            crate::response::DisplayError::new("database already exists")
+                .with_status(axum::http::StatusCode::CONFLICT)
+                .into()
+        }
+        _ => err,
+    }
 }
 
 pub struct PostgresConnection {
@@ -72,11 +86,57 @@ impl DatabaseConnection for PostgresConnection {
     }
 
     async fn delete_user(&self, user: &UserIdentifier) -> anyhow::Result<()> {
-        self.execute(&format!(
-            "DROP ROLE IF EXISTS {}",
-            quote_ident(&user.to_string())
-        ))
-        .await
+        let name = user.to_string();
+        let client = self.client(ADMIN_DATABASE).await?;
+
+        if client
+            .query_opt("SELECT 1 FROM pg_roles WHERE rolname = $1", &[&name])
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        let role = quote_ident(&name);
+        let owner = quote_ident(ADMIN_USER);
+
+        // DROP OWNED BY only covers the current database, so every database the role
+        // holds privileges on needs its own connection
+        let databases = client
+            .query(
+                "SELECT DISTINCT d.datname FROM pg_database d
+                 CROSS JOIN LATERAL aclexplode(d.datacl) a
+                 JOIN pg_roles r ON r.oid = a.grantee
+                 WHERE r.rolname = $1 AND d.datallowconn AND d.datname <> $2",
+                &[&name, &ADMIN_DATABASE],
+            )
+            .await?;
+
+        for row in &databases {
+            let database: &str = row.get(0);
+
+            self.client(database)
+                .await?
+                .simple_query(&format!(
+                    "REASSIGN OWNED BY {role} TO {owner}; DROP OWNED BY {role}"
+                ))
+                .await?;
+
+            client
+                .simple_query(&format!(
+                    "REVOKE ALL PRIVILEGES ON DATABASE {} FROM {role}",
+                    quote_ident(database)
+                ))
+                .await?;
+        }
+
+        client
+            .simple_query(&format!(
+                "REASSIGN OWNED BY {role} TO {owner}; DROP OWNED BY {role}; DROP ROLE IF EXISTS {role}"
+            ))
+            .await?;
+
+        Ok(())
     }
 
     async fn grant_user(&self, user: &UserIdentifier, database: &str) -> anyhow::Result<()> {
@@ -96,8 +156,16 @@ impl DatabaseConnection for PostgresConnection {
     }
 
     async fn create_database(&self, name: &str) -> anyhow::Result<()> {
-        self.execute(&format!("CREATE DATABASE {}", quote_ident(name)))
+        let name = quote_ident(name);
+
+        // CREATE DATABASE cannot share an implicit transaction with the revoke
+        self.execute(&format!("CREATE DATABASE {name}"))
             .await
+            .map_err(duplicate_database)?;
+        self.execute(&format!(
+            "REVOKE CONNECT, TEMPORARY ON DATABASE {name} FROM PUBLIC"
+        ))
+        .await
     }
 
     async fn delete_database(&self, name: &str) -> anyhow::Result<()> {

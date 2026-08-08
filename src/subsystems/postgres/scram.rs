@@ -1,5 +1,8 @@
 use super::protocol::{read_msg, write_msg};
-use crate::utils::{SafeSliceExt, bad, get_array};
+use crate::{
+    io::SafeSliceExt,
+    utils::{bad, get_array},
+};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, KeyInit, Mac};
 use postgres_protocol::{

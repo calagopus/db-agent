@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     ops::Deref,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU64},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use utoipa::ToSchema;
@@ -14,10 +18,33 @@ pub mod disk_checker;
 pub mod executor;
 pub mod identifier;
 pub mod manager;
+pub mod operations;
 pub mod remote;
 pub mod resources;
+pub mod websocket;
 
-pub const STDERR_CAPTURE_LIMIT: usize = 8192;
+pub const STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
+
+/// redis-cli cannot restore an rdb, so the export has to be a command stream for
+/// `--pipe`. building it inside lua keeps binary keys and values away from the
+/// shell, `..` concatenation is byte safe where `string.format("%s")` is not
+const REDIS_DUMP_SCRIPT: &str = r#"local out={"*2\r\n$6\r\nSELECT\r\n$"..#ARGV[1].."\r\n"..ARGV[1].."\r\n"}
+local c="0"
+repeat
+  local s=redis.call("SCAN",c,"COUNT",512)
+  c=s[1]
+  for i=1,#s[2] do
+    local k=s[2][i]
+    local v=redis.call("DUMP",k)
+    if v then
+      local t=redis.call("PTTL",k)
+      if t<0 then t=0 end
+      t=string.format("%d",t)
+      out[#out+1]="*5\r\n$7\r\nRESTORE\r\n$"..#k.."\r\n"..k.."\r\n$"..#t.."\r\n"..t.."\r\n$"..#v.."\r\n"..v.."\r\n$7\r\nREPLACE\r\n"
+    end
+  end
+until c=="0"
+return table.concat(out)"#;
 
 pub fn validate_database_name(value: &str, _ctx: &()) -> garde::Result {
     if !(1..=63).contains(&value.len()) {
@@ -72,7 +99,7 @@ pub enum DatabaseType {
 
 impl DatabaseType {
     #[inline]
-    pub fn as_str(self) -> &'static str {
+    pub fn to_str(self) -> &'static str {
         match self {
             DatabaseType::Postgres => "postgres",
             DatabaseType::Mariadb => "mariadb",
@@ -97,15 +124,20 @@ pub struct InnerInstance {
     pub uuid: uuid::Uuid,
     pub app_state: crate::routes::State,
 
-    pub route_inserter: manager::DatabaseRouteTableInserter,
+    route_inserter: manager::DatabaseRouteTableInserter,
     pub data: RwLock<crate::database::data::StoredInstance>,
 
-    pub process_handle: RwLock<Option<Arc<dyn executor::ProcessHandle>>>,
-    pub backend_auth_error: RwLock<Option<String>>,
+    process_handle: RwLock<Option<Arc<dyn executor::ProcessHandle>>>,
+    backend_auth_error: RwLock<Option<String>>,
 
     power_lock: tokio::sync::Mutex<()>,
 
-    pub disk_usage: AtomicU64,
+    pub suspended: AtomicBool,
+
+    pub websocket: tokio::sync::broadcast::Sender<websocket::WebsocketMessage>,
+    pub operations: operations::OperationManager,
+
+    resource_usage: tokio::sync::watch::Sender<resources::ResourceUsage>,
     disk_checker_task: tokio::task::JoinHandle<()>,
 }
 
@@ -120,12 +152,20 @@ pub struct Instance(Arc<InnerInstance>);
 
 impl Instance {
     pub fn new(
-        app_state: crate::routes::State,
         data: crate::database::data::StoredInstance,
-    ) -> anyhow::Result<Self> {
-        Ok(Self(Arc::new_cyclic(|weak| {
-            let disk_checker_task =
-                tokio::spawn(disk_checker::run(app_state.clone(), weak.clone()));
+        app_state: crate::routes::State,
+    ) -> Self {
+        let suspended = AtomicBool::new(data.suspended);
+
+        Self(Arc::new_cyclic(|weak| {
+            let (resource_usage, _) =
+                tokio::sync::watch::channel(resources::ResourceUsage::default());
+            let (websocket, _) = tokio::sync::broadcast::channel(128);
+            let disk_checker_task = tokio::spawn(disk_checker::run(
+                app_state.clone(),
+                weak.clone(),
+                resource_usage.clone(),
+            ));
 
             InnerInstance {
                 uuid: data.uuid,
@@ -137,28 +177,31 @@ impl Instance {
                 process_handle: RwLock::new(None),
                 backend_auth_error: RwLock::new(None),
                 power_lock: tokio::sync::Mutex::new(()),
-                disk_usage: AtomicU64::new(0),
+                suspended,
+                operations: operations::OperationManager::new(websocket.clone()),
+                websocket,
+                resource_usage,
                 disk_checker_task,
             }
-        })))
+        }))
     }
 
     pub async fn get_socket_path(&self) -> PathBuf {
         self.app_state.config.socket_path(self.uuid).join(
-            self.data
-                .read()
-                .await
-                .socket_path
-                .split('/')
-                .rev()
-                .take(1)
-                .collect::<Vec<_>>()
-                .join("/"),
+            std::path::Path::new(&self.data.read().await.socket_path)
+                .file_name()
+                .unwrap_or_default(),
         )
     }
 
-    pub async fn is_suspended(&self) -> bool {
-        self.data.read().await.suspended
+    #[inline]
+    pub fn locked_state(&self) -> Option<&'static str> {
+        if self.suspended.load(Ordering::Relaxed) {
+            tracing::debug!(instance = %self.uuid, "instance locked at state check: suspended");
+            return Some("suspended");
+        }
+
+        None
     }
 
     /// verifies mongod enforces authorization and the agent holds root
@@ -244,10 +287,8 @@ impl Instance {
         Ok(())
     }
 
-    async fn ensure_acl_writable(&self, action: &str) -> anyhow::Result<()> {
-        if self.data.read().await.database_type != DatabaseType::Redis
-            && self.resource_usage().await.state != resources::ContainerState::Running
-        {
+    async fn ensure_online(&self, action: &str) -> anyhow::Result<()> {
+        if self.resource_usage().state != resources::ContainerState::Running {
             return Err(crate::response::DisplayError::new(format!(
                 "the instance must be online to {action}"
             ))
@@ -256,6 +297,15 @@ impl Instance {
         }
 
         Ok(())
+    }
+
+    /// redis acl writes never reach the backend, they stay legal while offline
+    async fn ensure_acl_writable(&self, action: &str) -> anyhow::Result<()> {
+        if self.data.read().await.database_type == DatabaseType::Redis {
+            return Ok(());
+        }
+
+        self.ensure_online(action).await
     }
 
     pub async fn get_databases(
@@ -288,7 +338,7 @@ impl Instance {
     ) -> anyhow::Result<crate::database::data::StoredDatabase> {
         self.ensure_acl_writable("create a database").await?;
 
-        self.connection().await?.create_database(name).await?;
+        self.acl_connection().await?.create_database(name).await?;
 
         let uuid = uuid::Uuid::new_v4();
         let created = chrono::Utc::now();
@@ -302,7 +352,7 @@ impl Instance {
         .execute(self.app_state.database.write())
         .await
         {
-            let _ = self.connection().await?.delete_database(name).await;
+            let _ = self.acl_connection().await?.delete_database(name).await;
             return Err(err.into());
         }
 
@@ -324,7 +374,7 @@ impl Instance {
             self.delete_user(&user).await?;
         }
 
-        self.connection()
+        self.acl_connection()
             .await?
             .delete_database(&database.name)
             .await?;
@@ -350,7 +400,7 @@ impl Instance {
             .map(|user| UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username))
             .collect::<Result<Vec<_>, _>>()?;
 
-        self.connection()
+        self.acl_connection()
             .await?
             .recreate_database(&database.name, &users)
             .await?;
@@ -409,7 +459,7 @@ impl Instance {
             None => None,
         };
 
-        let connection = self.connection().await?;
+        let connection = self.acl_connection().await?;
         let password = crate::utils::generate_password();
         let password = password.as_str();
 
@@ -483,7 +533,7 @@ impl Instance {
         let password = crate::utils::generate_password();
         let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
 
-        self.connection()
+        self.acl_connection()
             .await?
             .update_user_password(&identifier, &password)
             .await?;
@@ -507,7 +557,10 @@ impl Instance {
         self.ensure_acl_writable("delete a user").await?;
 
         let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
-        self.connection().await?.delete_user(&identifier).await?;
+        self.acl_connection()
+            .await?
+            .delete_user(&identifier)
+            .await?;
 
         sqlx::query("DELETE FROM users WHERE uuid = ?")
             .bind(user.uuid)
@@ -519,7 +572,7 @@ impl Instance {
         Ok(())
     }
 
-    pub async fn create_container(&self) -> anyhow::Result<()> {
+    pub async fn setup_container(&self) -> anyhow::Result<()> {
         if self.process_handle.read().await.is_some() {
             return Ok(());
         }
@@ -527,34 +580,39 @@ impl Instance {
         let handle = self
             .app_state
             .container_executor
-            .create_container(self)
+            .setup_instance_process(self)
             .await?;
         *self.process_handle.write().await = Some(handle);
 
         Ok(())
     }
 
-    pub async fn attach_container(&self) -> anyhow::Result<()> {
+    pub async fn attach_container(&self) {
         if self.process_handle.read().await.is_some() {
-            return Ok(());
+            return;
         }
 
-        if let Some(handle) = self
+        tracing::info!(instance = %self.uuid, "attaching to container");
+
+        match self
             .app_state
             .container_executor
-            .attach_container(self)
-            .await?
+            .attach_instance_process(self)
+            .await
         {
-            *self.process_handle.write().await = Some(handle);
+            Ok(handle) => {
+                *self.process_handle.write().await = Some(handle);
+            }
+            Err(err) => {
+                tracing::debug!(instance = %self.uuid, "no running container to attach to: {}", err);
+            }
         }
-
-        Ok(())
     }
 
     pub async fn destroy_container(&self) -> anyhow::Result<()> {
         self.app_state
             .container_executor
-            .destroy_container(self)
+            .cleanup_instance_process(self)
             .await?;
         self.process_handle.write().await.take();
 
@@ -564,26 +622,26 @@ impl Instance {
     pub async fn is_disk_full(&self) -> bool {
         let disk_limit = self.data.read().await.disk;
         disk_limit != 0
-            && self.disk_usage.load(std::sync::atomic::Ordering::Relaxed)
-                >= disk_limit as u64 * 1024 * 1024
+            && self.resource_usage.borrow().disk_bytes >= disk_limit as u64 * 1024 * 1024
     }
 
     pub async fn start(&self) -> anyhow::Result<()> {
+        if let Some(state) = self.locked_state() {
+            anyhow::bail!("Instance is in a locked state ({state}), cannot start the instance.");
+        }
+
         if self.is_disk_full().await {
-            anyhow::bail!(
-                "database {} is over its disk limit, cannot start",
-                self.uuid
-            );
+            anyhow::bail!("Disk space is full, cannot start the instance.");
         }
 
         let _guard = self.power_lock.lock().await;
 
         self.destroy_container().await?;
-        self.create_container().await?;
+        self.setup_container().await?;
 
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.start().await,
-            None => anyhow::bail!("no container handle for database {}", self.uuid),
+            None => anyhow::bail!("instance has no active process"),
         }
     }
 
@@ -596,6 +654,10 @@ impl Instance {
     }
 
     pub async fn kill(&self) -> anyhow::Result<()> {
+        if self.resource_usage().state == resources::ContainerState::Offline {
+            return Ok(());
+        }
+
         let _guard = self.power_lock.lock().await;
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.kill().await,
@@ -607,9 +669,11 @@ impl Instance {
         &self,
         options: executor::ExecOptions,
     ) -> anyhow::Result<executor::ExecStream> {
+        self.ensure_online("run commands on the instance").await?;
+
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.exec(options).await,
-            None => anyhow::bail!("no container handle for database {}", self.uuid),
+            None => anyhow::bail!("instance has no active process"),
         }
     }
 
@@ -653,26 +717,79 @@ impl Instance {
                     None => format!("mongodump --uri={uri}{auth} --archive"),
                 }
             }
+            // every non empty database is dumped on its own, the SELECT that
+            // targets it is emitted by the script
             DatabaseType::Redis => {
-                format!("redis-cli -s {} --rdb -", crate::utils::shell_quote(socket))
+                let socket = crate::utils::shell_quote(socket);
+                let script = crate::utils::shell_quote(REDIS_DUMP_SCRIPT);
+
+                format!(
+                    r#"set -e; keyspace=$(redis-cli -s {socket} --raw INFO keyspace); for db in $(printf %s "$keyspace" | sed -n 's/^db\([0-9][0-9]*\):.*/\1/p'); do redis-cli -s {socket} -n "$db" --raw EVAL {script} 0 "$db"; done"#
+                )
             }
         };
+        let user = format!("{}:{}", data.image_uid, data.image_gid);
         drop(data);
 
         let stream = self
-            .exec(executor::ExecOptions::new(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("{command} 2>/dev/null"),
-            ]))
+            .exec(
+                executor::ExecOptions::new(vec!["sh".to_string(), "-c".to_string(), command])
+                    .with_user(user),
+            )
             .await?;
 
+        let uuid = self.uuid;
+
         Ok(Box::new(tokio_util::io::StreamReader::new(
-            stream.output.map_err(std::io::Error::other),
+            stream
+                .output
+                .inspect_err(move |err| tracing::error!(instance = %uuid, "export failed: {err}"))
+                .map_err(std::io::Error::other),
         )))
     }
 
+    /// an uploaded dump is taken as it is, so source_db can only ever select a
+    /// database out of a mongodb archive, and only with a db to put it in. the
+    /// remote route dumps the source itself and calls import_inner instead
     pub async fn import(
+        &self,
+        db: Option<&str>,
+        source_db: Option<&str>,
+        wipe: bool,
+        reader: &mut (dyn tokio::io::AsyncRead + Send + Unpin),
+    ) -> anyhow::Result<()> {
+        if source_db.is_some() {
+            let database_type = self.data.read().await.database_type;
+
+            if db.is_none() {
+                return Err(crate::response::DisplayError::new("source_db requires a db").into());
+            }
+            if database_type != DatabaseType::Mongodb {
+                return Err(crate::response::DisplayError::new(format!(
+                    "{} cannot import a single db out of a dump, omit source_db",
+                    database_type.to_str()
+                ))
+                .into());
+            }
+        }
+
+        self.import_inner(db, source_db, wipe, reader).await
+    }
+
+    /// the checks an import must fail on before anything is executed, so a
+    /// background import can be refused synchronously
+    pub async fn check_import(
+        &self,
+        db: Option<&str>,
+        source_db: Option<&str>,
+        wipe: bool,
+    ) -> anyhow::Result<()> {
+        check_import_args(self.data.read().await.database_type, db, source_db, wipe)?;
+
+        self.ensure_online("import a database").await
+    }
+
+    async fn import_inner(
         &self,
         db: Option<&str>,
         source_db: Option<&str>,
@@ -683,9 +800,7 @@ impl Instance {
         let socket = &data.socket_path;
         let database_type = data.database_type;
 
-        if wipe && db.is_none() && !matches!(database_type, DatabaseType::Redis) {
-            return Err(crate::response::DisplayError::new("wipe requires a db").into());
-        }
+        check_import_args(database_type, db, source_db, wipe)?;
 
         let (wipe_command, command) = match database_type {
             DatabaseType::Postgres => {
@@ -734,31 +849,30 @@ impl Instance {
             DatabaseType::Mongodb => {
                 let auth = mongodb_shell_auth(&data);
                 let uri = crate::utils::shell_quote(&mongodb_socket_uri(socket));
+                // the remap only renames, without nsInclude every other namespace
+                // the archive carries is restored under its own name
                 let import = match (db, source_db) {
-                    (Some(db), Some(source_db)) => format!(
-                        "mongorestore --uri={uri}{auth} --archive --nsFrom={} --nsTo={}",
-                        crate::utils::shell_quote(&format!("{source_db}.*")),
-                        crate::utils::shell_quote(&format!("{db}.*"))
-                    ),
-                    (Some(db), None) => format!(
-                        "mongorestore --uri={uri}{auth} --archive -d {}",
-                        crate::utils::shell_quote(db)
-                    ),
-                    (None, _) => format!("mongorestore --uri={uri}{auth} --archive"),
+                    (Some(db), Some(source_db)) => {
+                        let source_ns = crate::utils::shell_quote(&format!("{source_db}.*"));
+
+                        format!(
+                            "mongorestore --uri={uri}{auth} --archive --nsInclude={source_ns} --nsExclude={} --nsExclude={} --nsFrom={source_ns} --nsTo={}",
+                            crate::utils::shell_quote("admin.*"),
+                            crate::utils::shell_quote("config.*"),
+                            crate::utils::shell_quote(&format!("{db}.*"))
+                        )
+                    }
+                    _ => format!("mongorestore --uri={uri}{auth} --archive"),
                 };
                 (None, import)
             }
             DatabaseType::Redis => {
-                if db.is_some() {
-                    return Err(
-                        crate::response::DisplayError::new("redis has no named databases").into(),
-                    );
-                }
                 let socket = crate::utils::shell_quote(socket);
                 let wipe = wipe.then(|| format!("redis-cli -s {socket} FLUSHALL"));
                 (wipe, format!("redis-cli -s {socket} --pipe"))
             }
         };
+        let user = format!("{}:{}", data.image_uid, data.image_gid);
         drop(data);
 
         // --drop only drops the collections the archive carries, stale ones would survive
@@ -771,11 +885,14 @@ impl Instance {
 
         if let Some(wipe_command) = wipe_command {
             let mut stream = self
-                .exec(executor::ExecOptions::new(vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    wipe_command,
-                ]))
+                .exec(
+                    executor::ExecOptions::new(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        wipe_command,
+                    ])
+                    .with_user(user.clone()),
+                )
                 .await?;
             drop(stream.stdin);
             while let Some(chunk) = stream.output.next().await {
@@ -787,11 +904,10 @@ impl Instance {
             mut output,
             mut stdin,
         } = self
-            .exec(executor::ExecOptions::new(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                command,
-            ]))
+            .exec(
+                executor::ExecOptions::new(vec!["sh".to_string(), "-c".to_string(), command])
+                    .with_user(user),
+            )
             .await?;
 
         let write = async {
@@ -831,38 +947,86 @@ impl Instance {
         }
     }
 
-    pub async fn logs(
-        &self,
-        lines: Option<usize>,
-    ) -> futures_util::stream::BoxStream<'static, Result<bytes::Bytes, anyhow::Error>> {
+    pub async fn logs(&self, lines: Option<usize>) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
         match self.process_handle.read().await.as_ref() {
             Some(handle) => handle
                 .logs(lines)
                 .await
-                .unwrap_or_else(|_| futures_util::stream::empty().boxed()),
-            None => futures_util::stream::empty().boxed(),
+                .unwrap_or_else(|_| Box::new(tokio::io::empty())),
+            None => Box::new(tokio::io::empty()),
         }
     }
 
-    pub async fn resource_usage(&self) -> resources::ResourceUsage {
-        let mut usage = match self.process_handle.read().await.as_ref() {
-            Some(handle) => handle.resource_usage().await.unwrap_or_default(),
-            None => resources::ResourceUsage::default(),
+    pub async fn logs_lines(
+        &self,
+        lines: Option<usize>,
+    ) -> Box<dyn futures_util::Stream<Item = Result<String, anyhow::Error>> + Unpin + Send> {
+        let process_handle = match &*self.process_handle.read().await {
+            Some(c) => Arc::clone(c),
+            None => {
+                return Box::new(futures_util::stream::empty())
+                    as Box<
+                        dyn futures_util::Stream<Item = Result<String, anyhow::Error>>
+                            + Unpin
+                            + Send,
+                    >;
+            }
         };
-        usage.disk_bytes = self.disk_usage.load(std::sync::atomic::Ordering::Relaxed);
 
-        usage
+        let reader = match process_handle.logs(lines).await {
+            Ok(reader) => reader,
+            Err(_) => {
+                return Box::new(futures_util::stream::empty())
+                    as Box<
+                        dyn futures_util::Stream<Item = Result<String, anyhow::Error>>
+                            + Unpin
+                            + Send,
+                    >;
+            }
+        };
+
+        let stream = futures_util::stream::try_unfold(
+            tokio::io::BufReader::new(reader),
+            |mut reader| async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => Ok(None),
+                    Ok(_) => {
+                        let trimmed = line.trim_end_matches(['\n', '\r']);
+                        Ok(Some((String::from(trimmed), reader)))
+                    }
+                    Err(e) => Err(anyhow::Error::from(e)),
+                }
+            },
+        );
+
+        let pinned: Pin<
+            Box<dyn futures_util::Stream<Item = Result<String, anyhow::Error>> + Send>,
+        > = Box::pin(stream);
+        Box::new(pinned)
+    }
+
+    pub fn resource_usage(&self) -> resources::ResourceUsage {
+        *self.resource_usage.borrow()
+    }
+
+    #[inline]
+    pub fn subscribe_resource_usage(
+        &self,
+    ) -> tokio::sync::watch::Receiver<resources::ResourceUsage> {
+        self.resource_usage.subscribe()
     }
 
     pub async fn to_api_response(&self) -> ApiInstance {
         ApiInstance {
             data: self.data.read().await.clone(),
             backend_auth_error: self.backend_auth_error.read().await.clone(),
-            utilization: self.resource_usage().await,
+            utilization: self.resource_usage(),
         }
     }
 
-    pub async fn sync_container_resources(&self) -> anyhow::Result<()> {
+    pub async fn sync_container(&self) -> anyhow::Result<()> {
         let data = self.data.read().await.clone();
         if let Some(handle) = self.process_handle.read().await.as_ref() {
             handle.update_resources(&data).await?;
@@ -870,6 +1034,27 @@ impl Instance {
 
         Ok(())
     }
+}
+
+fn check_import_args(
+    database_type: DatabaseType,
+    db: Option<&str>,
+    source_db: Option<&str>,
+    wipe: bool,
+) -> anyhow::Result<()> {
+    if database_type == DatabaseType::Redis && db.is_some() {
+        return Err(crate::response::DisplayError::new("redis has no named databases").into());
+    }
+    if wipe && db.is_none() && database_type != DatabaseType::Redis {
+        return Err(crate::response::DisplayError::new("wipe requires a db").into());
+    }
+    // with --archive the archive names the database, restoring into another one is
+    // a rename that needs the name it had
+    if database_type == DatabaseType::Mongodb && db.is_some() && source_db.is_none() {
+        return Err(crate::response::DisplayError::new("db requires a source_db").into());
+    }
+
+    Ok(())
 }
 
 /// the mongo shell tools reject a unix socket path given to --host, it has to be a

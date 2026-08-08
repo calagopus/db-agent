@@ -18,10 +18,7 @@ impl HostMountTable {
         let container_id = container_id_from_mountinfo(&mountinfo)?;
 
         let inspect = docker
-            .inspect_container(
-                &container_id,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
+            .inspect_container(&container_id, None)
             .await
             .with_context(|| format!("failed to inspect own container {container_id}"))?;
         if inspect.id.as_deref() != Some(container_id.as_str()) {
@@ -78,12 +75,9 @@ impl HostMountTable {
 
     pub fn validate_directories(
         &self,
-        config: &crate::config::InnerConfig,
+        cfg: &crate::config::InnerConfig,
     ) -> Result<(), anyhow::Error> {
-        let directories = [
-            (&config.data_dir, "data_dir"),
-            (&config.socket_dir, "socket_dir"),
-        ];
+        let directories = [(&cfg.data_dir, "data_dir"), (&cfg.socket_dir, "socket_dir")];
 
         for (directory, name) in directories {
             if self.translate(Path::new(directory)).is_none() {

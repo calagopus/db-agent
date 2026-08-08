@@ -9,10 +9,23 @@ mod diagnostics;
 mod service_install;
 mod version;
 
-pub type ExecutorFunc = dyn Fn(
-        Option<Arc<crate::config::Config>>,
-        ArgMatches,
-    ) -> Pin<Box<dyn Future<Output = Result<i32, anyhow::Error>>>>
+pub enum ConfigState {
+    Missing,
+    Unparseable(String),
+    Loaded(Arc<crate::config::Config>),
+}
+
+impl ConfigState {
+    pub fn is_loaded(&self) -> bool {
+        matches!(self, Self::Loaded(_))
+    }
+
+    pub fn exists(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+}
+
+pub type ExecutorFunc = dyn Fn(ConfigState, ArgMatches) -> Pin<Box<dyn Future<Output = Result<i32, anyhow::Error>>>>
     + Send;
 
 pub enum CommandMapEntry {
@@ -32,7 +45,7 @@ impl CliCommandGroupBuilder {
                 .version(crate::full_version())
                 .arg(
                     Arg::new("config")
-                        .help("path to the configuration file")
+                        .help("set the location for the configuration file")
                         .num_args(1)
                         .short('c')
                         .long("config")
@@ -43,7 +56,7 @@ impl CliCommandGroupBuilder {
                 )
                 .arg(
                     Arg::new("debug")
-                        .help("run db-agent in debug mode")
+                        .help("pass in order to run db-agent in debug mode")
                         .num_args(0)
                         .short('d')
                         .long("debug")
@@ -57,7 +70,7 @@ impl CliCommandGroupBuilder {
         }
     }
 
-    pub fn get_command(&mut self) -> Command {
+    pub fn get_command(&self) -> Command {
         self.command.clone()
     }
 
@@ -152,7 +165,7 @@ pub fn commands(cli: CliCommandGroupBuilder) -> CliCommandGroupBuilder {
     )
     .add_command(
         "diagnostics",
-        "Prints a diagnostics report for db-agent.",
+        "Gets Diagnostic Data for db-agent.",
         diagnostics::DiagnosticsCommand,
     )
     .add_command(

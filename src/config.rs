@@ -4,11 +4,13 @@ use axum::{extract::ConnectInfo, http::HeaderMap};
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use std::{
+    collections::{BTreeMap, HashMap},
     fs::File,
+    io::BufRead,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -41,6 +43,9 @@ fn disk_check_interval() -> u64 {
 }
 fn disk_check_concurrency() -> usize {
     5
+}
+fn websocket_log_count() -> usize {
+    150
 }
 
 fn database_url() -> String {
@@ -101,14 +106,13 @@ fn docker_socket() -> String {
 fn docker_tmpfs_size() -> u64 {
     100
 }
-fn docker_container_pid_limit() -> i64 {
+fn docker_container_pid_limit() -> u64 {
     512
 }
 fn docker_timezone() -> String {
     if let Ok(tz) = std::env::var("TZ") {
         return tz;
     } else if let Ok(tz) = File::open("/etc/timezone") {
-        use std::io::BufRead;
         let mut buf = String::new();
         if std::io::BufReader::new(tz).read_line(&mut buf).is_ok() {
             let tz = buf.trim();
@@ -129,8 +133,8 @@ fn docker_registry_image_fetch_cache_duration() -> u64 {
 fn docker_log_config_type() -> String {
     "local".to_string()
 }
-fn docker_log_config_config() -> std::collections::BTreeMap<String, String> {
-    std::collections::BTreeMap::from([
+fn docker_log_config_config() -> BTreeMap<String, String> {
+    BTreeMap::from([
         ("max-size".to_string(), "5m".to_string()),
         ("max-file".to_string(), "1".to_string()),
         ("compress".to_string(), "false".to_string()),
@@ -138,6 +142,7 @@ fn docker_log_config_config() -> std::collections::BTreeMap<String, String> {
 }
 
 #[derive(Clone, ToSchema, Deserialize, Serialize, DefaultFromSerde)]
+#[serde(default)]
 pub struct Tls {
     #[serde(default)]
     pub enabled: bool,
@@ -162,17 +167,17 @@ nestify::nest! {
         #[serde(default = "log_dir")]
         pub log_dir: String,
 
-        #[serde(default)]
-        pub ignore_config_updates: bool,
-
         #[serde(default = "disk_check_interval")]
         pub disk_check_interval: u64,
         #[serde(default = "disk_check_concurrency")]
         pub disk_check_concurrency: usize,
 
+        #[serde(default = "websocket_log_count")]
+        pub websocket_log_count: usize,
+
         #[serde(default)]
         #[schema(inline)]
-        pub postgres: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Postgres {
+        pub postgres: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Postgres {
             #[serde(default = "postgres_enabled")]
             pub enabled: bool,
             #[serde(default = "postgres_bind")]
@@ -184,7 +189,7 @@ nestify::nest! {
 
         #[serde(default)]
         #[schema(inline)]
-        pub mariadb: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Mariadb {
+        pub mariadb: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Mariadb {
             #[serde(default = "mariadb_enabled")]
             pub enabled: bool,
             #[serde(default = "mariadb_bind")]
@@ -196,7 +201,7 @@ nestify::nest! {
 
         #[serde(default)]
         #[schema(inline)]
-        pub mongodb: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Mongodb {
+        pub mongodb: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Mongodb {
             #[serde(default = "mongodb_enabled")]
             pub enabled: bool,
             #[serde(default = "mongodb_bind")]
@@ -208,7 +213,7 @@ nestify::nest! {
 
         #[serde(default)]
         #[schema(inline)]
-        pub redis: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Redis {
+        pub redis: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Redis {
             #[serde(default = "redis_enabled")]
             pub enabled: bool,
             #[serde(default = "redis_bind")]
@@ -220,7 +225,7 @@ nestify::nest! {
 
         #[serde(default)]
         #[schema(inline)]
-        pub database: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DatabaseConfig {
+        pub database: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DatabaseConfig {
             #[serde(default = "database_url")]
             pub url: String,
             #[serde(default = "database_migrate")]
@@ -229,12 +234,13 @@ nestify::nest! {
 
         #[serde(default)]
         #[schema(inline)]
-        pub docker: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Docker {
+        pub docker: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Docker {
             #[serde(default = "docker_socket")]
             pub socket: String,
 
             #[serde(default)]
-            pub registries: std::collections::HashMap<String, #[derive(ToSchema, Deserialize, Serialize, Clone)] pub struct DockerRegistry {
+            #[schema(inline)]
+            pub registries: HashMap<String, #[derive(ToSchema, Deserialize, Serialize)] pub struct DockerRegistryConfiguration {
                 pub username: String,
                 pub password: String,
             }>,
@@ -242,7 +248,7 @@ nestify::nest! {
             #[serde(default = "docker_tmpfs_size")]
             pub tmpfs_size: u64,
             #[serde(default = "docker_container_pid_limit")]
-            pub container_pid_limit: i64,
+            pub container_pid_limit: u64,
             #[serde(default = "docker_timezone")]
             pub timezone: String,
             #[serde(default)]
@@ -250,7 +256,7 @@ nestify::nest! {
 
             #[serde(default)]
             #[schema(inline)]
-            pub registry_image_fetch_cache: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerRegistryImageFetchCache {
+            pub registry_image_fetch_cache: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerRegistryImageFetchCache {
                 #[serde(default = "docker_registry_image_fetch_cache_enabled")]
                 pub enabled: bool,
                 #[serde(default = "docker_registry_image_fetch_cache_duration")]
@@ -259,32 +265,34 @@ nestify::nest! {
 
             #[serde(default)]
             #[schema(inline)]
-            pub rootless: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerRootless {
+            pub rootless: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerRootless {
                 #[serde(default)]
                 pub enabled: bool,
             },
 
             #[serde(default)]
             #[schema(inline)]
-            pub log_config: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct DockerLogConfig {
+            pub log_config: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerLogConfig {
                 #[serde(default = "docker_log_config_type")]
                 pub r#type: String,
                 #[serde(default = "docker_log_config_config")]
-                pub config: std::collections::BTreeMap<String, String>,
+                pub config: BTreeMap<String, String>,
             },
         },
 
         #[serde(default)]
         #[schema(inline)]
-        pub api: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] pub struct Api {
+        pub api: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Api {
             #[serde(default = "api_bind")]
             pub bind: String,
+
+            #[serde(default)]
+            pub tls: Tls,
+
             #[serde(default)]
             pub token: String,
             #[serde(default)]
             pub disable_openapi_docs: bool,
-            #[serde(default)]
-            pub ignore_upgrades: bool,
             #[serde(default)]
             pub disable_remote_import: bool,
             #[serde(default = "api_remote_import_blocked_cidrs")]
@@ -292,12 +300,14 @@ nestify::nest! {
             pub remote_import_blocked_cidrs: Vec<cidr::IpCidr>,
 
             #[serde(default)]
-            pub tls: Tls,
-
-            #[serde(default)]
             #[schema(value_type = Vec<String>)]
             pub trusted_proxies: Vec<cidr::IpCidr>,
         },
+
+        #[serde(default)]
+        pub ignore_config_updates: bool,
+        #[serde(default)]
+        pub ignore_upgrades: bool,
     }
 }
 
@@ -319,6 +329,31 @@ fn log_filter(debug: bool) -> Targets {
         .with_target("db_agent", crate_level)
 }
 
+// ignore_upgrades moved out of api, and serde drops the now unknown nested key, so an operator
+// opt-out would be reset to false by the rewrite. aliases cannot bridge nesting levels, so the
+// move has to happen on the untyped value before deserializing.
+fn migrate_ignore_upgrades(raw: &mut serde_norway::Value) -> bool {
+    let Some(root) = raw.as_mapping_mut() else {
+        return false;
+    };
+
+    let Some(old) = root
+        .get_mut("api")
+        .and_then(serde_norway::Value::as_mapping_mut)
+        .and_then(|api| api.remove("ignore_upgrades"))
+    else {
+        return false;
+    };
+
+    if root.contains_key("ignore_upgrades") {
+        return false;
+    }
+
+    root.insert("ignore_upgrades".into(), old);
+
+    true
+}
+
 #[allow(dead_code)]
 pub struct LogGuard(
     tracing_appender::non_blocking::WorkerGuard,
@@ -327,9 +362,9 @@ pub struct LogGuard(
 
 pub struct Config {
     inner: ArcSwap<InnerConfig>,
-    log_reload_handle: OnceLock<ReloadHandle>,
+    log_reload_handle: ReloadHandle,
     pub path: String,
-    pub disk_check_semaphore: ArcSwap<tokio::sync::Semaphore>,
+    pub disk_check_concurrency_semaphore: ArcSwap<tokio::sync::Semaphore>,
 }
 
 impl Config {
@@ -344,28 +379,111 @@ impl Config {
             .copied()
     }
 
-    pub fn open(path: &str) -> anyhow::Result<Arc<Self>> {
-        let inner: InnerConfig = if Path::new(path).exists() {
+    pub fn open(
+        path: &str,
+        debug: bool,
+        ignore_debug: bool,
+    ) -> anyhow::Result<(Arc<Self>, LogGuard)> {
+        let exists = Path::new(path).exists();
+        let (inner, migrated): (InnerConfig, bool) = if exists {
             let file = File::open(path).context(format!("failed to open config file {path}"))?;
-            serde_norway::from_reader(std::io::BufReader::new(file))
-                .context(format!("failed to parse config file {path}"))?
+            let mut raw: serde_norway::Value =
+                serde_norway::from_reader(std::io::BufReader::new(file))
+                    .context(format!("failed to parse config file {path}"))?;
+            let migrated = migrate_ignore_upgrades(&mut raw);
+
+            (
+                serde_norway::from_value(raw)
+                    .context(format!("failed to parse config file {path}"))?,
+                migrated,
+            )
         } else {
-            tracing::warn!("config file {path} not found, writing defaults");
-            InnerConfig::default()
+            (InnerConfig::default(), false)
         };
+
+        Self::ensure_directories(&inner)?;
+
+        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+
+        let latest_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(Path::new(&inner.log_dir).join("db-agent.log"))
+            .context("failed to open latest log file")?;
+
+        let rolling = tracing_appender::rolling::Builder::new()
+            .filename_prefix("db-agent")
+            .filename_suffix("log")
+            .max_log_files(30)
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .build(&inner.log_dir)
+            .context("failed to create rolling log file appender")?;
+
+        let (file_writer, file_guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(50)
+                .finish(latest_file.and(rolling));
 
         Self::save_to(path, &inner)?;
 
-        let disk_check_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
+        let (reload_layer, log_reload_handle) = tracing_subscriber::reload::Layer::new(log_filter(
+            (inner.debug || debug) && !ignore_debug,
+        ));
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+                "%Y-%m-%d %H:%M:%S %z".to_string(),
+            ))
+            .with_writer(stdout_writer.and(file_writer))
+            .with_target(false)
+            .with_level(true)
+            .with_file(true)
+            .with_line_number(true);
+
+        tracing_subscriber::registry()
+            .with(LevelFilter::DEBUG)
+            .with(reload_layer)
+            .with(fmt_layer)
+            .try_init()
+            .context("failed to install tracing subscriber")?;
+
+        if !exists {
+            tracing::warn!("config file {path} not found, wrote defaults");
+        }
+        if migrated {
+            tracing::warn!("migrated api.ignore_upgrades to top-level ignore_upgrades in {path}");
+        }
+
+        let disk_check_concurrency_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
             inner.disk_check_concurrency.max(1),
         ));
 
-        Ok(Arc::new(Self {
+        let config = Arc::new(Self {
             inner: ArcSwap::from_pointee(inner),
-            log_reload_handle: OnceLock::new(),
+            log_reload_handle,
             path: path.to_string(),
-            disk_check_semaphore,
-        }))
+            disk_check_concurrency_semaphore,
+        });
+
+        Ok((config, LogGuard(file_guard, stdout_guard)))
+    }
+
+    fn ensure_directories(inner: &InnerConfig) -> std::io::Result<()> {
+        for dir in [&inner.log_dir, &inner.socket_dir, &inner.data_dir] {
+            let path = Path::new(dir);
+
+            if !path.exists() {
+                std::fs::create_dir_all(path)?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[inline]
@@ -423,74 +541,54 @@ impl Config {
         connect_info.ip()
     }
 
-    pub fn setup_logging(&self, debug: bool) -> anyhow::Result<LogGuard> {
-        let debug = debug || self.load().debug;
-        let log_dir = self.load().log_dir.clone();
-        std::fs::create_dir_all(&log_dir)
-            .context(format!("failed to create log directory {log_dir}"))?;
-
-        let rolling = tracing_appender::rolling::Builder::new()
-            .filename_prefix("db-agent")
-            .filename_suffix("log")
-            .max_log_files(30)
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .build(&log_dir)
-            .context("failed to create rolling log file appender")?;
-
-        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
-        let (file_writer, file_guard) = tracing_appender::non_blocking(rolling);
-
-        let (reload_layer, reload_handle) =
-            tracing_subscriber::reload::Layer::new(log_filter(debug));
-
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(stdout_writer.and(file_writer))
-            .with_target(false);
-
-        tracing_subscriber::registry()
-            .with(LevelFilter::DEBUG)
-            .with(reload_layer)
-            .with(fmt_layer)
-            .init();
-
-        let _ = self.log_reload_handle.set(reload_handle);
-
-        Ok(LogGuard(file_guard, stdout_guard))
-    }
-
     pub fn replace(&self, new: InnerConfig) -> anyhow::Result<()> {
+        Self::save_to(&self.path, &new)?;
+
         let old_debug = self.load().debug;
         let new_debug = new.debug;
         let old_concurrency = self.load().disk_check_concurrency.max(1);
         let new_concurrency = new.disk_check_concurrency.max(1);
-        Self::save_to(&self.path, &new)?;
         self.inner.store(Arc::new(new));
 
-        if old_debug != new_debug
-            && let Some(handle) = self.log_reload_handle.get()
-        {
-            handle
+        if old_debug != new_debug {
+            self.log_reload_handle
                 .modify(|filter| *filter = log_filter(new_debug))
                 .context("failed to reload tracing level filter")?;
         }
 
         if new_concurrency != old_concurrency {
-            self.disk_check_semaphore
+            self.disk_check_concurrency_semaphore
                 .store(Arc::new(tokio::sync::Semaphore::new(new_concurrency)));
         }
 
         Ok(())
     }
 
-    pub fn save_new(path: &str, inner: &InnerConfig) -> anyhow::Result<()> {
-        Self::save_to(path, inner)
-    }
-
     fn save_to(path: &str, inner: &InnerConfig) -> anyhow::Result<()> {
-        let file = File::create(path).context(format!("failed to create config file {path}"))?;
-        serde_norway::to_writer(std::io::BufWriter::new(file), inner)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let file = options
+            .open(path)
+            .context(format!("failed to create config file {path}"))?;
+        let writer = std::io::BufWriter::new(file);
+        serde_norway::to_writer(writer, inner)
             .context(format!("failed to write config file {path}"))?;
 
         Ok(())
+    }
+
+    pub fn save_new(path: &str, config: InnerConfig) -> anyhow::Result<()> {
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent)
+                .context(format!("failed to create config directory {path}"))?;
+        }
+
+        Self::save_to(path, &config)
     }
 }

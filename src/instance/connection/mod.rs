@@ -14,6 +14,38 @@ pub struct QueryResult {
     pub rows_affected: u64,
 }
 
+/// a server reported failure comes from the caller's own query, a transport level one does not
+/// and keeps its opaque status so socket paths stay internal
+pub fn query_error(err: anyhow::Error) -> anyhow::Error {
+    let message =
+        if let Some(mysql_async::Error::Server(err)) = err.downcast_ref::<mysql_async::Error>() {
+            Some(err.message.clone())
+        } else if let Some(err) = err.downcast_ref::<tokio_postgres::Error>() {
+            err.as_db_error().map(|err| err.message().to_string())
+        } else if let Some(err) = err.downcast_ref::<::redis::RedisError>() {
+            matches!(
+                err.kind(),
+                ::redis::ErrorKind::Server(_) | ::redis::ErrorKind::Extension
+            )
+            .then(|| err.to_string())
+        } else if let Some(::mongodb::error::ErrorKind::Command(err)) = err
+            .downcast_ref::<::mongodb::error::Error>()
+            .map(|err| &*err.kind)
+        {
+            Some(err.message.clone())
+        } else {
+            err.downcast_ref::<serde_json::Error>()
+                .map(|err| err.to_string())
+        };
+
+    match message {
+        Some(message) => crate::response::DisplayError::new(message)
+            .with_status(axum::http::StatusCode::BAD_REQUEST)
+            .into(),
+        None => err,
+    }
+}
+
 #[async_trait::async_trait]
 pub trait DatabaseConnection: Send + Sync {
     async fn create_user(&self, user: &UserIdentifier, password: &str) -> anyhow::Result<()>;
@@ -36,6 +68,14 @@ pub trait DatabaseConnection: Send + Sync {
 
 impl super::Instance {
     pub async fn connection(&self) -> anyhow::Result<Box<dyn DatabaseConnection>> {
+        self.ensure_online("reach the database").await?;
+
+        self.acl_connection().await
+    }
+
+    /// for the acl paths, which gate on ensure_acl_writable instead because a
+    /// redis user is ours to store and needs no backend
+    pub(super) async fn acl_connection(&self) -> anyhow::Result<Box<dyn DatabaseConnection>> {
         let socket = self.get_socket_path().await;
 
         let database_type = self.data.read().await.database_type;

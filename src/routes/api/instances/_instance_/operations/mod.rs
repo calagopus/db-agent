@@ -1,6 +1,8 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+mod _operation_;
+
 mod get {
     use crate::{
         response::{ApiResponse, ApiResponseResult},
@@ -10,8 +12,14 @@ mod get {
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
-    struct Response {
-        utilization: crate::instance::resources::ResourceUsage,
+    struct ApiOperation<'a> {
+        uuid: uuid::Uuid,
+        operation: &'a crate::instance::operations::DatabaseOperation,
+    }
+
+    #[derive(ToSchema, Serialize)]
+    struct Response<'a> {
+        operations: Vec<ApiOperation<'a>>,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -25,15 +33,24 @@ mod get {
         ),
     ))]
     pub async fn route(instance: GetInstance) -> ApiResponseResult {
-        ApiResponse::new_serialized(Response {
-            utilization: instance.resource_usage(),
-        })
-        .ok()
+        let values = instance.operations.operations().await;
+        let mut operations = Vec::new();
+        operations.reserve_exact(values.len());
+
+        for (uuid, operation) in values.iter() {
+            operations.push(ApiOperation {
+                uuid: *uuid,
+                operation: &operation.database_operation,
+            });
+        }
+
+        ApiResponse::new_serialized(Response { operations }).ok()
     }
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/{operation}", _operation_::router(state))
         .routes(routes!(get::route))
         .with_state(state.clone())
 }

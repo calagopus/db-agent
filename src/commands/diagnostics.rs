@@ -23,24 +23,29 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
     }
 
     fn get_executor(self) -> Box<crate::commands::ExecutorFunc> {
-        Box::new(|_config, arg_matches| {
+        Box::new(|config, arg_matches| {
             Box::pin(async move {
                 let args = DiagnosticsArgs::from_arg_matches(&arg_matches)?;
 
-                let config_path = arg_matches
-                    .get_one::<String>("config")
-                    .map(|path| path.as_str())
-                    .or_else(|| crate::config::Config::find())
-                    .unwrap_or(crate::config::Config::DEFAULT_PATH);
-
-                let config = match crate::config::Config::open(config_path) {
-                    Ok(config) => config,
-                    Err(err) => {
-                        eprintln!("{}: {err:#}", "failed to load config".red());
+                let config = match config {
+                    crate::commands::ConfigState::Loaded(config) => config,
+                    crate::commands::ConfigState::Unparseable(err) => {
+                        eprintln!("{}: {err}", "failed to load config".red());
+                        return Ok(1);
+                    }
+                    crate::commands::ConfigState::Missing => {
+                        eprintln!("{}", "no config found".red());
                         return Ok(1);
                     }
                 };
                 let config = config.load();
+
+                let include_endpoints = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(
+                        "do you want to include endpoints (i.e. the IP/port db-agent binds to)?",
+                    )
+                    .default(false)
+                    .interact()?;
 
                 let review_before_upload = Confirm::with_theme(&ColorfulTheme::default())
                     .with_prompt(
@@ -75,13 +80,17 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                     &versions.os.unwrap_or_else(|| "unknown".to_string()),
                 )?;
 
+                let api_bind = config.api.bind.clone();
+
                 write_header(&mut output, "configuration")?;
-                write_line(&mut output, "api", &config.api.bind)?;
+                write_line(&mut output, "api", &api_bind)?;
                 write_line(
                     &mut output,
                     "api tls enabled",
                     &config.api.tls.enabled.to_string(),
                 )?;
+                write_line(&mut output, "api tls certificate", &config.api.tls.cert)?;
+                write_line(&mut output, "api tls key", &config.api.tls.key)?;
                 write_line(
                     &mut output,
                     "api tls kernel",
@@ -120,7 +129,21 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                 write_header(&mut output, "latest db-agent logs")?;
                 match latest_log_lines(&config.log_dir, args.log_lines).await {
                     Ok(lines) => output.push_str(&lines),
-                    Err(err) => writeln!(output, "failed to read log directory: {err}")?,
+                    Err(err) => {
+                        eprintln!("{}: {err}", "failed to read db-agent log file".red());
+                        return Ok(1);
+                    }
+                }
+
+                if !include_endpoints {
+                    output = output.replace(&api_bind, "{redacted}");
+
+                    if !config.api.tls.cert.is_empty() {
+                        output = output.replace(&config.api.tls.cert, "{redacted}");
+                    }
+                    if !config.api.tls.key.is_empty() {
+                        output = output.replace(&config.api.tls.key, "{redacted}");
+                    }
                 }
 
                 if review_before_upload {

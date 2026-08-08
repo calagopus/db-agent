@@ -86,16 +86,10 @@ pub fn parse_client_first(cf: &str) -> Option<(String, String, String)> {
     Some((bare, cnonce, user))
 }
 
-pub async fn backend_auth(
-    socket: &Path,
-    user: &str,
-    password: &str,
-) -> std::io::Result<UnixStream> {
-    let mut be = UnixStream::connect(socket).await?;
-
+pub async fn backend_auth(be: &mut UnixStream, user: &str, password: &str) -> std::io::Result<()> {
     let hello = doc! { "ismaster": 1, "$db": "admin" };
-    write_op_msg_request(&mut be, 1, &hello).await?;
-    let _ = read_message(&mut be).await?;
+    write_op_msg_request(be, 1, &hello).await?;
+    let _ = read_message(be).await?;
 
     let cnonce = B64.encode(random_bytes::<18>());
     let bare = format!("n={},r={cnonce}", escape(user));
@@ -106,9 +100,9 @@ pub async fn backend_auth(
         "payload": binary(client_first.as_bytes()),
         "$db": "admin",
     };
-    write_op_msg_request(&mut be, 2, &start).await?;
+    write_op_msg_request(be, 2, &start).await?;
 
-    let (_, _, body) = read_message(&mut be).await?;
+    let (_, _, body) = read_message(be).await?;
     let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
     let conversation_id = reply.get_i32("conversationId").unwrap_or(1);
     let server_first = String::from_utf8(
@@ -146,9 +140,9 @@ pub async fn backend_auth(
         "payload": binary(client_final.as_bytes()),
         "$db": "admin",
     };
-    write_op_msg_request(&mut be, 3, &cont).await?;
+    write_op_msg_request(be, 3, &cont).await?;
 
-    let (_, _, body) = read_message(&mut be).await?;
+    let (_, _, body) = read_message(be).await?;
     let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
     if reply.get_f64("ok").ok() != Some(1.0) {
         return Err(bad("backend rejected auth"));
@@ -174,16 +168,16 @@ pub async fn backend_auth(
             "payload": binary(b""),
             "$db": "admin",
         };
-        write_op_msg_request(&mut be, 4, &finish).await?;
+        write_op_msg_request(be, 4, &finish).await?;
 
-        let (_, _, body) = read_message(&mut be).await?;
+        let (_, _, body) = read_message(be).await?;
         let reply = op_msg_doc(&body).ok_or_else(|| bad("bad backend reply"))?;
         if reply.get_f64("ok").ok() != Some(1.0) || !reply.get_bool("done").unwrap_or(false) {
             return Err(bad("backend auth did not complete"));
         }
     }
 
-    Ok(be)
+    Ok(())
 }
 
 fn field(s: &str, prefix: &str) -> Option<String> {
@@ -196,6 +190,7 @@ fn field(s: &str, prefix: &str) -> Option<String> {
 fn escape(s: &str) -> String {
     s.replace('=', "=3D").replace(',', "=2C")
 }
+
 fn unescape(s: &str) -> String {
     s.replace("=2C", ",").replace("=3D", "=")
 }
@@ -211,9 +206,11 @@ fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
     m.update(msg);
     m.finalize().into_bytes().into()
 }
+
 fn sha256(d: &[u8]) -> [u8; 32] {
     Sha256::digest(d).into()
 }
+
 fn pbkdf2_sha256(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
     let mut m = Hmac::<Sha256>::new_from_slice(password).expect("pbkdf2 key");
     m.update(salt);

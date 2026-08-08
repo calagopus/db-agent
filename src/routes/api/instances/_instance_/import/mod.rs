@@ -5,10 +5,11 @@ mod remote;
 
 mod post {
     use crate::{
+        Query,
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::instances::_instance_::GetInstance},
     };
-    use axum::{extract::Query, http::StatusCode};
+    use axum::{body::Body, http::StatusCode};
     use futures_util::TryStreamExt;
     use garde::Validate;
     use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ mod post {
 
     #[derive(ToSchema, Validate, Deserialize)]
     pub struct Params {
+        #[garde(inner(custom(crate::instance::validate_source_database_name)))]
+        source_db: Option<String>,
         #[garde(inner(custom(crate::instance::validate_database_name)))]
         db: Option<String>,
         #[garde(skip)]
@@ -31,10 +34,18 @@ mod post {
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
     ), params(
-        ("instance" = uuid::Uuid, description = "The instance uuid"),
+        (
+            "instance" = uuid::Uuid,
+            description = "The instance uuid",
+            example = "123e4567-e89b-12d3-a456-426614174000",
+        ),
+        (
+            "source_db" = Option<String>, Query,
+            description = "The db the dump was taken from, mongodb only, requires db",
+        ),
         (
             "db" = Option<String>, Query,
-            description = "The db to import into, whole instance if omitted; must be omitted for redis",
+            description = "The db to import into, whole instance if omitted; must be omitted for redis, requires source_db for mongodb",
         ),
         (
             "wipe" = Option<bool>, Query,
@@ -44,7 +55,7 @@ mod post {
     pub async fn route(
         instance: GetInstance,
         Query(params): Query<Params>,
-        body: axum::body::Body,
+        body: Body,
     ) -> ApiResponseResult {
         if let Err(errors) = crate::utils::validate_data(&params) {
             return ApiResponse::error(&errors.join(", "))
@@ -57,7 +68,12 @@ mod post {
         );
 
         instance
-            .import(params.db.as_deref(), None, params.wipe, &mut reader)
+            .import(
+                params.db.as_deref(),
+                params.source_db.as_deref(),
+                params.wipe,
+                &mut reader,
+            )
             .await?;
 
         ApiResponse::new_serialized(Response {}).ok()

@@ -1,11 +1,5 @@
 use rand::{RngExt, distr::SampleString};
-use std::{
-    future::Future,
-    net::SocketAddr,
-    ops::{Bound, RangeBounds},
-    str::FromStr,
-    time::Duration,
-};
+use std::{future::Future, net::SocketAddr, time::Duration};
 use tokio::net::{TcpListener, TcpStream};
 
 pub fn validate_data<T: garde::Validate<Context = ()>>(data: &T) -> Result<(), Vec<String>> {
@@ -41,23 +35,6 @@ pub fn generate_password() -> String {
 /// quotes a value for interpolation into a `sh -c` command line
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
-}
-
-/// parses a uri host as a literal address, `None` for a hostname
-pub fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    std::net::IpAddr::from_str(host).ok()
-}
-
-pub fn is_blocked_ip(cidrs: &[cidr::IpCidr], ip: &std::net::IpAddr) -> bool {
-    // ipv4-mapped addresses have to match the ipv4 ranges
-    let ip = ip.to_canonical();
-
-    cidrs.iter().any(|cidr| cidr.contains(&ip))
 }
 
 pub fn bad(msg: &str) -> std::io::Error {
@@ -103,10 +80,10 @@ pub async fn accept_loop<
                     match fut.await {
                         Ok(()) => {}
                         Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-                            tracing::debug!("[{peer}] protocol error: {err}");
+                            tracing::debug!(%peer, "protocol error: {err}");
                         }
                         Err(err) if is_silent_error(&err) => {}
-                        Err(err) => tracing::error!("[{peer}] error: {err}"),
+                        Err(err) => tracing::error!(%peer, "connection error: {err}"),
                     }
                 });
             }
@@ -141,6 +118,11 @@ pub fn strip_paths(value: &mut serde_json::Value, paths: &[&str]) {
                 break;
             }
 
+            if map.get(part).is_some_and(|next| !next.is_object()) {
+                map.remove(part);
+                break;
+            }
+
             match map.get_mut(part) {
                 Some(next) => cursor = next,
                 None => break,
@@ -155,55 +137,3 @@ pub fn get_array<const N: usize>(slice: &[u8], start: usize) -> std::io::Result<
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| bad("unexpected end of buffer"))
 }
-
-fn resolve_range(range: impl RangeBounds<usize>, len: usize) -> std::io::Result<(usize, usize)> {
-    let start = match range.start_bound() {
-        Bound::Included(&n) => n,
-        Bound::Excluded(&n) => n.saturating_add(1),
-        Bound::Unbounded => 0,
-    };
-
-    let end = match range.end_bound() {
-        Bound::Included(&n) => n.saturating_add(1),
-        Bound::Excluded(&n) => n,
-        Bound::Unbounded => len,
-    };
-
-    if crate::unlikely(start > end) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "range start exceeds range end",
-        ));
-    }
-
-    if crate::unlikely(end > len) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "range end exceeds slice length",
-        ));
-    }
-
-    Ok((start, end))
-}
-
-pub trait SafeSliceExt<T>: AsRef<[T]> {
-    fn get_slice(&self, range: impl RangeBounds<usize>) -> std::io::Result<&[T]> {
-        let slice = self.as_ref();
-        let (start, end) = resolve_range(range, slice.len())?;
-
-        // SAFETY: resolve_range guarantees start <= end <= slice.len()
-        Ok(unsafe { slice.get_unchecked(start..end) })
-    }
-}
-impl<T, Tr: AsRef<[T]> + ?Sized> SafeSliceExt<T> for Tr {}
-
-pub trait SafeSliceMutExt<T>: AsMut<[T]> {
-    fn get_slice_mut(&mut self, range: impl RangeBounds<usize>) -> std::io::Result<&mut [T]> {
-        let slice = self.as_mut();
-        let (start, end) = resolve_range(range, slice.len())?;
-
-        // SAFETY: resolve_range guarantees start <= end <= slice.len()
-        Ok(unsafe { slice.get_unchecked_mut(start..end) })
-    }
-}
-impl<T, Tr: AsMut<[T]> + ?Sized> SafeSliceMutExt<T> for Tr {}

@@ -1,7 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-mod get {
+mod delete {
     use crate::{
         Path,
         response::{ApiResponse, ApiResponseResult},
@@ -12,11 +12,9 @@ mod get {
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
-    struct Response {
-        size: i64,
-    }
+    struct Response {}
 
-    #[utoipa::path(get, path = "/", responses(
+    #[utoipa::path(delete, path = "/", responses(
         (status = OK, body = inline(Response)),
         (status = NOT_FOUND, body = ApiError),
     ), params(
@@ -26,36 +24,27 @@ mod get {
             example = "123e4567-e89b-12d3-a456-426614174000",
         ),
         (
-            "database" = uuid::Uuid,
-            description = "The database uuid",
+            "operation" = uuid::Uuid,
+            description = "The operation uuid",
             example = "123e4567-e89b-12d3-a456-426614174000",
         ),
     ))]
     pub async fn route(
         instance: GetInstance,
-        Path((_instance, database_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+        Path((_instance, operation_id)): Path<(uuid::Uuid, uuid::Uuid)>,
     ) -> ApiResponseResult {
-        let database = match instance.get_database(database_id).await? {
-            Some(database) => database,
-            None => {
-                return ApiResponse::error("database not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
-        };
+        if !instance.operations.abort_operation(operation_id).await {
+            return ApiResponse::error("operation not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
+        }
 
-        let size = instance
-            .connection()
-            .await?
-            .get_size(&database.name)
-            .await?;
-
-        ApiResponse::new_serialized(Response { size }).ok()
+        ApiResponse::new_serialized(Response {}).ok()
     }
 }
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
-        .routes(routes!(get::route))
+        .routes(routes!(delete::route))
         .with_state(state.clone())
 }

@@ -68,7 +68,7 @@ async fn detect_ktls_support() -> Option<Arc<CompatibleCiphers>> {
     let ciphers = match tokio::time::timeout(PROBE_TIMEOUT, CompatibleCiphers::new()).await {
         Ok(Ok(ciphers)) => ciphers,
         Ok(Err(err)) => {
-            tracing::warn!("failed to probe kernel tls support: {err:?}");
+            tracing::warn!("failed to probe kernel tls support: {:#?}", err);
 
             return None;
         }
@@ -197,7 +197,9 @@ impl<S: Send + 'static> Accept<TcpStream, S> for ReloadableAcceptor {
         Box::pin(async move {
             let stream = ReloadableAcceptor::accept(&acceptor, tcp)
                 .await
-                .inspect_err(|err| tracing::debug!("failed to accept https connection: {err:?}"))?;
+                .inspect_err(|err| {
+                    tracing::debug!("failed to accept https connection: {:#?}", err)
+                })?;
 
             Ok((stream, service))
         })
