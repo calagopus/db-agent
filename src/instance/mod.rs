@@ -815,6 +815,10 @@ impl Instance {
                     crate::utils::shell_quote(socket.rsplit_once('/').map_or("", |(dir, _)| dir));
                 match db {
                     Some(db) => {
+                        // a dump taken with --create or pg_dumpall carries \connect for its own
+                        // db, which lands everything there instead of here. the COPY range keeps
+                        // the strips off row data, which can hold a line that reads like DDL
+                        let strip = r"sed '/^COPY .*FROM stdin;$/,/^\\\.$/!{ s/^\\connect .*$//; s/^\\c .*$//; s/^CREATE DATABASE .*;$//; s/^DROP DATABASE .*;$//; s/^ALTER DATABASE .*;$//; }' |";
                         let base = format!(
                             "psql -q -v ON_ERROR_STOP=1 -h {dir} -U postgres -d {}",
                             crate::utils::shell_quote(db)
@@ -822,7 +826,7 @@ impl Instance {
                         let wipe = wipe.then(|| {
                             format!("{base} -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'")
                         });
-                        (wipe, format!("{base} -o /dev/null"))
+                        (wipe, format!("{strip} {base} -o /dev/null"))
                     }
                     // no ON_ERROR_STOP: pg_dumpall output recreates existing roles
                     None => (
@@ -832,12 +836,17 @@ impl Instance {
                 }
             }
             DatabaseType::Mariadb => {
-                let strip = r"sed -e 's/DEFINER=`[^`]*`@`[^`]*`//g' |";
+                let strip = r"sed -e 's/DEFINER=`[^`]*`@`[^`]*`//g'";
                 let socket = crate::utils::shell_quote(socket);
                 match db {
                     Some(db) => {
+                        // a dump taken with --databases carries CREATE DATABASE/USE for its own
+                        // name, which as root lands every table there instead of here, and
+                        // --add-drop-database drops that database first. the DELIMITER range keeps
+                        // the strips out of routine bodies, which are copied verbatim
+                        let redirect = r" -e '/^DELIMITER ;;$/,/^DELIMITER ;$/!{ s/^USE `[^`]*`;$//; s/^CREATE DATABASE .*;$//; s/^DROP DATABASE .*;$//; s|^/\*![0-9]* DROP DATABASE .*;$||; }'";
                         let import = format!(
-                            "{strip} mariadb --socket={socket} -u root {}",
+                            "{strip}{redirect} | mariadb --socket={socket} -u root {}",
                             crate::utils::shell_quote(db)
                         );
                         let wipe = wipe.then(|| {
@@ -850,7 +859,7 @@ impl Instance {
                         });
                         (wipe, import)
                     }
-                    None => (None, format!("{strip} mariadb --socket={socket} -u root")),
+                    None => (None, format!("{strip} | mariadb --socket={socket} -u root")),
                 }
             }
             DatabaseType::Mongodb => {
