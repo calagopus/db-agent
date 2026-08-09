@@ -132,12 +132,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    if creds.instance.locked_state().is_some() {
-        protocol::send_error(&mut stream, "28P01", "database is suspended").await?;
+    if let Some(state) = creds.instance.locked_state() {
+        protocol::send_error(&mut stream, "28P01", "database is locked").await?;
         tracing::debug!(
             %peer,
             instance = %creds.instance.uuid,
-            "rejected: instance suspended"
+            state = %state,
+            "rejected: instance locked"
         );
         return Ok(());
     }

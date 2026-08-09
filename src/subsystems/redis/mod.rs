@@ -144,13 +144,14 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     };
 
-    if creds.instance.locked_state().is_some() {
+    if let Some(state) = creds.instance.locked_state() {
         tracing::debug!(
             %peer,
             instance = %creds.instance.uuid,
-            "rejected: instance suspended"
+            state = %state,
+            "rejected: instance locked"
         );
-        client.write_all(b"-ERR database is suspended\r\n").await?;
+        client.write_all(b"-ERR database is locked\r\n").await?;
         return Ok(());
     }
 
