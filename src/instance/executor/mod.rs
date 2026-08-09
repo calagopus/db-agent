@@ -34,7 +34,6 @@ pub struct ExecStream {
 pub struct NetworkedContainerOptions {
     pub command: Vec<String>,
     pub env: Vec<String>,
-    /// `hostname:ip` entries pinned into the container's hosts file
     pub extra_hosts: Vec<String>,
 }
 
@@ -66,6 +65,9 @@ pub trait ProcessHandle: Send + Sync {
         &self,
         lines: Option<usize>,
     ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, anyhow::Error>;
+    async fn subscribe_stdout_lines(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<Arc<String>>, anyhow::Error>;
 
     async fn update_resources(
         &self,

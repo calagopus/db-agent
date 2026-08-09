@@ -619,20 +619,63 @@ struct DockerProcessHandle {
     app_config: Arc<crate::config::Config>,
 
     resource_usage: tokio::sync::watch::Sender<ResourceUsage>,
+    stdout_rx: tokio::sync::broadcast::Receiver<Arc<String>>,
 
     state_task: tokio::task::JoinHandle<()>,
     stats_task: tokio::task::JoinHandle<()>,
 }
 
 impl DockerProcessHandle {
-    fn new(
+    async fn new(
         container_id: String,
         docker: Arc<bollard::Docker>,
         app_config: Arc<crate::config::Config>,
         uuid: uuid::Uuid,
         resource_usage: tokio::sync::watch::Sender<ResourceUsage>,
-    ) -> Self {
+    ) -> Result<Self, anyhow::Error> {
         resource_usage.wipe(ContainerState::Offline);
+
+        let (stdout_tx, stdout_rx) =
+            tokio::sync::broadcast::channel::<Arc<String>>(app_config.load().websocket_log_count);
+
+        let mut attach = docker
+            .attach_container(
+                &container_id,
+                Some(bollard::query_parameters::AttachContainerOptions {
+                    stdout: true,
+                    stderr: true,
+                    stream: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // intentionally not aborted on drop so that it can finish writing any remaining logs to the channel
+        tokio::spawn(async move {
+            let mut line_buffer = crate::io::line_buffer::LineBuffer::new();
+
+            let emit = |slice: &[u8]| {
+                stdout_tx
+                    .send(Arc::new(String::from_utf8_lossy(slice).into_owned()))
+                    .ok();
+            };
+
+            while let Some(Ok(data)) = attach.output.next().await {
+                line_buffer.extend(&data.into_bytes());
+
+                while let Some(line) = line_buffer.next_line() {
+                    emit(line);
+                }
+
+                line_buffer.compact();
+            }
+
+            if let Some(line) = line_buffer.flush() {
+                emit(line);
+            }
+
+            tracing::debug!(instance = %uuid, "stdout task ended");
+        });
 
         let stats_docker = Arc::clone(&docker);
         let stats_id = container_id.clone();
@@ -757,14 +800,15 @@ impl DockerProcessHandle {
             }
         });
 
-        Self {
+        Ok(Self {
             container_id,
             docker,
             app_config,
             resource_usage,
+            stdout_rx,
             state_task,
             stats_task,
-        }
+        })
     }
 }
 
@@ -891,6 +935,12 @@ impl super::ProcessHandle for DockerProcessHandle {
             buffer: Vec::new(),
             pos: 0,
         }))
+    }
+
+    async fn subscribe_stdout_lines(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<Arc<String>>, anyhow::Error> {
+        Ok(self.stdout_rx.resubscribe())
     }
 
     async fn update_resources(&self, data: &StoredInstance) -> Result<(), anyhow::Error> {
@@ -1022,13 +1072,16 @@ impl super::ContainerExecutor for DockerExecutor {
             )
             .await?;
 
-        Ok(Arc::new(DockerProcessHandle::new(
-            container.id,
-            Arc::clone(&self.docker),
-            Arc::clone(&self.app_config),
-            data.uuid,
-            instance.resource_usage.clone(),
-        )))
+        Ok(Arc::new(
+            DockerProcessHandle::new(
+                container.id,
+                Arc::clone(&self.docker),
+                Arc::clone(&self.app_config),
+                data.uuid,
+                instance.resource_usage.clone(),
+            )
+            .await?,
+        ))
     }
 
     async fn attach_instance_process(
@@ -1043,13 +1096,16 @@ impl super::ContainerExecutor for DockerExecutor {
         .await
         .ok_or_else(|| anyhow::anyhow!("no running database container found"))?;
 
-        Ok(Arc::new(DockerProcessHandle::new(
-            container_id,
-            Arc::clone(&self.docker),
-            Arc::clone(&self.app_config),
-            instance.uuid,
-            instance.resource_usage.clone(),
-        )))
+        Ok(Arc::new(
+            DockerProcessHandle::new(
+                container_id,
+                Arc::clone(&self.docker),
+                Arc::clone(&self.app_config),
+                instance.uuid,
+                instance.resource_usage.clone(),
+            )
+            .await?,
+        ))
     }
 
     async fn cleanup_instance_process(

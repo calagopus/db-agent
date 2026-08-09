@@ -1,4 +1,4 @@
-use crate::instance::identifier::UserIdentifier;
+use crate::{instance::identifier::UserIdentifier, io::SafeSliceExt};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,7 +10,10 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::RwLock,
+};
 use utoipa::ToSchema;
 
 pub mod connection;
@@ -985,18 +988,53 @@ impl Instance {
             }
         };
 
+        struct LogsState {
+            reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+            line_buffer: crate::io::line_buffer::LineBuffer,
+            read_buffer: Vec<u8>,
+            eof: bool,
+        }
+
         let stream = futures_util::stream::try_unfold(
-            tokio::io::BufReader::new(reader),
-            |mut reader| async move {
-                use tokio::io::AsyncBufReadExt;
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => Ok(None),
-                    Ok(_) => {
-                        let trimmed = line.trim_end_matches(['\n', '\r']);
-                        Ok(Some((String::from(trimmed), reader)))
+            LogsState {
+                reader,
+                line_buffer: crate::io::line_buffer::LineBuffer::new(),
+                read_buffer: vec![0; crate::BUFFER_SIZE],
+                eof: false,
+            },
+            |mut state| async move {
+                loop {
+                    if let Some(line) = state
+                        .line_buffer
+                        .next_line()
+                        .map(|line| String::from_utf8_lossy(line).into_owned())
+                    {
+                        state.line_buffer.compact();
+
+                        return Ok(Some((line, state)));
                     }
-                    Err(e) => Err(anyhow::Error::from(e)),
+
+                    if state.eof {
+                        return Ok(None);
+                    }
+
+                    match state.reader.read(&mut state.read_buffer).await {
+                        Ok(0) => {
+                            state.eof = true;
+
+                            let line = state
+                                .line_buffer
+                                .flush()
+                                .map(|line| String::from_utf8_lossy(line).into_owned());
+
+                            return Ok(line.map(|line| (line, state)));
+                        }
+                        Ok(bytes_read) => {
+                            let chunk = state.read_buffer.get_slice(..bytes_read)?;
+                            state.line_buffer.extend(chunk);
+                        }
+                        Err(err) => return Err(anyhow::Error::from(err)),
+                    }
                 }
             },
         );
@@ -1005,6 +1043,24 @@ impl Instance {
             Box<dyn futures_util::Stream<Item = Result<String, anyhow::Error>> + Send>,
         > = Box::pin(stream);
         Box::new(pinned)
+    }
+
+    pub async fn subscribe_stdout_lines(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<Arc<String>>> {
+        if let Some(process_handle) = self.process_handle.read().await.as_ref() {
+            match process_handle.subscribe_stdout_lines().await {
+                Ok(receiver) => return Some(receiver),
+                Err(err) => {
+                    tracing::error!(
+                        instance = %self.uuid,
+                        "failed to subscribe to container stdout: {err}"
+                    );
+                }
+            }
+        }
+
+        None
     }
 
     pub fn resource_usage(&self) -> resources::ResourceUsage {

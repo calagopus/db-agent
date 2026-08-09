@@ -90,7 +90,7 @@ pub async fn handle_ws(
             }
         };
 
-        let futures: [Pin<Box<dyn Future<Output = ()> + Send>>; 2] = [
+        let futures: [Pin<Box<dyn Future<Output = ()> + Send>>; 3] = [
             // Instance listener
             {
                 let websocket_handler = Arc::clone(&websocket_handler);
@@ -109,6 +109,42 @@ pub async fn handle_ws(
                                 );
                             }
                         }
+                    }
+                })
+            },
+            // Stdout listener
+            {
+                let websocket_handler = Arc::clone(&websocket_handler);
+                let instance = instance.clone();
+
+                Box::pin(async move {
+                    loop {
+                        if let Some(mut stdout) = instance.subscribe_stdout_lines().await {
+                            loop {
+                                match stdout.recv().await {
+                                    Ok(line) => {
+                                        websocket_handler
+                                            .send_message(
+                                                super::WebsocketMessage::builder(
+                                                    super::WebsocketEvent::InstanceConsoleOutput,
+                                                )
+                                                .arg(line.as_str())
+                                                .build(),
+                                            )
+                                            .await;
+                                    }
+                                    Err(RecvError::Closed) => break,
+                                    Err(RecvError::Lagged(_)) => {
+                                        tracing::debug!(
+                                            instance = %instance.uuid,
+                                            "stdout lagged behind, messages dropped"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 })
             },

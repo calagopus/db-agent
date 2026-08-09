@@ -1,5 +1,7 @@
 use std::ops::{Bound, RangeBounds};
 
+pub mod line_buffer;
+
 fn resolve_range(range: impl RangeBounds<usize>, len: usize) -> std::io::Result<(usize, usize)> {
     let start = match range.start_bound() {
         Bound::Included(&n) => n,
