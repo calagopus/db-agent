@@ -8,16 +8,9 @@ use std::{
 };
 use url::Url;
 
-/// libpq reads the real endpoint from these instead of the uri host, which would
-/// make any check against the host meaningless
 const POSTGRES_HOST_OVERRIDES: &[&str] = &["host", "hostaddr", "service", "servicefile"];
 
-/// how long a dump tool may spend reaching the source before it gives up
 const CONNECT_TIMEOUT: u64 = 10;
-
-/// a source that connects and then stalls holds the dump container, the operation
-/// and the target's import open for as long as it likes, so the dump is cut off
-/// once it goes quiet for this long
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn parse_url(url: &str, database_type: DatabaseType) -> anyhow::Result<Url> {
@@ -75,13 +68,10 @@ fn decode(value: &str) -> String {
         .into_owned()
 }
 
-/// the database the connection string points at, if any
 fn url_database(url: &Url) -> Option<String> {
     Some(decode(url.path().trim_start_matches('/'))).filter(|db| !db.is_empty())
 }
 
-/// the name may come from the connection string instead of the payload, where garde
-/// never saw it
 fn checked_source_db(source_db: Option<String>) -> anyhow::Result<Option<String>> {
     if let Some(source_db) = &source_db {
         crate::instance::validate_source_database_name(source_db, &())
@@ -109,9 +99,6 @@ fn mariadb_uses_tls(url: &Url) -> bool {
     })
 }
 
-/// rejects the import if any host of the connection string resolves into a blocked
-/// range. the vetted addresses are returned to be pinned, since whoever connects
-/// resolves the names again and could otherwise get a different answer
 async fn vetted_hosts(
     hosts: &[String],
     blocked: &[cidr::IpCidr],
@@ -136,7 +123,6 @@ async fn vetted_hosts(
             continue;
         }
 
-        // fail closed, a name the agent cannot resolve cannot be vetted either
         let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), 0))
             .await
             .map_err(|err| {
@@ -163,8 +149,6 @@ async fn vetted_hosts(
     Ok(pinned)
 }
 
-/// fails the dump once the source goes quiet for `timeout`, dropping the container
-/// stream with it
 fn with_idle_timeout<S>(
     stream: S,
     timeout: Duration,
@@ -190,8 +174,6 @@ where
     })
 }
 
-/// a validated remote import, ready to be run in the background. it holds the dump
-/// command, which carries the source's password
 pub struct RemoteImport {
     pub source_host: String,
     pub source_db: Option<String>,
@@ -202,8 +184,6 @@ pub struct RemoteImport {
 }
 
 impl super::Instance {
-    /// validates a remote import of this instance's own type, resolving and vetting
-    /// the source. see [`super::Instance::import`] for the meaning of `db` and `wipe`
     pub async fn prepare_remote_import(
         &self,
         url: &str,
@@ -229,8 +209,6 @@ impl super::Instance {
                     url.set_path(source_db);
                 }
 
-                // an explicit one is the caller's choice, and libpq takes the last
-                // occurrence of a parameter
                 if !url
                     .query_pairs()
                     .any(|(key, _)| key.as_ref() == "connect_timeout")
@@ -239,8 +217,6 @@ impl super::Instance {
                         .append_pair("connect_timeout", &CONNECT_TIMEOUT.to_string());
                 }
 
-                // pg_dumpall does not hand a password in the connection string down to
-                // the pg_dump children it spawns
                 let password = url.password().map(decode);
                 let _ = url.set_password(None);
                 let quoted = crate::utils::shell_quote(url.as_str());
@@ -280,7 +256,6 @@ impl super::Instance {
                     flags.push_str(" --ssl");
                 }
 
-                // the source is live and not ours to lock, hence --single-transaction
                 let dump = match &source_db {
                     Some(source_db) => format!(
                         "mariadb-dump {flags} --single-transaction {}",
@@ -289,8 +264,6 @@ impl super::Instance {
                     None => format!("mariadb-dump {flags} --single-transaction --all-databases"),
                 };
 
-                // mariadb-dump has no connect timeout of its own, the client it ships
-                // with does, so reaching the source at all is bounded by a probe
                 let command = format!(
                     "mariadb {flags} --connect-timeout={CONNECT_TIMEOUT} -e 'SELECT 1' > /dev/null && {dump}"
                 );
@@ -305,8 +278,13 @@ impl super::Instance {
                 )
             }
             DatabaseType::Mongodb => {
-                // the url crate cannot hold a seed list, every host past the first
-                // carries its own port
+                if !url.starts_with("mongodb://") && !url.starts_with("mongodb+srv://") {
+                    return Err(crate::response::DisplayError::new(
+                        "connection string for mongodb must use the mongodb scheme",
+                    )
+                    .into());
+                }
+
                 let connection = ConnectionString::parse(url).map_err(|err| {
                     crate::response::DisplayError::new(format!("invalid connection string: {err}"))
                 })?;
@@ -320,8 +298,6 @@ impl super::Instance {
                         })
                         .collect(),
                     HostInfo::DnsRecord(_) if blocked.is_empty() => Vec::new(),
-                    // srv resolves to hosts the agent never sees, and its txt record
-                    // can set connection options on top
                     _ => {
                         return Err(crate::response::DisplayError::new(
                             "mongodb+srv connection strings are not supported, list the hosts instead",
@@ -340,7 +316,6 @@ impl super::Instance {
                     None => String::new(),
                 };
 
-                // mongodump refuses a flag the uri already sets
                 let mut timeouts = String::new();
                 if connection.connect_timeout.is_none() {
                     timeouts.push_str(&format!(" --dialTimeout={CONNECT_TIMEOUT}"));
@@ -381,8 +356,6 @@ impl super::Instance {
         })
     }
 
-    /// dumps the prepared source and imports it. the dump runs in a script runner
-    /// container since instance containers have no networking
     pub async fn run_remote_import(
         &self,
         import: RemoteImport,

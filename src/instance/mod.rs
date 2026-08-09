@@ -197,6 +197,18 @@ impl Instance {
         )
     }
 
+    pub fn log_daemon(&self, message: impl Into<String>) {
+        self.websocket
+            .send(
+                websocket::WebsocketMessage::builder(
+                    websocket::WebsocketEvent::InstanceDaemonMessage,
+                )
+                .arg(message)
+                .build(),
+            )
+            .ok();
+    }
+
     #[inline]
     pub fn locked_state(&self) -> Option<&'static str> {
         if self.suspended.load(Ordering::Relaxed) {
@@ -207,9 +219,6 @@ impl Instance {
         None
     }
 
-    /// verifies mongod enforces authorization and the agent holds root
-    /// credentials, bootstrapping the root user when possible. sessions
-    /// must not be relayed unless this succeeds (fail closed).
     pub async fn verify_mongodb_auth(&self) -> anyhow::Result<()> {
         let result = self.verify_mongodb_auth_inner().await;
         *self.backend_auth_error.write().await = result.as_ref().err().map(|e| e.to_string());
@@ -236,13 +245,9 @@ impl Instance {
         Ok(())
     }
 
-    /// creates and stores the agent's root user if missing. works while
-    /// authorization is off, or on a fresh `--auth` instance via the
-    /// localhost exception; must run before any other user is created
     pub async fn ensure_mongodb_root(&self) -> anyhow::Result<()> {
         let socket = self.get_socket_path().await;
 
-        // write lock serializes concurrent bootstrap attempts
         let mut data = self.data.write().await;
         if data.root_password.is_some() {
             return Ok(());
@@ -302,7 +307,6 @@ impl Instance {
         Ok(())
     }
 
-    /// redis acl writes never reach the backend, they stay legal while offline
     async fn ensure_acl_writable(&self, action: &str) -> anyhow::Result<()> {
         if self.data.read().await.database_type == DatabaseType::Redis {
             return Ok(());

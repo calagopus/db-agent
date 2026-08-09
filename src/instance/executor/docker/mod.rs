@@ -373,6 +373,7 @@ impl DockerExecutor {
         &self,
         instance: &super::super::Instance,
         image: &str,
+        quiet: bool,
     ) -> Result<(), anyhow::Error> {
         if image.ends_with('~') {
             return Ok(());
@@ -458,14 +459,10 @@ impl DockerExecutor {
             return Ok(());
         }
 
-        instance
-            .websocket
-            .send(
-                WebsocketMessage::builder(WebsocketEvent::InstanceDaemonMessage)
-                    .arg("Pulling database image, this could take a few minutes to complete...")
-                    .build(),
-            )
-            .ok();
+        if !quiet {
+            instance
+                .log_daemon("Pulling database image, this could take a few minutes to complete...");
+        }
 
         let mut registry_auth = None;
         for (registry, config) in self.app_config.load().docker.registries.iter() {
@@ -493,21 +490,37 @@ impl DockerExecutor {
         while let Some(status) = stream.next().await {
             match status {
                 Ok(info) => {
-                    let Some(id) = info.id else { continue };
-
-                    let message = match info.status.as_deref().map(str::to_lowercase).as_deref() {
-                        Some("downloading") => {
-                            pull_progress(&id, PullProgressStatus::Pulling, info.progress_detail)
+                    let message = match info.id {
+                        Some(id) => {
+                            match info.status.as_deref().map(str::to_lowercase).as_deref() {
+                                Some("downloading") => pull_progress(
+                                    &id,
+                                    PullProgressStatus::Pulling,
+                                    info.progress_detail,
+                                ),
+                                Some("extracting") => pull_progress(
+                                    &id,
+                                    PullProgressStatus::Extracting,
+                                    info.progress_detail,
+                                ),
+                                Some("download complete" | "pull complete") => Some(
+                                    WebsocketMessage::builder(
+                                        WebsocketEvent::InstanceImagePullCompleted,
+                                    )
+                                    .arg(id)
+                                    .build(),
+                                ),
+                                _ => None,
+                            }
                         }
-                        Some("extracting") => {
-                            pull_progress(&id, PullProgressStatus::Extracting, info.progress_detail)
-                        }
-                        Some("download complete" | "pull complete") => Some(
-                            WebsocketMessage::builder(WebsocketEvent::InstanceImagePullCompleted)
-                                .arg(id)
-                                .build(),
-                        ),
-                        _ => None,
+                        None => match info.status {
+                            Some(status) if !quiet => Some(
+                                WebsocketMessage::builder(WebsocketEvent::InstanceConsoleOutput)
+                                    .arg(status)
+                                    .build(),
+                            ),
+                            _ => None,
+                        },
                     };
 
                     if let Some(message) = message {
@@ -521,6 +534,10 @@ impl DockerExecutor {
                         "failed to pull image: {:?}",
                         err
                     );
+
+                    if !quiet {
+                        instance.log_daemon(format!("failed to pull image: {err}"));
+                    }
 
                     if !self.image_exists(image_name).await {
                         return Err(err.into());
@@ -537,6 +554,10 @@ impl DockerExecutor {
 
         if let Some(guard) = &mut last_pull {
             **guard = Some(std::time::Instant::now());
+        }
+
+        if !quiet {
+            instance.log_daemon("Finished pulling database image");
         }
 
         Ok(())
@@ -1043,7 +1064,7 @@ impl super::ContainerExecutor for DockerExecutor {
 
         let rootless = self.app_config.load().docker.rootless.enabled;
 
-        self.pull_image(instance, &data.image).await?;
+        self.pull_image(instance, &data.image, false).await?;
         tokio::fs::create_dir_all(data_dir.join("volumes")).await?;
         for mapping in &data.volumes {
             let host_path = mapping.host_path(&self.app_config, data.uuid);
@@ -1153,7 +1174,7 @@ impl super::ContainerExecutor for DockerExecutor {
         anyhow::Error,
     > {
         let data = instance.data.read().await.clone();
-        self.pull_image(instance, &data.image).await?;
+        self.pull_image(instance, &data.image, true).await?;
 
         let name = format!(
             "{}_{CONTAINER_TYPE_SCRIPT_RUNNER}_{}",
