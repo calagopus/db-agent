@@ -311,7 +311,20 @@ nestify::nest! {
     }
 }
 
-pub const FORBIDDEN_PATHS: &[&str] = &["api.token"];
+pub const FORBIDDEN_PATHS: &[&str] = &[
+    "ignore_config_updates",
+    "ignore_upgrades",
+    "socket_dir",
+    "data_dir",
+    "log_dir",
+    "docker.socket",
+    "api.token",
+    "api.bind",
+    "api.tls",
+    "api.trusted_proxies",
+    "api.disable_remote_import",
+    "api.remote_import_blocked_cidrs",
+];
 
 pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
 type ReloadHandle =
@@ -327,31 +340,6 @@ fn log_filter(debug: bool) -> Targets {
     Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("db_agent", crate_level)
-}
-
-// ignore_upgrades moved out of api, and serde drops the now unknown nested key, so an operator
-// opt-out would be reset to false by the rewrite. aliases cannot bridge nesting levels, so the
-// move has to happen on the untyped value before deserializing.
-fn migrate_ignore_upgrades(raw: &mut serde_norway::Value) -> bool {
-    let Some(root) = raw.as_mapping_mut() else {
-        return false;
-    };
-
-    let Some(old) = root
-        .get_mut("api")
-        .and_then(serde_norway::Value::as_mapping_mut)
-        .and_then(|api| api.remove("ignore_upgrades"))
-    else {
-        return false;
-    };
-
-    if root.contains_key("ignore_upgrades") {
-        return false;
-    }
-
-    root.insert("ignore_upgrades".into(), old);
-
-    true
 }
 
 #[allow(dead_code)]
@@ -384,22 +372,10 @@ impl Config {
         debug: bool,
         ignore_debug: bool,
     ) -> anyhow::Result<(Arc<Self>, LogGuard)> {
-        let exists = Path::new(path).exists();
-        let (inner, migrated): (InnerConfig, bool) = if exists {
-            let file = File::open(path).context(format!("failed to open config file {path}"))?;
-            let mut raw: serde_norway::Value =
-                serde_norway::from_reader(std::io::BufReader::new(file))
-                    .context(format!("failed to parse config file {path}"))?;
-            let migrated = migrate_ignore_upgrades(&mut raw);
-
-            (
-                serde_norway::from_value(raw)
-                    .context(format!("failed to parse config file {path}"))?,
-                migrated,
-            )
-        } else {
-            (InnerConfig::default(), false)
-        };
+        let file = File::open(path).context(format!("failed to open config file {path}"))?;
+        let reader = std::io::BufReader::new(file);
+        let inner: InnerConfig = serde_norway::from_reader(reader)
+            .context(format!("failed to parse config file {path}"))?;
 
         Self::ensure_directories(&inner)?;
 
@@ -447,13 +423,6 @@ impl Config {
             .try_init()
             .context("failed to install tracing subscriber")?;
 
-        if !exists {
-            tracing::warn!("config file {path} not found, wrote defaults");
-        }
-        if migrated {
-            tracing::warn!("migrated api.ignore_upgrades to top-level ignore_upgrades in {path}");
-        }
-
         let disk_check_concurrency_semaphore = ArcSwap::from_pointee(tokio::sync::Semaphore::new(
             inner.disk_check_concurrency.max(1),
         ));
@@ -474,11 +443,15 @@ impl Config {
 
             if !path.exists() {
                 std::fs::create_dir_all(path)?;
+            }
 
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mode = std::fs::metadata(path)?.permissions().mode();
+                if mode & 0o077 != 0 {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o077))?;
                 }
             }
         }

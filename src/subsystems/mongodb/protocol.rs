@@ -1,10 +1,11 @@
 use crate::utils::{bad, get_array, handshake_step};
-use bson::{Bson, Document, doc, spec::BinarySubtype};
+use bson::{Bson, Document, RawBsonRef, RawDocument, doc, spec::BinarySubtype};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_MSG_LEN: usize = 48 * 1000 * 1000;
 const MAX_HANDSHAKE_LEN: usize = 1024 * 1024;
+const MAX_BSON_DEPTH: usize = 25;
 
 pub const OP_REPLY: i32 = 1;
 pub const OP_QUERY: i32 = 2004;
@@ -80,7 +81,38 @@ pub fn op_msg_doc(body: &[u8]) -> Option<Document> {
         return None;
     }
 
+    let raw = RawDocument::from_bytes(doc.get(..len as usize)?).ok()?;
+    if !depth_within_limit(raw) {
+        return None;
+    }
+
     Document::from_reader(doc).ok()
+}
+
+fn depth_within_limit(doc: &RawDocument) -> bool {
+    let mut pending = vec![(doc, 1usize)];
+
+    while let Some((doc, depth)) = pending.pop() {
+        if depth > MAX_BSON_DEPTH {
+            return false;
+        }
+
+        for element in doc.iter_elements() {
+            let nested = match element.and_then(|element| element.value()) {
+                Ok(RawBsonRef::Document(doc)) => doc,
+                Ok(RawBsonRef::Array(array)) => match RawDocument::from_bytes(array.as_bytes()) {
+                    Ok(doc) => doc,
+                    Err(_) => return false,
+                },
+                Ok(RawBsonRef::JavaScriptCodeWithScope(code)) => code.scope,
+                Ok(_) => continue,
+                Err(_) => return false,
+            };
+            pending.push((nested, depth + 1));
+        }
+    }
+
+    true
 }
 
 pub async fn write_op_msg<S: AsyncWrite + Unpin>(
