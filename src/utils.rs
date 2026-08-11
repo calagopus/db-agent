@@ -1,6 +1,15 @@
 use rand::{RngExt, distr::SampleString};
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, path::Path, time::Duration};
 use tokio::net::{TcpListener, TcpStream};
+
+pub fn is_single_component_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None) => component.to_str() == Some(name),
+        _ => false,
+    }
+}
 
 pub fn validate_data<T: garde::Validate<Context = ()>>(data: &T) -> Result<(), Vec<String>> {
     data.validate().map_err(|report| {

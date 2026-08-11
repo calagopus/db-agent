@@ -981,6 +981,7 @@ dependencies = [
  "colored",
  "constant_time_eq",
  "dialoguer",
+ "flate2",
  "futures-util",
  "garde",
  "hex",
@@ -1016,6 +1017,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
+ "tokio-test",
  "tokio-util",
  "tower-http 0.7.0",
  "tracing",
@@ -1258,6 +1260,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
+ "libz-ng-sys",
  "libz-sys",
  "miniz_oxide",
 ]
@@ -2184,6 +2187,16 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "libz-ng-sys"
+version = "1.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879917b256f6317769b9f374b435805a8697013098aacce5a38ac106cd6a9469"
+dependencies = [
+ "cmake",
+ "libc",
 ]
 
 [[package]]
@@ -4170,6 +4183,17 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

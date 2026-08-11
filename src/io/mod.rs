@@ -1,6 +1,8 @@
 use std::ops::{Bound, RangeBounds};
 
+pub mod compression;
 pub mod line_buffer;
+pub mod tail;
 
 fn resolve_range(range: impl RangeBounds<usize>, len: usize) -> std::io::Result<(usize, usize)> {
     let start = match range.start_bound() {
