@@ -1,8 +1,23 @@
 use super::{super::identifier::UserIdentifier, DatabaseConnection, QueryResult};
-use mysql_async::prelude::*;
-use std::path::PathBuf;
+use futures_util::StreamExt;
+use sqlx::{
+    Column, Connection, Decode, Either, Executor, MySql, Row,
+    mysql::{MySqlConnectOptions, MySqlConnection, MySqlRow},
+};
+use std::path::{Path, PathBuf};
 
-const ADMIN_USER: &str = "root";
+pub const ADMIN_USER: &str = "root";
+
+pub fn connect_options(socket: &Path, database: Option<&str>) -> MySqlConnectOptions {
+    let options = MySqlConnectOptions::new()
+        .socket(socket)
+        .username(ADMIN_USER);
+
+    match database {
+        Some(database) => options.database(database),
+        None => options,
+    }
+}
 
 #[inline]
 fn quote_ident(s: &str) -> String {
@@ -17,8 +32,12 @@ fn quote_literal(s: &str) -> String {
 fn duplicate_database(err: anyhow::Error) -> anyhow::Error {
     const ER_DB_CREATE_EXISTS: u16 = 1007;
 
-    match err.downcast_ref::<mysql_async::Error>() {
-        Some(mysql_async::Error::Server(server)) if server.code == ER_DB_CREATE_EXISTS => {
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(server))
+            if server
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .is_some_and(|server| server.number() == ER_DB_CREATE_EXISTS) =>
+        {
             crate::response::DisplayError::new("database already exists")
                 .with_status(axum::http::StatusCode::CONFLICT)
                 .into()
@@ -27,42 +46,42 @@ fn duplicate_database(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
-fn value_to_json(value: mysql_async::Value) -> serde_json::Value {
-    match value {
-        mysql_async::Value::NULL => serde_json::Value::Null,
-        mysql_async::Value::Bytes(bytes) => {
-            serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned())
-        }
-        mysql_async::Value::Int(i) => i.into(),
-        mysql_async::Value::UInt(u) => u.into(),
-        mysql_async::Value::Float(f) => serde_json::json!(f),
-        mysql_async::Value::Double(d) => serde_json::json!(d),
-        date_or_time => serde_json::Value::String(date_or_time.as_sql(true)),
-    }
+fn row_values(row: &MySqlRow) -> Vec<serde_json::Value> {
+    (0..row.columns().len())
+        .map(|ordinal| {
+            let value = match row.try_get_raw(ordinal) {
+                Ok(value) => value,
+                Err(_) => return serde_json::Value::Null,
+            };
+
+            match <&[u8] as Decode<MySql>>::decode(value) {
+                Ok(bytes) => serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned()),
+                Err(_) => serde_json::Value::Null,
+            }
+        })
+        .collect()
 }
 
 pub struct MariadbConnection {
-    opts: mysql_async::Opts,
+    options: MySqlConnectOptions,
 }
 
 impl MariadbConnection {
     pub fn new(socket: PathBuf) -> Self {
         Self {
-            opts: mysql_async::OptsBuilder::default()
-                .socket(Some(socket.to_string_lossy().into_owned()))
-                .user(Some(ADMIN_USER))
-                .into(),
+            options: connect_options(&socket, None),
         }
     }
 
-    async fn conn(&self) -> anyhow::Result<mysql_async::Conn> {
-        Ok(mysql_async::Conn::new(self.opts.clone()).await?)
+    async fn conn(&self) -> anyhow::Result<MySqlConnection> {
+        Ok(MySqlConnection::connect_with(&self.options).await?)
     }
 
     async fn execute(&self, sql: String) -> anyhow::Result<()> {
         let mut conn = self.conn().await?;
-        conn.query_drop(sql).await?;
-        conn.disconnect().await?;
+        conn.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(sql)))
+            .await?;
+        let _ = conn.close().await;
         Ok(())
     }
 }
@@ -126,45 +145,51 @@ impl DatabaseConnection for MariadbConnection {
 
     async fn get_size(&self, name: &str) -> anyhow::Result<i64> {
         let mut conn = self.conn().await?;
-        let size: Option<Option<i64>> = conn
-            .exec_first(
-                "SELECT CAST(SUM(data_length + index_length) AS SIGNED) FROM information_schema.tables WHERE table_schema = ?",
-                (name,),
-            )
-            .await?;
-        conn.disconnect().await?;
+        let size: Option<i64> = sqlx::query_scalar(
+            "SELECT CAST(SUM(data_length + index_length) AS SIGNED) FROM information_schema.tables WHERE table_schema = ?",
+        )
+        .bind(name)
+        .fetch_one(&mut conn)
+        .await?;
+        let _ = conn.close().await;
 
-        Ok(size.flatten().unwrap_or(0))
+        Ok(size.unwrap_or(0))
     }
 
     async fn query(&self, db: Option<&str>, query: &str) -> anyhow::Result<QueryResult> {
-        let mut conn = self.conn().await?;
-        if let Some(db) = db {
-            conn.query_drop(format!("USE {}", quote_ident(db))).await?;
+        let options = match db {
+            Some(db) => self.options.clone().database(db),
+            None => self.options.clone(),
+        };
+        let mut conn = MySqlConnection::connect_with(&options).await?;
+
+        let mut result = QueryResult::default();
+        let mut new_set = true;
+        let mut stream = sqlx::raw_sql(sqlx::AssertSqlSafe(query.to_owned())).fetch_many(&mut conn);
+
+        while let Some(item) = stream.next().await {
+            match item? {
+                Either::Left(done) => {
+                    result.rows_affected += done.rows_affected();
+                    new_set = true;
+                }
+                Either::Right(row) => {
+                    if new_set {
+                        result.columns = row
+                            .columns()
+                            .iter()
+                            .map(|column| column.name().to_owned())
+                            .collect();
+                        new_set = false;
+                    }
+
+                    result.rows.push(row_values(&row));
+                }
+            }
         }
 
-        let mut query_result = conn.query_iter(query).await?;
-        let mut result = QueryResult {
-            columns: query_result
-                .columns()
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(|c| c.name_str().into_owned())
-                .collect(),
-            rows_affected: query_result.affected_rows(),
-            ..Default::default()
-        };
-
-        result.rows = query_result
-            .collect::<mysql_async::Row>()
-            .await?
-            .into_iter()
-            .map(|row| row.unwrap().into_iter().map(value_to_json).collect())
-            .collect();
-
-        drop(query_result);
-        conn.disconnect().await?;
+        drop(stream);
+        let _ = conn.close().await;
 
         Ok(result)
     }

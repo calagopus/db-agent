@@ -19,6 +19,7 @@ use utoipa::ToSchema;
 pub mod connection;
 pub mod disk_checker;
 pub mod executor;
+pub mod explorer;
 pub mod identifier;
 pub mod manager;
 pub mod operations;
@@ -623,6 +624,8 @@ impl Instance {
             .await?;
         self.process_handle.write().await.take();
 
+        explorer::close_pools(self.uuid).await;
+
         Ok(())
     }
 
@@ -654,10 +657,14 @@ impl Instance {
 
     pub async fn stop(&self) -> anyhow::Result<()> {
         let _guard = self.power_lock.lock().await;
-        match self.process_handle.read().await.as_ref() {
+        let result = match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.stop().await,
             None => Ok(()),
-        }
+        };
+
+        explorer::close_pools(self.uuid).await;
+
+        result
     }
 
     pub async fn kill(&self) -> anyhow::Result<()> {
@@ -666,10 +673,14 @@ impl Instance {
         }
 
         let _guard = self.power_lock.lock().await;
-        match self.process_handle.read().await.as_ref() {
+        let result = match self.process_handle.read().await.as_ref() {
             Some(handle) => handle.kill().await,
             None => Ok(()),
-        }
+        };
+
+        explorer::close_pools(self.uuid).await;
+
+        result
     }
 
     pub async fn exec(
