@@ -113,7 +113,8 @@ const MYSQL_COLUMNS: &str = "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, COLUMN
     CAST(IS_NULLABLE = 'YES' AS SIGNED) AS nullable,
     CAST(COLUMN_KEY = 'PRI' AS SIGNED) AS primary_key,
     CAST(EXTRA LIKE '%auto_increment%' AS SIGNED) AS auto_increment,
-    CAST(EXTRA LIKE '%GENERATED%' AS SIGNED) AS generated,
+    CAST(EXTRA LIKE '%VIRTUAL GENERATED%' OR EXTRA LIKE '%STORED GENERATED%' AS SIGNED)
+        AS is_generated,
     CAST(DATA_TYPE IN ('binary', 'varbinary', 'bit', 'geometry') OR DATA_TYPE LIKE '%blob' AS SIGNED)
         AS binary_data
     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION";
@@ -122,7 +123,8 @@ const MYSQL_TABLE_COLUMNS: &str = "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_DEFAU
     CAST(IS_NULLABLE = 'YES' AS SIGNED) AS nullable,
     CAST(COLUMN_KEY = 'PRI' AS SIGNED) AS primary_key,
     CAST(EXTRA LIKE '%auto_increment%' AS SIGNED) AS auto_increment,
-    CAST(EXTRA LIKE '%GENERATED%' AS SIGNED) AS generated,
+    CAST(EXTRA LIKE '%VIRTUAL GENERATED%' OR EXTRA LIKE '%STORED GENERATED%' AS SIGNED)
+        AS is_generated,
     CAST(DATA_TYPE IN ('binary', 'varbinary', 'bit', 'geometry') OR DATA_TYPE LIKE '%blob' AS SIGNED)
         AS binary_data
     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -139,7 +141,7 @@ fn mysql_column(row: &MySqlRow) -> Result<SchemaColumn, sqlx::Error> {
             .filter(|value| value != "NULL"),
         primary_key: row.try_get::<i64, _>("primary_key")? != 0,
         auto_increment: row.try_get::<i64, _>("auto_increment")? != 0,
-        generated: row.try_get::<i64, _>("generated")? != 0,
+        generated: row.try_get::<i64, _>("is_generated")? != 0,
         binary: row.try_get::<Option<i64>, _>("binary_data")?.unwrap_or(0) != 0,
     })
 }
@@ -194,12 +196,15 @@ impl ExplorerConnection for MysqlExplorer {
     }
 
     async fn set_read_only(&mut self, read_only: bool) -> Result<(), anyhow::Error> {
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "SET SESSION transaction_read_only = {}",
-            if read_only { 1 } else { 0 }
-        )))
-        .execute(&mut *self.connection)
-        .await?;
+        let statement = if read_only {
+            "SET SESSION TRANSACTION READ ONLY"
+        } else {
+            "SET SESSION TRANSACTION READ WRITE"
+        };
+
+        sqlx::raw_sql(statement)
+            .execute(&mut *self.connection)
+            .await?;
 
         Ok(())
     }
