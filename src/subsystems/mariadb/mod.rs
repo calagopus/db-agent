@@ -40,6 +40,7 @@ pub async fn run(
     let bind = config.load().mariadb.bind;
 
     let listener = TcpListener::bind(bind).await?;
+    crate::net::apply_socket_congestion_control(&listener, &config);
     status.mark_running();
     tracing::info!(
         "mariadb listening on {bind} (client TLS: {})",

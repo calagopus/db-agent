@@ -54,6 +54,7 @@ regex = "1.13.0"
 url = "2.5.8"
 percent-encoding = "2.3.2"
 cap-std = "4.0.0"
+rustix = { version = "1.0.7", features = ["process", "net"] }
 clap = { version = "4.5.37", features = ["derive", "string"] }
 clap_complete = "4.6.7"
 dialoguer = "0.12.0"

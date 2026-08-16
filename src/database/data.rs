@@ -81,6 +81,8 @@ pub struct StoredInstance {
     pub memory: i64,
     pub swap: i64,
     pub disk: i64,
+    /// Only has an effect with a scheduler that implements weights, CFQ on
+    /// cgroup v1 and BFQ or iocost on v2. It is silently ignored otherwise.
     pub io_weight: Option<i64>,
     pub cpu: i64,
     pub image: String,

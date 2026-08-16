@@ -992,6 +992,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rustc-hash",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",

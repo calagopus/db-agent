@@ -100,11 +100,15 @@ fn api_remote_import_blocked_cidrs() -> Vec<cidr::IpCidr> {
     }
 }
 
+fn tcp_congestion_control() -> String {
+    "bbr".to_string()
+}
+
 fn docker_socket() -> String {
     "/var/run/docker.sock".to_string()
 }
-fn docker_tmpfs_size() -> u64 {
-    100
+fn docker_tmpfs_size() -> MiB {
+    100u64.into()
 }
 fn docker_container_pid_limit() -> u64 {
     512
@@ -130,6 +134,15 @@ fn docker_registry_image_fetch_cache_enabled() -> bool {
 fn docker_registry_image_fetch_cache_duration() -> u64 {
     5 * 60
 }
+fn docker_cpu_period() -> u64 {
+    100000
+}
+fn docker_cfs_burst_enabled() -> bool {
+    true
+}
+fn docker_cfs_burst_multiple() -> f64 {
+    1.0
+}
 fn docker_log_config_type() -> String {
     "local".to_string()
 }
@@ -139,6 +152,36 @@ fn docker_log_config_config() -> BTreeMap<String, String> {
         ("max-file".to_string(), "1".to_string()),
         ("compress".to_string(), "false".to_string()),
     ])
+}
+
+/// Represents a size in Mebibytes (MiB). The inner value is the number of MiB (not bytes!!).
+#[derive(
+    ToSchema, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default,
+)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct MiB(u64);
+
+impl MiB {
+    pub fn as_bytes(self) -> u64 {
+        self.0 * 1024 * 1024
+    }
+
+    pub fn as_mib(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for MiB {
+    fn from(value: u64) -> Self {
+        MiB(value)
+    }
+}
+
+impl From<i64> for MiB {
+    fn from(value: i64) -> Self {
+        MiB(value as u64)
+    }
 }
 
 #[derive(Clone, ToSchema, Deserialize, Serialize, DefaultFromSerde)]
@@ -174,6 +217,9 @@ nestify::nest! {
 
         #[serde(default = "websocket_log_count")]
         pub websocket_log_count: usize,
+
+        #[serde(default = "tcp_congestion_control")]
+        pub tcp_congestion_control: String,
 
         #[serde(default)]
         #[schema(inline)]
@@ -246,13 +292,38 @@ nestify::nest! {
             }>,
 
             #[serde(default = "docker_tmpfs_size")]
-            pub tmpfs_size: u64,
+            pub tmpfs_size: MiB,
+            #[serde(default)]
+            pub shm_size: MiB,
             #[serde(default = "docker_container_pid_limit")]
             pub container_pid_limit: u64,
+            #[serde(default)]
+            pub container_apparmor_profile: String,
+            #[serde(default)]
+            #[schema(inline)]
+            pub container_ulimits: Vec<#[derive(Clone, ToSchema, Deserialize, Serialize)] pub struct DockerUlimit {
+                pub name: String,
+                pub soft: i64,
+                pub hard: i64,
+            }>,
+            #[serde(default)]
+            pub container_sysctls: HashMap<String, String>,
             #[serde(default = "docker_timezone")]
             pub timezone: String,
             #[serde(default)]
             pub userns_mode: String,
+
+            #[serde(default = "docker_cpu_period")]
+            pub cpu_period: u64,
+
+            #[serde(default)]
+            #[schema(inline)]
+            pub cfs_burst: #[derive(Clone, Copy, ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct DockerCfsBurst {
+                #[serde(default = "docker_cfs_burst_enabled")]
+                pub enabled: bool,
+                #[serde(default = "docker_cfs_burst_multiple")]
+                pub multiple: f64,
+            },
 
             #[serde(default)]
             #[schema(inline)]
@@ -261,6 +332,8 @@ nestify::nest! {
                 pub enabled: bool,
                 #[serde(default = "docker_registry_image_fetch_cache_duration")]
                 pub duration: u64,
+                #[serde(default)]
+                pub background_refresh: bool,
             },
 
             #[serde(default)]
@@ -308,6 +381,13 @@ nestify::nest! {
         pub ignore_config_updates: bool,
         #[serde(default)]
         pub ignore_upgrades: bool,
+    }
+}
+
+impl Docker {
+    /// The configured CFS period in microseconds, clamped to what the kernel accepts.
+    pub fn cpu_period_us(&self) -> i64 {
+        self.cpu_period.clamp(1000, 1000000) as i64
     }
 }
 

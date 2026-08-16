@@ -469,12 +469,10 @@ async fn main_rt() {
                 acceptor.mode()
             );
 
-            match axum_server::bind(address)
-                .acceptor(acceptor)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await
+            let listener = match std::net::TcpListener::bind(address)
+                .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
             {
-                Ok(_) => {}
+                Ok(listener) => listener,
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AddrInUse {
                         exit_error!("failed to start https server ({} already in use)", address);
@@ -482,6 +480,20 @@ async fn main_rt() {
                         exit_error!("failed to start https server: {:?}", err);
                     }
                 }
+            };
+            crate::net::apply_socket_congestion_control(&listener, &config);
+
+            let server = match axum_server::from_tcp(listener) {
+                Ok(server) => server,
+                Err(err) => exit_error!("failed to start https server: {:?}", err),
+            };
+
+            if let Err(err) = server
+                .acceptor(acceptor)
+                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+            {
+                exit_error!("failed to start https server: {:?}", err);
             }
         } else {
             tracing::info!(
@@ -491,17 +503,20 @@ async fn main_rt() {
                 state.start_time.elapsed().as_millis()
             );
 
-            match axum::serve(
-                match tokio::net::TcpListener::bind(address).await {
-                    Ok(listener) => listener,
-                    Err(err) => {
-                        if err.kind() == std::io::ErrorKind::AddrInUse {
-                            exit_error!("failed to start http server ({} already in use)", address);
-                        } else {
-                            exit_error!("failed to start http server: {:?}", err);
-                        }
+            let listener = match tokio::net::TcpListener::bind(address).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        exit_error!("failed to start http server ({} already in use)", address);
+                    } else {
+                        exit_error!("failed to start http server: {:?}", err);
                     }
-                },
+                }
+            };
+            crate::net::apply_socket_congestion_control(&listener, &config);
+
+            match axum::serve(
+                listener,
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
