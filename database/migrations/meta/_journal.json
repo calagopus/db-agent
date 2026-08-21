@@ -22,6 +22,13 @@
       "when": 1787218104130,
       "tag": "0002_user_database_permissions",
       "breakpoints": false
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1787302450860,
+      "tag": "0003_instance_state",
+      "breakpoints": false
     }
   ]
 }

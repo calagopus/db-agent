@@ -44,6 +44,9 @@ fn disk_check_interval() -> u64 {
 fn disk_check_concurrency() -> usize {
     5
 }
+fn boot_autostart_concurrency() -> usize {
+    5
+}
 fn websocket_log_count() -> usize {
     150
 }
@@ -214,6 +217,9 @@ nestify::nest! {
         pub disk_check_interval: u64,
         #[serde(default = "disk_check_concurrency")]
         pub disk_check_concurrency: usize,
+
+        #[serde(default = "boot_autostart_concurrency")]
+        pub boot_autostart_concurrency: usize,
 
         #[serde(default = "websocket_log_count")]
         pub websocket_log_count: usize,

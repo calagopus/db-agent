@@ -847,9 +847,9 @@ impl Instance {
         Ok(())
     }
 
-    pub async fn attach_container(&self) {
+    pub async fn attach_container(&self) -> bool {
         if self.process_handle.read().await.is_some() {
-            return;
+            return true;
         }
 
         tracing::info!(instance = %self.uuid, "attaching to container");
@@ -862,9 +862,13 @@ impl Instance {
         {
             Ok(handle) => {
                 *self.process_handle.write().await = Some(handle);
+
+                true
             }
             Err(err) => {
                 tracing::debug!(instance = %self.uuid, "no running container to attach to: {}", err);
+
+                false
             }
         }
     }

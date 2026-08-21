@@ -7,6 +7,7 @@ export const instances = sqliteTable(
     uuid: blob().primaryKey().notNull(),
     uuid_short: integer().notNull(),
     database_type: text().notNull(),
+    state: text({ enum: ['offline', 'starting', 'stopping', 'running'] }).default('offline').notNull(),
     suspended: integer({ mode: 'boolean' }).default(false).notNull(),
     memory: integer().notNull(),
     swap: integer().notNull(),
@@ -27,6 +28,7 @@ export const instances = sqliteTable(
   (cols) => [
     index('instances_database_type_idx').on(cols.database_type),
     uniqueIndex('instances_uuid_short_idx').on(cols.uuid_short),
+    check('instances_state_check', sql`${cols.state} in ('offline', 'starting', 'stopping', 'running')`),
   ],
 );
 

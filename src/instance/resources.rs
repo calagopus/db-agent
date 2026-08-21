@@ -23,6 +23,17 @@ impl ContainerState {
             ContainerState::Running => "running",
         }
     }
+
+    #[inline]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "offline" => Some(ContainerState::Offline),
+            "starting" => Some(ContainerState::Starting),
+            "stopping" => Some(ContainerState::Stopping),
+            "running" => Some(ContainerState::Running),
+            _ => None,
+        }
+    }
 }
 
 #[derive(ToSchema, Default, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
