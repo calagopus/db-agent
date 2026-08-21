@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm"
-import { integer, blob, index, text, sqliteTable, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { integer, blob, check, index, text, primaryKey, sqliteTable, uniqueIndex } from "drizzle-orm/sqlite-core"
 
 export const instances = sqliteTable(
   'instances',
@@ -50,15 +50,28 @@ export const users = sqliteTable(
     uuid: blob().primaryKey().notNull(),
     uuid_short: integer().notNull(),
     instance_uuid: blob().notNull().references(() => instances.uuid, { onDelete: 'cascade' }),
-    database_uuid: blob().references(() => databases.uuid, { onDelete: 'cascade' }),
     username: text().notNull(),
     password: text().notNull(),
     created: integer({ mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
   },
   (cols) => [
     index('users_instance_uuid_idx').on(cols.instance_uuid),
-    index('users_database_uuid_idx').on(cols.database_uuid),
     index('users_username_idx').on(cols.username),
     uniqueIndex('users_uuid_short_idx').on(cols.uuid_short),
+  ],
+);
+
+export const userDatabases = sqliteTable(
+  'user_databases',
+  {
+    user_uuid: blob().notNull().references(() => users.uuid, { onDelete: 'cascade' }),
+    database_uuid: blob().notNull().references(() => databases.uuid, { onDelete: 'cascade' }),
+    permission: text({ enum: ['read_only', 'read_write'] }).notNull(),
+    created: integer({ mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
+  },
+  (cols) => [
+    primaryKey({ columns: [cols.user_uuid, cols.database_uuid] }),
+    index('user_databases_database_uuid_idx').on(cols.database_uuid),
+    check('user_databases_permission_check', sql`${cols.permission} in ('read_only', 'read_write')`),
   ],
 );

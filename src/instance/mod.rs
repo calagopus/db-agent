@@ -1,6 +1,7 @@
 use crate::{instance::identifier::UserIdentifier, io::SafeSliceExt};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, Row};
 use std::{
     ops::Deref,
     path::PathBuf,
@@ -29,27 +30,6 @@ pub mod websocket;
 
 pub const STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
 
-/// redis-cli cannot restore an rdb, so the export has to be a command stream for
-/// `--pipe`. building it inside lua keeps binary keys and values away from the
-/// shell, `..` concatenation is byte safe where `string.format("%s")` is not
-const REDIS_DUMP_SCRIPT: &str = r#"local out={"*2\r\n$6\r\nSELECT\r\n$"..#ARGV[1].."\r\n"..ARGV[1].."\r\n"}
-local c="0"
-repeat
-  local s=redis.call("SCAN",c,"COUNT",512)
-  c=s[1]
-  for i=1,#s[2] do
-    local k=s[2][i]
-    local v=redis.call("DUMP",k)
-    if v then
-      local t=redis.call("PTTL",k)
-      if t<0 then t=0 end
-      t=string.format("%d",t)
-      out[#out+1]="*5\r\n$7\r\nRESTORE\r\n$"..#k.."\r\n"..k.."\r\n$"..#t.."\r\n"..t.."\r\n$"..#v.."\r\n"..v.."\r\n$7\r\nREPLACE\r\n"
-    end
-  end
-until c=="0"
-return table.concat(out)"#;
-
 pub fn validate_database_name(value: &str, _ctx: &()) -> garde::Result {
     if !(1..=63).contains(&value.len()) {
         return Err(garde::Error::new("must be between 1 and 63 characters"));
@@ -61,8 +41,6 @@ pub fn validate_database_name(value: &str, _ctx: &()) -> garde::Result {
     Ok(())
 }
 
-/// database names on a foreign server are not ours to name, this only rejects what
-/// would break the value out of its slot on a dump command line
 pub fn validate_source_database_name(value: &str, _ctx: &()) -> garde::Result {
     if !(1..=64).contains(&value.len()) {
         return Err(garde::Error::new("must be between 1 and 64 characters"));
@@ -122,6 +100,40 @@ impl DatabaseType {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, ToSchema, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DatabasePermission {
+    None,
+    ReadOnly,
+    ReadWrite,
+}
+
+impl DatabasePermission {
+    #[inline]
+    pub fn to_db_str(self) -> Option<&'static str> {
+        match self {
+            DatabasePermission::None => None,
+            DatabasePermission::ReadOnly => Some("read_only"),
+            DatabasePermission::ReadWrite => Some("read_write"),
+        }
+    }
+
+    #[inline]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "read_only" => Some(DatabasePermission::ReadOnly),
+            "read_write" => Some(DatabasePermission::ReadWrite),
+            _ => None,
+        }
+    }
+}
+
+fn duplicate_database_permission() -> anyhow::Error {
+    crate::response::DisplayError::new("the same database appears twice in the permission list")
+        .with_status(axum::http::StatusCode::BAD_REQUEST)
+        .into()
 }
 
 pub struct InnerInstance {
@@ -327,6 +339,19 @@ impl Instance {
         .await?)
     }
 
+    async fn get_database_by_name(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::database::data::StoredDatabase>> {
+        Ok(sqlx::query_as::<_, crate::database::data::StoredDatabase>(
+            "SELECT * FROM databases WHERE instance_uuid = ? AND name = ?",
+        )
+        .bind(self.uuid)
+        .bind(name)
+        .fetch_optional(self.app_state.database.read())
+        .await?)
+    }
+
     pub async fn get_database(
         &self,
         uuid: uuid::Uuid,
@@ -378,14 +403,15 @@ impl Instance {
     ) -> anyhow::Result<()> {
         self.ensure_acl_writable("delete a database").await?;
 
-        for user in self.get_database_users(database.uuid).await? {
-            self.delete_user(&user).await?;
+        let connection = self.acl_connection().await?;
+        for (user, _) in self.get_database_users(database.uuid).await? {
+            let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
+            connection
+                .apply_permission(&identifier, &database.name, DatabasePermission::None)
+                .await?;
         }
 
-        self.acl_connection()
-            .await?
-            .delete_database(&database.name)
-            .await?;
+        connection.delete_database(&database.name).await?;
 
         sqlx::query("DELETE FROM databases WHERE uuid = ?")
             .bind(database.uuid)
@@ -401,17 +427,37 @@ impl Instance {
     ) -> anyhow::Result<()> {
         self.ensure_acl_writable("recreate a database").await?;
 
-        let users = self
-            .get_database_users(database.uuid)
-            .await?
-            .into_iter()
-            .map(|user| UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username))
-            .collect::<Result<Vec<_>, _>>()?;
+        let connection = self.acl_connection().await?;
+        connection.delete_database(&database.name).await?;
+        connection.create_database(&database.name).await?;
 
-        self.acl_connection()
-            .await?
-            .recreate_database(&database.name, &users)
-            .await?;
+        self.resync_database_acl(connection.as_ref(), database)
+            .await
+    }
+
+    async fn resync_database_acl_by_name(&self, name: &str) -> anyhow::Result<()> {
+        let Some(database) = self.get_database_by_name(name).await? else {
+            return Ok(());
+        };
+        let connection = self.acl_connection().await?;
+
+        self.resync_database_acl(connection.as_ref(), &database)
+            .await
+    }
+
+    async fn resync_database_acl(
+        &self,
+        connection: &dyn connection::DatabaseConnection,
+        database: &crate::database::data::StoredDatabase,
+    ) -> anyhow::Result<()> {
+        connection.bootstrap_database(&database.name).await?;
+
+        for (user, permission) in self.get_database_users(database.uuid).await? {
+            let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
+            connection
+                .apply_permission(&identifier, &database.name, permission)
+                .await?;
+        }
 
         Ok(())
     }
@@ -419,72 +465,126 @@ impl Instance {
     async fn get_database_users(
         &self,
         database_uuid: uuid::Uuid,
-    ) -> anyhow::Result<Vec<crate::database::data::StoredUser>> {
-        Ok(sqlx::query_as::<_, crate::database::data::StoredUser>(
-            "SELECT * FROM users WHERE instance_uuid = ? AND database_uuid = ?",
+    ) -> anyhow::Result<Vec<(crate::database::data::StoredUser, DatabasePermission)>> {
+        let mut rows = sqlx::query(
+            "SELECT users.*, user_databases.permission FROM users
+             JOIN user_databases ON user_databases.user_uuid = users.uuid
+             WHERE users.instance_uuid = ? AND user_databases.database_uuid = ?",
         )
         .bind(self.uuid)
         .bind(database_uuid)
-        .fetch_all(self.app_state.database.read())
-        .await?)
+        .fetch(self.app_state.database.read());
+
+        let mut users = Vec::new();
+        while let Some(row) = rows.try_next().await? {
+            let permission = crate::database::data::decode_permission(&row)?;
+            users.push((
+                crate::database::data::StoredUser::from_row(&row)?,
+                permission,
+            ));
+        }
+
+        Ok(users)
     }
 
     pub async fn get_users(&self) -> anyhow::Result<Vec<crate::database::data::StoredUser>> {
-        Ok(sqlx::query_as::<_, crate::database::data::StoredUser>(
+        let mut users = sqlx::query_as::<_, crate::database::data::StoredUser>(
             "SELECT * FROM users WHERE instance_uuid = ?",
         )
         .bind(self.uuid)
         .fetch_all(self.app_state.database.read())
-        .await?)
+        .await?;
+
+        let mut links = sqlx::query(
+            "SELECT user_databases.* FROM user_databases
+             JOIN users ON users.uuid = user_databases.user_uuid
+             WHERE users.instance_uuid = ?",
+        )
+        .bind(self.uuid)
+        .fetch(self.app_state.database.read());
+
+        let mut by_user: rustc_hash::FxHashMap<uuid::Uuid, Vec<_>> = Default::default();
+        while let Some(row) = links.try_next().await? {
+            by_user
+                .entry(row.try_get("user_uuid")?)
+                .or_default()
+                .push(crate::database::data::StoredUserDatabase::from_row(&row)?);
+        }
+
+        for user in &mut users {
+            user.databases = by_user.remove(&user.uuid).unwrap_or_default();
+        }
+
+        Ok(users)
     }
 
     pub async fn get_user(
         &self,
         uuid: uuid::Uuid,
     ) -> anyhow::Result<Option<crate::database::data::StoredUser>> {
-        Ok(sqlx::query_as::<_, crate::database::data::StoredUser>(
+        let user = sqlx::query_as::<_, crate::database::data::StoredUser>(
             "SELECT * FROM users WHERE instance_uuid = ? AND uuid = ?",
         )
         .bind(self.uuid)
         .bind(uuid)
         .fetch_optional(self.app_state.database.read())
-        .await?)
+        .await?;
+
+        let Some(mut user) = user else {
+            return Ok(None);
+        };
+
+        user.databases = sqlx::query_as::<_, crate::database::data::StoredUserDatabase>(
+            "SELECT * FROM user_databases WHERE user_uuid = ?",
+        )
+        .bind(user.uuid)
+        .fetch_all(self.app_state.database.read())
+        .await?;
+
+        Ok(Some(user))
     }
 
     pub async fn create_user(
         &self,
         username: &str,
-        database_uuid: Option<uuid::Uuid>,
+        databases: &[(uuid::Uuid, DatabasePermission)],
     ) -> anyhow::Result<crate::database::data::StoredUser> {
         self.ensure_acl_writable("create a user").await?;
 
-        let database = match database_uuid {
-            Some(database_uuid) => Some(
-                self.get_database(database_uuid)
-                    .await?
-                    .ok_or_else(|| crate::response::DisplayError::new("database not found"))?,
-            ),
-            None => None,
-        };
+        let mut named = rustc_hash::FxHashSet::default();
+        let mut grants = Vec::with_capacity(databases.len());
+        for (database_uuid, permission) in databases {
+            if !named.insert(*database_uuid) {
+                return Err(duplicate_database_permission());
+            }
+            if *permission == DatabasePermission::None {
+                continue;
+            }
+
+            let database = self
+                .get_database(*database_uuid)
+                .await?
+                .ok_or_else(|| crate::response::DisplayError::new("database not found"))?;
+            grants.push((database, *permission));
+        }
 
         let connection = self.acl_connection().await?;
         let password = crate::utils::generate_password();
         let password = password.as_str();
 
-        let user = loop {
+        let mut user = loop {
             let uuid = uuid::Uuid::new_v4();
             let uuid_short = uuid.as_fields().0;
             UserIdentifier::from_parts(uuid_short, username)?;
             let created = chrono::Utc::now();
 
             match sqlx::query(
-                "INSERT INTO users (uuid, uuid_short, instance_uuid, database_uuid, username, password, created)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO users (uuid, uuid_short, instance_uuid, username, password, created)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid)
             .bind(uuid_short as i64)
             .bind(self.uuid)
-            .bind(database_uuid)
             .bind(username)
             .bind(password)
             .bind(created.timestamp())
@@ -496,9 +596,9 @@ impl Instance {
                         uuid,
                         uuid_short: uuid_short as i64,
                         instance_uuid: self.uuid,
-                        database_uuid,
                         username: username.to_string(),
                         password: password.to_string(),
+                        databases: Vec::with_capacity(grants.len()),
                         created,
                     };
                 }
@@ -508,18 +608,28 @@ impl Instance {
         };
 
         let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, username)?;
-        if let Err(err) = connection.create_user(&identifier, password).await {
-            sqlx::query("DELETE FROM users WHERE uuid = ?")
-                .bind(user.uuid)
-                .execute(self.app_state.database.write())
-                .await?;
-            return Err(err);
-        }
+        let mut backend_created = false;
+        let result = async {
+            connection.create_user(&identifier, password).await?;
+            backend_created = true;
 
-        if let Some(database) = &database
-            && let Err(err) = connection.grant_user(&identifier, &database.name).await
-        {
-            let _ = connection.delete_user(&identifier).await;
+            for (database, permission) in &grants {
+                user.databases
+                    .push(self.link_user(&user, database, *permission).await?);
+                connection
+                    .apply_permission(&identifier, &database.name, *permission)
+                    .await?;
+            }
+
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            if backend_created {
+                let _ = connection.delete_user(&identifier).await;
+            }
+
             sqlx::query("DELETE FROM users WHERE uuid = ?")
                 .bind(user.uuid)
                 .execute(self.app_state.database.write())
@@ -530,6 +640,148 @@ impl Instance {
         self.route_inserter.insert(identifier, password);
 
         Ok(user)
+    }
+
+    pub async fn set_user_permission(
+        &self,
+        user: &crate::database::data::StoredUser,
+        database: &crate::database::data::StoredDatabase,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<Option<crate::database::data::StoredUserDatabase>> {
+        self.ensure_acl_writable("change a user's permissions")
+            .await?;
+
+        let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
+        let connection = self.acl_connection().await?;
+
+        self.apply_permission(connection.as_ref(), &identifier, user, database, permission)
+            .await
+    }
+
+    pub async fn set_user_permissions(
+        &self,
+        user: &crate::database::data::StoredUser,
+        databases: &[(uuid::Uuid, DatabasePermission)],
+    ) -> anyhow::Result<Vec<crate::database::data::StoredUserDatabase>> {
+        self.ensure_acl_writable("change a user's permissions")
+            .await?;
+
+        let mut named = rustc_hash::FxHashSet::default();
+        let mut changes = Vec::with_capacity(databases.len() + user.databases.len());
+
+        for (database_uuid, permission) in databases {
+            if !named.insert(*database_uuid) {
+                return Err(duplicate_database_permission());
+            }
+
+            let database = self
+                .get_database(*database_uuid)
+                .await?
+                .ok_or_else(|| crate::response::DisplayError::new("database not found"))?;
+            changes.push((database, *permission));
+        }
+
+        for existing in &user.databases {
+            if named.contains(&existing.database_uuid) {
+                continue;
+            }
+
+            if let Some(database) = self.get_database(existing.database_uuid).await? {
+                changes.push((database, DatabasePermission::None));
+            }
+        }
+
+        let identifier = UserIdentifier::from_parts(user.uuid.as_fields().0, &user.username)?;
+        let connection = self.acl_connection().await?;
+
+        let mut links = Vec::with_capacity(changes.len());
+        for (applied, (database, permission)) in changes.iter().enumerate() {
+            let link = self
+                .apply_permission(
+                    connection.as_ref(),
+                    &identifier,
+                    user,
+                    database,
+                    *permission,
+                )
+                .await
+                .inspect_err(|err| {
+                    if applied > 0 {
+                        tracing::warn!(
+                            instance = %self.uuid,
+                            user = %user.uuid,
+                            database = %database.name,
+                            "failed to change a permission with {applied} already applied: {err:#}"
+                        );
+                    }
+                })?;
+
+            if let Some(link) = link {
+                links.push(link);
+            }
+        }
+
+        Ok(links)
+    }
+
+    async fn apply_permission(
+        &self,
+        connection: &dyn connection::DatabaseConnection,
+        identifier: &UserIdentifier,
+        user: &crate::database::data::StoredUser,
+        database: &crate::database::data::StoredDatabase,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<Option<crate::database::data::StoredUserDatabase>> {
+        connection
+            .apply_permission(identifier, &database.name, permission)
+            .await?;
+
+        let stored = if permission == DatabasePermission::None {
+            sqlx::query("DELETE FROM user_databases WHERE user_uuid = ? AND database_uuid = ?")
+                .bind(user.uuid)
+                .bind(database.uuid)
+                .execute(self.app_state.database.write())
+                .await
+                .map(|_| None)
+                .map_err(anyhow::Error::from)
+        } else {
+            self.link_user(user, database, permission).await.map(Some)
+        };
+
+        stored.inspect_err(|err| {
+            tracing::warn!(
+                instance = %self.uuid,
+                user = %user.uuid,
+                database = %database.name,
+                "applied a permission on the backend but failed to store it: {err:#}"
+            );
+        })
+    }
+
+    async fn link_user(
+        &self,
+        user: &crate::database::data::StoredUser,
+        database: &crate::database::data::StoredDatabase,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<crate::database::data::StoredUserDatabase> {
+        let created: i64 = sqlx::query_scalar(
+            "INSERT INTO user_databases (user_uuid, database_uuid, permission, created)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (user_uuid, database_uuid) DO UPDATE SET permission = excluded.permission
+             RETURNING created",
+        )
+        .bind(user.uuid)
+        .bind(database.uuid)
+        .bind(permission.to_db_str())
+        .bind(chrono::Utc::now().timestamp())
+        .fetch_one(self.app_state.database.write())
+        .await?;
+
+        Ok(crate::database::data::StoredUserDatabase {
+            database_uuid: database.uuid,
+            permission,
+            created: chrono::DateTime::from_timestamp(created, 0).unwrap_or_default(),
+        })
     }
 
     pub async fn rotate_password(
@@ -735,11 +987,27 @@ impl Instance {
                     None => format!("mongodump --uri={uri}{auth} --archive"),
                 }
             }
-            // every non empty database is dumped on its own, the SELECT that
-            // targets it is emitted by the script
             DatabaseType::Redis => {
                 let socket = crate::utils::shell_quote(socket);
-                let script = crate::utils::shell_quote(REDIS_DUMP_SCRIPT);
+                let script = crate::utils::shell_quote(
+                    r#"local out={"*2\r\n$6\r\nSELECT\r\n$"..#ARGV[1].."\r\n"..ARGV[1].."\r\n"}
+local c="0"
+repeat
+  local s=redis.call("SCAN",c,"COUNT",512)
+  c=s[1]
+  for i=1,#s[2] do
+    local k=s[2][i]
+    local v=redis.call("DUMP",k)
+    if v then
+      local t=redis.call("PTTL",k)
+      if t<0 then t=0 end
+      t=string.format("%d",t)
+      out[#out+1]="*5\r\n$7\r\nRESTORE\r\n$"..#k.."\r\n"..k.."\r\n$"..#t.."\r\n"..t.."\r\n$"..#v.."\r\n"..v.."\r\n$7\r\nREPLACE\r\n"
+    end
+  end
+until c=="0"
+return table.concat(out)"#,
+                );
 
                 format!(
                     r#"set -e; keyspace=$(redis-cli -s {socket} --raw INFO keyspace); for db in $(printf %s "$keyspace" | sed -n 's/^db\([0-9][0-9]*\):.*/\1/p'); do redis-cli -s {socket} -n "$db" --raw EVAL {script} 0 "$db"; done"#
@@ -766,9 +1034,6 @@ impl Instance {
         )))
     }
 
-    /// an uploaded dump is taken as it is, so source_db can only ever select a
-    /// database out of a mongodb archive, and only with a db to put it in. the
-    /// remote route dumps the source itself and calls import_inner instead
     pub async fn import(
         &self,
         db: Option<&str>,
@@ -794,8 +1059,6 @@ impl Instance {
         self.import_inner(db, source_db, wipe, reader).await
     }
 
-    /// the checks an import must fail on before anything is executed, so a
-    /// background import can be refused synchronously
     pub async fn check_import(
         &self,
         db: Option<&str>,
@@ -966,12 +1229,25 @@ impl Instance {
 
         let mut write = std::pin::pin!(write);
         let mut drain = std::pin::pin!(drain);
-        tokio::select! {
+        let result = tokio::select! {
             // the side that failed first has the useful error, a dead source leaves
             // the target failing on a truncated dump
             drained = &mut drain => drained,
             written = &mut write => written.and(drain.await),
+        };
+
+        if wipe
+            && let Some(db) = db
+            && let Err(err) = self.resync_database_acl_by_name(db).await
+        {
+            tracing::warn!(
+                instance = %self.uuid,
+                database = %db,
+                "failed to reapply permissions after a wiped import: {err:#}"
+            );
         }
+
+        result
     }
 
     pub async fn logs(&self, lines: Option<usize>) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {

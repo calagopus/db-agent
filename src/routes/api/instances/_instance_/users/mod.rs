@@ -1,7 +1,25 @@
 use super::State;
+use garde::Validate;
+use serde::Deserialize;
+use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 pub mod _user_;
+
+#[derive(ToSchema, Validate, Deserialize)]
+pub struct UserDatabase {
+    #[garde(skip)]
+    pub database_uuid: uuid::Uuid,
+    #[garde(skip)]
+    pub permission: crate::instance::DatabasePermission,
+}
+
+impl UserDatabase {
+    #[inline]
+    pub fn into_pair(self) -> (uuid::Uuid, crate::instance::DatabasePermission) {
+        (self.database_uuid, self.permission)
+    }
+}
 
 mod get {
     use crate::{
@@ -48,8 +66,9 @@ mod post {
     pub struct Payload {
         #[garde(length(chars, min = 2, max = 23), ascii, alphanumeric)]
         username: String,
-        #[garde(skip)]
-        database_uuid: Option<uuid::Uuid>,
+        #[serde(default)]
+        #[garde(dive)]
+        databases: Vec<super::UserDatabase>,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -79,9 +98,13 @@ mod post {
                 .ok();
         }
 
-        let user = instance
-            .create_user(&data.username, data.database_uuid)
-            .await?;
+        let databases: Vec<_> = data
+            .databases
+            .into_iter()
+            .map(super::UserDatabase::into_pair)
+            .collect();
+
+        let user = instance.create_user(&data.username, &databases).await?;
         let username = crate::instance::identifier::UserIdentifier::from_parts(
             user.uuid.as_fields().0,
             &user.username,

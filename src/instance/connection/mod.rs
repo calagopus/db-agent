@@ -1,4 +1,4 @@
-use super::identifier::UserIdentifier;
+use super::{DatabasePermission, identifier::UserIdentifier};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -14,8 +14,6 @@ pub struct QueryResult {
     pub rows_affected: u64,
 }
 
-/// a server reported failure comes from the caller's own query, a transport level one does not
-/// and keeps its opaque status so socket paths stay internal
 pub fn query_error(err: anyhow::Error) -> anyhow::Error {
     let message = if let Some(sqlx::Error::Database(err)) = err.downcast_ref::<sqlx::Error>() {
         Some(err.message().to_string())
@@ -53,12 +51,20 @@ pub trait DatabaseConnection: Send + Sync {
     ) -> anyhow::Result<()>;
     async fn delete_user(&self, user: &UserIdentifier) -> anyhow::Result<()>;
 
-    async fn grant_user(&self, user: &UserIdentifier, database: &str) -> anyhow::Result<()>;
+    async fn apply_permission(
+        &self,
+        user: &UserIdentifier,
+        database: &str,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<()>;
 
     async fn create_database(&self, name: &str) -> anyhow::Result<()>;
     async fn delete_database(&self, name: &str) -> anyhow::Result<()>;
-    async fn recreate_database(&self, name: &str, users: &[UserIdentifier]) -> anyhow::Result<()>;
     async fn get_size(&self, name: &str) -> anyhow::Result<i64>;
+
+    async fn bootstrap_database(&self, _name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn query(&self, db: Option<&str>, query: &str) -> anyhow::Result<QueryResult>;
 }

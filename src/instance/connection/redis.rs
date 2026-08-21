@@ -1,4 +1,7 @@
-use super::{super::identifier::UserIdentifier, DatabaseConnection, QueryResult};
+use super::{
+    super::{DatabasePermission, identifier::UserIdentifier},
+    DatabaseConnection, QueryResult,
+};
 use std::path::PathBuf;
 
 fn value_to_json(value: redis::Value) -> serde_json::Value {
@@ -67,7 +70,12 @@ impl DatabaseConnection for RedisConnection {
         Ok(())
     }
 
-    async fn grant_user(&self, _user: &UserIdentifier, _database: &str) -> anyhow::Result<()> {
+    async fn apply_permission(
+        &self,
+        _user: &UserIdentifier,
+        _database: &str,
+        _permission: DatabasePermission,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -76,14 +84,6 @@ impl DatabaseConnection for RedisConnection {
     }
 
     async fn delete_database(&self, _name: &str) -> anyhow::Result<()> {
-        Err(no_databases())
-    }
-
-    async fn recreate_database(
-        &self,
-        _name: &str,
-        _users: &[UserIdentifier],
-    ) -> anyhow::Result<()> {
         Err(no_databases())
     }
 

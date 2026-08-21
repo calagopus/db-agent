@@ -15,6 +15,13 @@
       "when": 1784379634558,
       "tag": "0001_sticky_alex_power",
       "breakpoints": false
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787218104130,
+      "tag": "0002_user_database_permissions",
+      "breakpoints": false
     }
   ]
 }

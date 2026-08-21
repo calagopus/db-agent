@@ -1,6 +1,7 @@
 use super::State;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+mod databases;
 mod rotate_password;
 
 mod get {
@@ -99,6 +100,7 @@ mod delete {
 
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
+        .nest("/databases", databases::router(state))
         .nest("/rotate-password", rotate_password::router(state))
         .routes(routes!(get::route))
         .routes(routes!(delete::route))

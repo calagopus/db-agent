@@ -1,4 +1,4 @@
-use crate::instance::DatabaseType;
+use crate::instance::{DatabasePermission, DatabaseType};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Row, sqlite::SqliteRow};
 use std::collections::BTreeMap;
@@ -11,6 +11,17 @@ fn decode_created(row: &SqliteRow) -> Result<chrono::DateTime<chrono::Utc>, sqlx
         source: Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid created timestamp: {secs}"),
+        )),
+    })
+}
+
+pub(crate) fn decode_permission(row: &SqliteRow) -> Result<DatabasePermission, sqlx::Error> {
+    let raw = row.try_get::<String, _>("permission")?;
+    DatabasePermission::from_db_str(&raw).ok_or_else(|| sqlx::Error::ColumnDecode {
+        index: "permission".into(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid database permission: {raw}"),
         )),
     })
 }
@@ -369,9 +380,11 @@ pub struct StoredUser {
     pub uuid: uuid::Uuid,
     pub uuid_short: i64,
     pub instance_uuid: uuid::Uuid,
-    pub database_uuid: Option<uuid::Uuid>,
     pub username: String,
     pub password: String,
+    // lives in its own table, `FromRow` leaves it empty for the callers that
+    // only need the user itself
+    pub databases: Vec<StoredUserDatabase>,
     pub created: chrono::DateTime<chrono::Utc>,
 }
 
@@ -381,9 +394,26 @@ impl FromRow<'_, SqliteRow> for StoredUser {
             uuid: row.try_get("uuid")?,
             uuid_short: row.try_get("uuid_short")?,
             instance_uuid: row.try_get("instance_uuid")?,
-            database_uuid: row.try_get("database_uuid")?,
             username: row.try_get("username")?,
             password: row.try_get("password")?,
+            databases: Vec::new(),
+            created: decode_created(row)?,
+        })
+    }
+}
+
+#[derive(ToSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct StoredUserDatabase {
+    pub database_uuid: uuid::Uuid,
+    pub permission: DatabasePermission,
+    pub created: chrono::DateTime<chrono::Utc>,
+}
+
+impl FromRow<'_, SqliteRow> for StoredUserDatabase {
+    fn from_row(row: &SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            database_uuid: row.try_get("database_uuid")?,
+            permission: decode_permission(row)?,
             created: decode_created(row)?,
         })
     }

@@ -1,4 +1,7 @@
-use super::{super::identifier::UserIdentifier, DatabaseConnection, QueryResult};
+use super::{
+    super::{DatabasePermission, identifier::UserIdentifier},
+    DatabaseConnection, QueryResult,
+};
 use mongodb::bson::{Bson, Document, doc};
 use std::path::PathBuf;
 
@@ -29,12 +32,38 @@ impl MongodbConnection {
         })
     }
 
-    async fn run_admin(&self, command: Document) -> anyhow::Result<()> {
-        self.client
+    async fn run_admin(&self, command: Document) -> anyhow::Result<Document> {
+        Ok(self
+            .client
             .database(ADMIN_DATABASE)
             .run_command(command)
+            .await?)
+    }
+
+    async fn foreign_roles(
+        &self,
+        user: &UserIdentifier,
+        database: &str,
+    ) -> anyhow::Result<Vec<Bson>> {
+        let reply = self
+            .run_admin(doc! { "usersInfo": user.to_string() })
             .await?;
-        Ok(())
+
+        let Some(Bson::Array(users)) = reply.get("users") else {
+            anyhow::bail!("mongodb returned no user list");
+        };
+
+        Ok(users
+            .iter()
+            .filter_map(|user| user.as_document()?.get("roles")?.as_array())
+            .flatten()
+            .filter(|role| {
+                role.as_document()
+                    .and_then(|role| role.get_str("db").ok())
+                    .is_some_and(|db| db != database)
+            })
+            .cloned()
+            .collect())
     }
 
     pub async fn create_root(&self, password: &str) -> anyhow::Result<()> {
@@ -44,6 +73,7 @@ impl MongodbConnection {
             "roles": [{ "role": "root", "db": ADMIN_DATABASE }],
         })
         .await
+        .map(|_| ())
     }
 
     pub async fn auth_enforced(&self) -> anyhow::Result<bool> {
@@ -74,6 +104,7 @@ impl DatabaseConnection for MongodbConnection {
             "roles": [],
         })
         .await
+        .map(|_| ())
     }
 
     async fn update_user_password(
@@ -86,18 +117,40 @@ impl DatabaseConnection for MongodbConnection {
             "pwd": password,
         })
         .await
+        .map(|_| ())
     }
 
     async fn delete_user(&self, user: &UserIdentifier) -> anyhow::Result<()> {
-        self.run_admin(doc! { "dropUser": user.to_string() }).await
+        self.run_admin(doc! { "dropUser": user.to_string() })
+            .await
+            .map(|_| ())
     }
 
-    async fn grant_user(&self, user: &UserIdentifier, database: &str) -> anyhow::Result<()> {
+    async fn apply_permission(
+        &self,
+        user: &UserIdentifier,
+        database: &str,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<()> {
+        let mut roles = self.foreign_roles(user, database).await?;
+
+        match permission {
+            DatabasePermission::None => {}
+            DatabasePermission::ReadOnly => {
+                roles.push(doc! { "role": "read", "db": database }.into());
+            }
+            DatabasePermission::ReadWrite => {
+                roles.push(doc! { "role": "readWrite", "db": database }.into());
+                roles.push(doc! { "role": "dbAdmin", "db": database }.into());
+            }
+        }
+
         self.run_admin(doc! {
-            "grantRolesToUser": user.to_string(),
-            "roles": [{ "role": "dbOwner", "db": database }],
+            "updateUser": user.to_string(),
+            "roles": roles,
         })
         .await
+        .map(|_| ())
     }
 
     async fn create_database(&self, _name: &str) -> anyhow::Result<()> {
@@ -107,10 +160,6 @@ impl DatabaseConnection for MongodbConnection {
     async fn delete_database(&self, name: &str) -> anyhow::Result<()> {
         self.client.database(name).drop().await?;
         Ok(())
-    }
-
-    async fn recreate_database(&self, name: &str, _users: &[UserIdentifier]) -> anyhow::Result<()> {
-        self.delete_database(name).await
     }
 
     async fn get_size(&self, name: &str) -> anyhow::Result<i64> {

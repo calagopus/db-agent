@@ -1,4 +1,7 @@
-use super::{super::identifier::UserIdentifier, DatabaseConnection, QueryResult};
+use super::{
+    super::{DatabasePermission, identifier::UserIdentifier},
+    DatabaseConnection, QueryResult,
+};
 use futures_util::StreamExt;
 use sqlx::{
     Column, Connection, Decode, Either, Executor, MySql, Row,
@@ -7,6 +10,10 @@ use sqlx::{
 use std::path::{Path, PathBuf};
 
 pub const ADMIN_USER: &str = "root";
+
+const ER_NONEXISTING_GRANT: u16 = 1141;
+const READ_ONLY_PRIVILEGES: &str =
+    "SELECT, SHOW VIEW, EXECUTE, CREATE TEMPORARY TABLES, LOCK TABLES";
 
 pub fn connect_options(socket: &Path, database: Option<&str>) -> MySqlConnectOptions {
     let options = MySqlConnectOptions::new()
@@ -29,19 +36,22 @@ fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+fn error_number(err: &anyhow::Error) -> Option<u16> {
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(server)) => server
+            .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+            .map(|server| server.number()),
+        _ => None,
+    }
+}
+
 fn duplicate_database(err: anyhow::Error) -> anyhow::Error {
     const ER_DB_CREATE_EXISTS: u16 = 1007;
 
-    match err.downcast_ref::<sqlx::Error>() {
-        Some(sqlx::Error::Database(server))
-            if server
-                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-                .is_some_and(|server| server.number() == ER_DB_CREATE_EXISTS) =>
-        {
-            crate::response::DisplayError::new("database already exists")
-                .with_status(axum::http::StatusCode::CONFLICT)
-                .into()
-        }
+    match error_number(&err) {
+        Some(ER_DB_CREATE_EXISTS) => crate::response::DisplayError::new("database already exists")
+            .with_status(axum::http::StatusCode::CONFLICT)
+            .into(),
         _ => err,
     }
 }
@@ -118,13 +128,33 @@ impl DatabaseConnection for MariadbConnection {
         .await
     }
 
-    async fn grant_user(&self, user: &UserIdentifier, database: &str) -> anyhow::Result<()> {
-        self.execute(format!(
-            "GRANT ALL PRIVILEGES ON {}.* TO {}@'%'",
-            quote_ident(database),
-            quote_literal(&user.to_string())
-        ))
-        .await
+    async fn apply_permission(
+        &self,
+        user: &UserIdentifier,
+        database: &str,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<()> {
+        let database = quote_ident(database);
+        let user = quote_literal(&user.to_string());
+
+        if let Err(err) = self
+            .execute(format!(
+                "REVOKE ALL PRIVILEGES ON {database}.* FROM {user}@'%'"
+            ))
+            .await
+            && !matches!(error_number(&err), Some(ER_NONEXISTING_GRANT))
+        {
+            return Err(err);
+        }
+
+        let privileges = match permission {
+            DatabasePermission::None => return Ok(()),
+            DatabasePermission::ReadOnly => READ_ONLY_PRIVILEGES,
+            DatabasePermission::ReadWrite => "ALL PRIVILEGES",
+        };
+
+        self.execute(format!("GRANT {privileges} ON {database}.* TO {user}@'%'"))
+            .await
     }
 
     async fn create_database(&self, name: &str) -> anyhow::Result<()> {
@@ -136,11 +166,6 @@ impl DatabaseConnection for MariadbConnection {
     async fn delete_database(&self, name: &str) -> anyhow::Result<()> {
         self.execute(format!("DROP DATABASE IF EXISTS {}", quote_ident(name)))
             .await
-    }
-
-    async fn recreate_database(&self, name: &str, _users: &[UserIdentifier]) -> anyhow::Result<()> {
-        self.delete_database(name).await?;
-        self.create_database(name).await
     }
 
     async fn get_size(&self, name: &str) -> anyhow::Result<i64> {

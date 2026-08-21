@@ -1,5 +1,9 @@
-use super::{super::identifier::UserIdentifier, DatabaseConnection, QueryResult};
+use super::{
+    super::{DatabasePermission, identifier::UserIdentifier},
+    DatabaseConnection, QueryResult,
+};
 use futures_util::StreamExt;
+use sha2::Digest;
 use sqlx::{
     Column, Connection, Either, Executor, Row, ValueRef,
     postgres::{PgConnectOptions, PgConnection},
@@ -37,6 +41,25 @@ fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+fn group_role(database: &str, suffix: &str) -> String {
+    let digest = sha2::Sha256::digest(database.as_bytes());
+
+    quote_ident(&format!(
+        "d{}_{suffix}",
+        hex::encode(digest.get(..8).unwrap_or_default())
+    ))
+}
+
+#[inline]
+fn read_only_role(database: &str) -> String {
+    group_role(database, "ro")
+}
+
+#[inline]
+fn read_write_role(database: &str) -> String {
+    group_role(database, "rw")
+}
+
 fn duplicate_database(err: anyhow::Error) -> anyhow::Error {
     const DUPLICATE_DATABASE: &str = "42P04";
 
@@ -66,12 +89,26 @@ impl PostgresConnection {
     }
 
     async fn execute(&self, sql: &str) -> anyhow::Result<()> {
-        let mut client = self.client(ADMIN_DATABASE).await?;
+        self.execute_in(ADMIN_DATABASE, sql).await
+    }
+
+    async fn execute_in(&self, database: &str, sql: &str) -> anyhow::Result<()> {
+        let mut client = self.client(database).await?;
         client
             .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned())))
             .await?;
         let _ = client.close().await;
         Ok(())
+    }
+
+    async fn ensure_roles(&self, database: &str) -> anyhow::Result<()> {
+        let (read_only, read_write) = (read_only_role(database), read_write_role(database));
+
+        self.execute(&format!(
+            "DO $$ BEGIN CREATE ROLE {read_only} NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+             DO $$ BEGIN CREATE ROLE {read_write} NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+        ))
+        .await
     }
 }
 
@@ -113,79 +150,153 @@ impl DatabaseConnection for PostgresConnection {
             return Ok(());
         }
 
-        let role = quote_ident(&name);
-        let owner = quote_ident(ADMIN_USER);
-
-        // DROP OWNED BY only covers the current database, so every database the role
-        // holds privileges on needs its own connection
         let databases: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT d.datname FROM pg_database d
-             CROSS JOIN LATERAL aclexplode(d.datacl) a
-             JOIN pg_roles r ON r.oid = a.grantee
+            "SELECT DISTINCT d.datname FROM pg_shdepend s
+             JOIN pg_roles r ON r.oid = s.refobjid
+             JOIN pg_database d ON d.oid = CASE
+                 WHEN s.dbid <> 0 THEN s.dbid
+                 WHEN s.classid = 'pg_database'::regclass THEN s.objid
+             END
              WHERE r.rolname = $1 AND d.datallowconn AND d.datname <> $2",
         )
         .bind(&name)
         .bind(ADMIN_DATABASE)
         .fetch_all(&mut client)
         .await?;
-
-        for database in &databases {
-            let mut scoped = self.client(database).await?;
-            scoped
-                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                    "REASSIGN OWNED BY {role} TO {owner}; DROP OWNED BY {role}"
-                ))))
-                .await?;
-            let _ = scoped.close().await;
-
-            client
-                .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                    "REVOKE ALL PRIVILEGES ON DATABASE {} FROM {role}",
-                    quote_ident(database)
-                ))))
-                .await?;
-        }
-
-        client
-            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                "REASSIGN OWNED BY {role} TO {owner}; DROP OWNED BY {role}; DROP ROLE IF EXISTS {role}"
-            ))))
-            .await?;
         let _ = client.close().await;
 
-        Ok(())
+        let role = quote_ident(&name);
+
+        for database in &databases {
+            self.ensure_roles(database).await?;
+            self.execute_in(
+                database,
+                &format!(
+                    "REASSIGN OWNED BY {role} TO {}; DROP OWNED BY {role}",
+                    read_write_role(database)
+                ),
+            )
+            .await?;
+
+            self.execute(&format!(
+                "REVOKE ALL PRIVILEGES ON DATABASE {} FROM {role}",
+                quote_ident(database)
+            ))
+            .await?;
+        }
+
+        self.execute(&format!(
+            "REASSIGN OWNED BY {role} TO {}; DROP OWNED BY {role}; DROP ROLE IF EXISTS {role}",
+            quote_ident(ADMIN_USER)
+        ))
+        .await
     }
 
-    async fn grant_user(&self, user: &UserIdentifier, database: &str) -> anyhow::Result<()> {
-        let user = quote_ident(&user.to_string());
+    async fn apply_permission(
+        &self,
+        user: &UserIdentifier,
+        database: &str,
+        permission: DatabasePermission,
+    ) -> anyhow::Result<()> {
+        self.bootstrap_database(database).await?;
+
+        let (read_only, read_write) = (read_only_role(database), read_write_role(database));
+        let role = quote_ident(&user.to_string());
+
         self.execute(&format!(
-            "GRANT ALL PRIVILEGES ON DATABASE {} TO {user}",
-            quote_ident(database),
+            "DO $$ BEGIN
+                 SET LOCAL client_min_messages = error;
+                 REVOKE {read_only}, {read_write} FROM {role};
+                 REVOKE ALL PRIVILEGES ON DATABASE {} FROM {role};
+             END $$",
+            quote_ident(database)
         ))
         .await?;
 
-        let mut client = self.client(database).await?;
-        client
-            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                "GRANT ALL ON SCHEMA public TO {user}"
-            ))))
+        let reassign = match permission {
+            DatabasePermission::ReadWrite => String::new(),
+            _ => format!("REASSIGN OWNED BY {role} TO {read_write};"),
+        };
+
+        self.execute_in(
+            database,
+            &format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public REVOKE ALL ON TABLES FROM {read_only}, {read_write};
+                 ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public REVOKE ALL ON SEQUENCES FROM {read_only}, {read_write};
+                 ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM {read_only}, {read_write};
+                 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM {role};
+                 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM {role};
+                 REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM {role};
+                 REVOKE ALL PRIVILEGES ON SCHEMA public FROM {role};
+                 {reassign}"
+            ),
+        )
+        .await?;
+
+        let group = match permission {
+            DatabasePermission::None => return Ok(()),
+            DatabasePermission::ReadOnly => &read_only,
+            DatabasePermission::ReadWrite => &read_write,
+        };
+
+        self.execute(&format!("GRANT {group} TO {role}")).await?;
+
+        if permission == DatabasePermission::ReadWrite {
+            self.execute_in(
+                database,
+                &format!(
+                    "ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public GRANT SELECT ON TABLES TO {read_only};
+                     ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public GRANT SELECT ON SEQUENCES TO {read_only};
+                     ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public GRANT ALL ON TABLES TO {read_write};
+                     ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public GRANT ALL ON SEQUENCES TO {read_write};
+                     ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO {read_only}, {read_write}"
+                ),
+            )
             .await?;
-        let _ = client.close().await;
+        }
 
         Ok(())
     }
 
-    async fn create_database(&self, name: &str) -> anyhow::Result<()> {
-        let name = quote_ident(name);
+    async fn bootstrap_database(&self, name: &str) -> anyhow::Result<()> {
+        self.ensure_roles(name).await?;
 
-        // CREATE DATABASE cannot share an implicit transaction with the revoke
-        self.execute(&format!("CREATE DATABASE {name}"))
+        let (read_only, read_write) = (read_only_role(name), read_write_role(name));
+
+        self.execute(&format!(
+            "REVOKE CONNECT, TEMPORARY ON DATABASE {name} FROM PUBLIC;
+             GRANT CONNECT ON DATABASE {name} TO {read_only}, {read_write};
+             GRANT CREATE, TEMPORARY ON DATABASE {name} TO {read_write}",
+            name = quote_ident(name)
+        ))
+        .await?;
+
+        self.execute_in(
+            name,
+            &format!(
+                "GRANT USAGE ON SCHEMA public TO {read_only};
+                 GRANT USAGE, CREATE ON SCHEMA public TO {read_write};
+                 GRANT SELECT ON ALL TABLES IN SCHEMA public TO {read_only};
+                 GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO {read_only};
+                 GRANT ALL ON ALL TABLES IN SCHEMA public TO {read_write};
+                 GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {read_write};
+                 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {read_only}, {read_write};
+                 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {read_only};
+                 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO {read_only};
+                 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {read_write};
+                 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {read_write};
+                 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO {read_only}, {read_write}"
+            ),
+        )
+        .await
+    }
+
+    async fn create_database(&self, name: &str) -> anyhow::Result<()> {
+        self.execute(&format!("CREATE DATABASE {}", quote_ident(name)))
             .await
             .map_err(duplicate_database)?;
-        self.execute(&format!(
-            "REVOKE CONNECT, TEMPORARY ON DATABASE {name} FROM PUBLIC"
-        ))
-        .await
+
+        self.bootstrap_database(name).await
     }
 
     async fn delete_database(&self, name: &str) -> anyhow::Result<()> {
@@ -193,15 +304,17 @@ impl DatabaseConnection for PostgresConnection {
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             quote_ident(name)
         ))
-        .await
-    }
+        .await?;
 
-    async fn recreate_database(&self, name: &str, users: &[UserIdentifier]) -> anyhow::Result<()> {
-        self.delete_database(name).await?;
-        self.create_database(name).await?;
-
-        for user in users {
-            self.grant_user(user, name).await?;
+        if let Err(err) = self
+            .execute(&format!(
+                "DROP ROLE IF EXISTS {}, {}",
+                read_only_role(name),
+                read_write_role(name)
+            ))
+            .await
+        {
+            tracing::warn!(database = %name, "failed to drop database group roles: {err:#}");
         }
 
         Ok(())
