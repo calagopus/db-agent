@@ -36,7 +36,27 @@ impl Database {
 
         if migrate {
             let start = Instant::now();
-            sqlx::migrate!("./database/migrations")
+            let migrator = sqlx::migrate!("./database/migrations");
+
+            let has_migrations_table: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+            )
+            .fetch_optional(&sqlite)
+            .await
+            .context("failed to check for migrations table")?;
+            if has_migrations_table.is_some()
+                && let Some(migration) = migrator.iter().find(|m| m.version == 3)
+            {
+                sqlx::query(
+                    "UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = 3 AND checksum != ?1",
+                )
+                .bind(&*migration.checksum)
+                .execute(&sqlite)
+                .await
+                .context("failed to repair migration checksum")?;
+            }
+
+            migrator
                 .run(&sqlite)
                 .await
                 .context("failed to run database migrations")?;
