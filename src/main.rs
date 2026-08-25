@@ -129,7 +129,7 @@ async fn handle_request(
     tracing::info!(
         ip = %ip,
         path = req.uri().path(),
-        query = req.uri().query().unwrap_or_default(),
+        query = %crate::utils::redact_query(req.uri().query().unwrap_or_default()),
         "http {}",
         req.method().to_string().to_lowercase(),
     );

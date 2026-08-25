@@ -76,7 +76,12 @@ mod post {
             .connect_timeout(std::time::Duration::from_secs(30))
             .build()?;
 
-        let mut response = client.get(&data.url).headers(headers).send().await?;
+        let mut response = client
+            .get(&data.url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|err| err.without_url())?;
 
         let mut options = tokio::fs::OpenOptions::new();
         options.create(true).write(true).truncate(true).read(true);
@@ -84,7 +89,7 @@ mod post {
         options.mode(0o755);
         let mut file = options.open(&tmp_file).await?;
 
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.map_err(|err| err.without_url())? {
             file.write_all(&chunk).await?;
         }
 
