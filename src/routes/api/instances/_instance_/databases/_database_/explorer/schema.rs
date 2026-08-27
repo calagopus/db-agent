@@ -15,6 +15,7 @@ mod get {
     #[derive(ToSchema, Serialize)]
     struct Response {
         tables: Vec<SchemaTable>,
+        truncated: bool,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -47,9 +48,13 @@ mod get {
             }
         };
 
-        let tables = instance.get_explorer_schema(&database.name).await?;
+        let schema = instance.get_explorer_schema(&database.name).await?;
 
-        ApiResponse::new_serialized(Response { tables }).ok()
+        ApiResponse::new_serialized(Response {
+            tables: schema.tables,
+            truncated: schema.truncated,
+        })
+        .ok()
     }
 }
 

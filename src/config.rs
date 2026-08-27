@@ -96,9 +96,16 @@ fn api_remote_import_blocked_cidrs() -> Vec<cidr::IpCidr> {
             cidr::IpCidr::from_str("172.16.0.0/12").unwrap_unchecked(),
             cidr::IpCidr::from_str("192.168.0.0/16").unwrap_unchecked(),
             cidr::IpCidr::from_str("169.254.0.0/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("192.0.0.0/24").unwrap_unchecked(),
+            cidr::IpCidr::from_str("198.18.0.0/15").unwrap_unchecked(),
+            cidr::IpCidr::from_str("224.0.0.0/4").unwrap_unchecked(),
+            cidr::IpCidr::from_str("240.0.0.0/4").unwrap_unchecked(),
+            cidr::IpCidr::from_str("::/128").unwrap_unchecked(),
             cidr::IpCidr::from_str("::1/128").unwrap_unchecked(),
             cidr::IpCidr::from_str("fe80::/10").unwrap_unchecked(),
             cidr::IpCidr::from_str("fc00::/7").unwrap_unchecked(),
+            cidr::IpCidr::from_str("2002::/16").unwrap_unchecked(),
+            cidr::IpCidr::from_str("ff00::/8").unwrap_unchecked(),
         ])
     }
 }
@@ -580,20 +587,33 @@ impl Config {
                 .any(|cidr| cidr.contains(&connect_info.ip()));
 
         if trusted {
+            fn find_forwarded_ip(
+                forwarded: &str,
+                trusted_proxies: &[cidr::IpCidr],
+            ) -> Option<std::net::IpAddr> {
+                for entry in forwarded.rsplit(',') {
+                    let ip: std::net::IpAddr = entry.trim().parse().ok()?;
+
+                    if !trusted_proxies.iter().any(|cidr| cidr.contains(&ip)) {
+                        return Some(ip);
+                    }
+                }
+
+                None
+            }
+
             if let Some(forwarded) = headers.get("X-Forwarded-For")
                 && let Ok(forwarded) = forwarded.to_str()
-                && let Some(ip) = forwarded.split(',').next()
+                && let Some(ip) = find_forwarded_ip(forwarded, &cfg.api.trusted_proxies)
             {
-                return ip.trim().parse().unwrap_or_else(|_| connect_info.ip());
+                return ip;
             }
 
             if let Some(forwarded) = headers.get("X-Real-IP")
                 && let Ok(forwarded) = forwarded.to_str()
+                && let Ok(ip) = forwarded.trim().parse()
             {
-                return forwarded
-                    .trim()
-                    .parse()
-                    .unwrap_or_else(|_| connect_info.ip());
+                return ip;
             }
         }
 

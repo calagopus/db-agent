@@ -22,13 +22,16 @@ pub const BROWSE_MAX_FILTERS: usize = 10;
 
 pub const MUTATE_MAX_ROWS: usize = 100;
 pub const CREATE_TABLE_MAX_COLUMNS: usize = 100;
+pub const SCHEMA_MAX_TABLES: usize = 1000;
 
 const QUERY_MAX_BYTES: usize = 4 * 1024 * 1024;
+const QUERY_MAX_VALUE_BYTES: usize = 256 * 1024;
 const QUERY_STATEMENT_TIMEOUT_MS: u64 = 10_000;
 const QUERY_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 static TENANT_CONNECTIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(16)));
+const TENANT_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 const TENANT_POOL_MAX_CONNECTIONS: u32 = 4;
 const TENANT_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -119,7 +122,7 @@ pub trait ExplorerConnection: Send {
     fn auto_increment_keyword(&self) -> &'static str;
     fn is_integer_type(&self, rendered: &str) -> bool;
 
-    async fn schema_tables(&mut self) -> Result<Vec<SchemaTable>, anyhow::Error>;
+    async fn schema_tables(&mut self) -> Result<DatabaseSchema, anyhow::Error>;
     async fn table_columns(
         &mut self,
         schema: Option<&str>,
@@ -129,7 +132,11 @@ pub trait ExplorerConnection: Send {
     async fn resolve_type(&mut self, input: &str) -> Result<String, anyhow::Error>;
 
     async fn quote_values(&mut self, values: &[String]) -> Result<Vec<String>, anyhow::Error>;
-    async fn fetch_unprepared(&mut self, sql: String) -> Result<QueryResultSet, anyhow::Error>;
+    async fn fetch_unprepared(
+        &mut self,
+        sql: String,
+        max_rows: usize,
+    ) -> Result<QueryResultSet, anyhow::Error>;
     async fn run_query(
         &mut self,
         sql: &str,
@@ -182,7 +189,15 @@ impl super::Instance {
     ) -> Result<TenantConnection, anyhow::Error> {
         self.ensure_online("explore the database").await?;
 
-        let permit = TENANT_CONNECTIONS.clone().acquire_owned().await?;
+        let permit = tokio::time::timeout(
+            TENANT_PERMIT_TIMEOUT,
+            TENANT_CONNECTIONS.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            crate::response::DisplayError::new("too many concurrent database connections")
+                .with_status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        })??;
 
         let key = (self.uuid, database.to_owned());
         let pool = {
@@ -284,7 +299,11 @@ impl ResultCollector {
         }
     }
 
-    fn push(&mut self, columns: impl FnOnce() -> Vec<QueryColumn>, row: Vec<QueryValue>) {
+    fn push(
+        &mut self,
+        columns: impl FnOnce() -> Vec<QueryColumn>,
+        row: impl FnOnce() -> Vec<QueryValue>,
+    ) {
         if self.columns.is_empty() {
             self.columns = columns();
         }
@@ -294,7 +313,16 @@ impl ResultCollector {
             return;
         }
 
-        self.bytes += row.iter().map(QueryValue::byte_len).sum::<usize>();
+        let row = row();
+        let bytes = row.iter().map(QueryValue::byte_len).sum::<usize>();
+
+        if self.bytes + bytes > QUERY_MAX_BYTES {
+            self.bytes = QUERY_MAX_BYTES;
+            self.truncated = true;
+            return;
+        }
+
+        self.bytes += bytes;
         self.rows.push(row);
     }
 
@@ -305,7 +333,6 @@ impl ResultCollector {
             rows_affected,
             truncated: std::mem::take(&mut self.truncated),
         });
-        self.bytes = 0;
     }
 
     fn into_results(mut self) -> Vec<QueryResultSet> {
@@ -330,28 +357,52 @@ pub struct QueryColumn {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryValue {
     Null,
-    Text { value: String },
-    Binary { value: String },
+    Text { value: String, truncated: bool },
+    Binary { value: String, truncated: bool },
 }
 
 impl QueryValue {
-    fn from_bytes(bytes: Option<Vec<u8>>) -> Self {
+    fn from_bytes(bytes: Option<&[u8]>) -> Self {
         let Some(bytes) = bytes else {
             return Self::Null;
         };
 
-        match String::from_utf8(bytes) {
-            Ok(value) => Self::Text { value },
-            Err(err) => Self::Binary {
-                value: hex::encode(err.as_bytes()),
-            },
+        match std::str::from_utf8(bytes) {
+            Ok(value) => Self::text(value),
+            Err(_) => Self::binary(bytes),
+        }
+    }
+
+    fn text(value: &str) -> Self {
+        Self::Text {
+            value: crate::utils::slice_up_to(value, QUERY_MAX_VALUE_BYTES).to_owned(),
+            truncated: value.len() > QUERY_MAX_VALUE_BYTES,
+        }
+    }
+
+    fn binary(bytes: &[u8]) -> Self {
+        let max = QUERY_MAX_VALUE_BYTES / 2;
+
+        Self::Binary {
+            value: hex::encode(bytes.get(..bytes.len().min(max)).unwrap_or(bytes)),
+            truncated: bytes.len() > max,
+        }
+    }
+
+    fn hex(hex: &[u8]) -> Self {
+        let max = QUERY_MAX_VALUE_BYTES & !1;
+        let cut = hex.len().min(max);
+
+        Self::Binary {
+            value: String::from_utf8_lossy(hex.get(..cut).unwrap_or(hex)).into_owned(),
+            truncated: hex.len() > cut,
         }
     }
 
     fn byte_len(&self) -> usize {
         match self {
             Self::Null => 0,
-            Self::Text { value } | Self::Binary { value } => value.len(),
+            Self::Text { value, .. } | Self::Binary { value, .. } => value.len(),
         }
     }
 }
@@ -387,14 +438,34 @@ pub struct SchemaTable {
     pub columns: Vec<SchemaColumn>,
 }
 
+#[derive(ToSchema, Serialize, Clone)]
+pub struct DatabaseSchema {
+    pub tables: Vec<SchemaTable>,
+    pub truncated: bool,
+}
+
 impl super::Instance {
     pub async fn get_explorer_schema(
         &self,
         database: &str,
-    ) -> Result<Vec<SchemaTable>, anyhow::Error> {
+    ) -> Result<DatabaseSchema, anyhow::Error> {
         let mut connection = self.connect_explorer(database, true).await?;
 
-        connection.inner.schema_tables().await
+        let result = tokio::time::timeout(QUERY_CONNECTION_TIMEOUT, async {
+            connection.inner.schema_tables().await
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                connection.inner.close_on_drop();
+
+                Err(crate::response::DisplayError::new("query timed out")
+                    .with_status(axum::http::StatusCode::REQUEST_TIMEOUT)
+                    .into())
+            }
+        }
     }
 }
 
@@ -621,54 +692,72 @@ impl super::Instance {
         let direction = if options.descending { "DESC" } else { "ASC" };
 
         let mut connection = self.connect_explorer(database, true).await?;
-        let columns = connection
-            .inner
-            .table_columns(options.schema.as_deref(), &options.table)
-            .await?;
-        if columns.is_empty() {
-            return Err(unknown_table(&options.table));
-        }
 
-        let clauses = options
-            .filters
-            .iter()
-            .map(|filter| filter_clause(&*connection.inner, &columns, filter))
-            .collect::<Result<Vec<_>, _>>()?;
-        let pending: Vec<String> = clauses
-            .iter()
-            .filter_map(|clause| clause.value.clone())
-            .collect();
-        let literals = if pending.is_empty() {
-            Vec::new()
-        } else {
-            connection.inner.quote_values(&pending).await?
-        };
-
-        let mut sql = format!(
-            "SELECT * FROM {}",
-            connection
+        let result = tokio::time::timeout(QUERY_CONNECTION_TIMEOUT, async {
+            let columns = connection
                 .inner
-                .qualified_table(options.schema.as_deref(), &options.table)
-        );
-        if let Some(where_clause) = assemble_where(&clauses, literals)? {
-            sql.push_str(&where_clause);
-        }
-        if let Some(order_by) = &options.order_by {
-            if !columns.iter().any(|column| column.name == *order_by) {
-                return Err(unknown_column(order_by));
+                .table_columns(options.schema.as_deref(), &options.table)
+                .await?;
+            if columns.is_empty() {
+                return Err(unknown_table(&options.table));
             }
 
-            sql.push_str(&format!(
-                " ORDER BY {} {direction}",
-                connection.inner.quote_ident(order_by)
-            ));
-        }
-        sql.push_str(&format!(
-            " LIMIT {} OFFSET {}",
-            options.limit, options.offset
-        ));
+            let clauses = options
+                .filters
+                .iter()
+                .map(|filter| filter_clause(&*connection.inner, &columns, filter))
+                .collect::<Result<Vec<_>, _>>()?;
+            let pending: Vec<String> = clauses
+                .iter()
+                .filter_map(|clause| clause.value.clone())
+                .collect();
+            let literals = if pending.is_empty() {
+                Vec::new()
+            } else {
+                connection.inner.quote_values(&pending).await?
+            };
 
-        connection.inner.fetch_unprepared(sql).await
+            let mut sql = format!(
+                "SELECT * FROM {}",
+                connection
+                    .inner
+                    .qualified_table(options.schema.as_deref(), &options.table)
+            );
+            if let Some(where_clause) = assemble_where(&clauses, literals)? {
+                sql.push_str(&where_clause);
+            }
+            if let Some(order_by) = &options.order_by {
+                if !columns.iter().any(|column| column.name == *order_by) {
+                    return Err(unknown_column(order_by));
+                }
+
+                sql.push_str(&format!(
+                    " ORDER BY {} {direction}",
+                    connection.inner.quote_ident(order_by)
+                ));
+            }
+            sql.push_str(&format!(
+                " LIMIT {} OFFSET {}",
+                options.limit, options.offset
+            ));
+
+            connection
+                .inner
+                .fetch_unprepared(sql, options.limit as usize)
+                .await
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                connection.inner.close_on_drop();
+
+                Err(crate::response::DisplayError::new("query timed out")
+                    .with_status(axum::http::StatusCode::REQUEST_TIMEOUT)
+                    .into())
+            }
+        }
     }
 }
 
@@ -783,17 +872,32 @@ impl super::Instance {
         check_batch(operation.len())?;
 
         let mut connection = self.connect_explorer(database, false).await?;
-        let columns = connection.inner.table_columns(schema, table).await?;
-        if columns.is_empty() {
-            return Err(unknown_table(table));
+
+        let result = tokio::time::timeout(QUERY_CONNECTION_TIMEOUT, async {
+            let columns = connection.inner.table_columns(schema, table).await?;
+            if columns.is_empty() {
+                return Err(unknown_table(table));
+            }
+
+            let statements = operation.statements(&*connection.inner, &columns, schema, table)?;
+
+            connection
+                .inner
+                .apply_statements(statements, operation.expects_single_row())
+                .await
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                connection.inner.close_on_drop();
+
+                Err(crate::response::DisplayError::new("statement timed out")
+                    .with_status(axum::http::StatusCode::REQUEST_TIMEOUT)
+                    .into())
+            }
         }
-
-        let statements = operation.statements(&*connection.inner, &columns, schema, table)?;
-
-        connection
-            .inner
-            .apply_statements(statements, operation.expects_single_row())
-            .await
     }
 }
 

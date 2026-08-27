@@ -2,6 +2,20 @@ use rand::{RngExt, distr::SampleString};
 use std::{future::Future, net::SocketAddr, path::Path, time::Duration};
 use tokio::net::{TcpListener, TcpStream};
 
+#[inline]
+pub fn slice_up_to(s: &str, max_len: usize) -> &str {
+    if max_len >= s.len() || s.is_empty() {
+        return s;
+    }
+
+    let mut idx = max_len;
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+
+    s.get(..idx).unwrap_or(s)
+}
+
 pub fn is_single_component_file_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
 
