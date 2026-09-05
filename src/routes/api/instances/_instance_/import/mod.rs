@@ -24,6 +24,9 @@ mod post {
         #[garde(skip)]
         #[serde(default)]
         wipe: bool,
+        #[garde(skip)]
+        #[serde(default)]
+        lock: bool,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -33,6 +36,7 @@ mod post {
         (status = OK, body = inline(Response)),
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
     ), params(
         (
             "instance" = uuid::Uuid,
@@ -50,6 +54,10 @@ mod post {
         (
             "wipe" = Option<bool>, Query,
             description = "Clear existing data in the target before importing, requires db except for redis",
+        ),
+        (
+            "lock" = Option<bool>, Query,
+            description = "Write lock the instance for the duration of the import, refusing writes through the api and dropping client connections",
         ),
     ), request_body = String)]
     pub async fn route(
@@ -72,6 +80,7 @@ mod post {
                 params.db.as_deref(),
                 params.source_db.as_deref(),
                 params.wipe,
+                params.lock,
                 &mut reader,
             )
             .await?;

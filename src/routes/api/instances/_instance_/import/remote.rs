@@ -23,6 +23,9 @@ mod post {
         #[garde(skip)]
         #[serde(default)]
         wipe: bool,
+        #[garde(skip)]
+        #[serde(default)]
+        lock: bool,
     }
 
     #[derive(ToSchema, Serialize)]
@@ -63,8 +66,13 @@ mod post {
         let import = instance
             .prepare_remote_import(&data.url, data.source_db.as_deref())
             .await?;
-        instance
-            .check_import(data.db.as_deref(), import.source_db.as_deref(), data.wipe)
+        let guard = instance
+            .prepare_import(
+                data.db.as_deref(),
+                import.source_db.as_deref(),
+                data.wipe,
+                data.lock,
+            )
             .await?;
 
         let bytes_processed = Arc::new(AtomicU64::new(0));
@@ -83,6 +91,8 @@ mod post {
                 let instance = instance.0.clone();
 
                 async move {
+                    let _guard = guard;
+
                     instance
                         .run_remote_import(import, data.db.as_deref(), data.wipe, bytes_processed)
                         .await

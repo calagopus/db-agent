@@ -137,6 +137,21 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         );
         return Ok(());
     }
+    if let Some(state) = creds.instance.write_locked_state() {
+        write_packet(
+            &mut stream,
+            cseq + 1,
+            &protocol::err_packet(1040, "08004", "database is write locked"),
+        )
+        .await?;
+        tracing::debug!(
+            %peer,
+            instance = %creds.instance.uuid,
+            state = %state,
+            "rejected: instance write locked"
+        );
+        return Ok(());
+    }
 
     let (mut token, mut seq) = (hr.auth_response, cseq);
     if hr.plugin != protocol::NATIVE {
@@ -207,7 +222,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let _guard = user_id
         .map(|id| status.connect(id, Some(hr.database.to_string()).filter(|s| !s.is_empty())));
-    let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
+    let (c2b, b2c) = tokio::select! {
+        copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
+        _ = creds.instance.write_locked() => {
+            tracing::debug!(%peer, "closed: instance write locked");
+            return Ok(());
+        }
+    };
     tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }

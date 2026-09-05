@@ -101,9 +101,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     routes: &DatabaseRouteManager,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
-    let mut scram: Option<Scram> = None;
+    let mut scram: Option<(Scram, crate::instance::Instance)> = None;
 
-    let (st, mut backend) = loop {
+    let (st, mut backend, instance) = loop {
         let (reqid, opcode, body) = read_message(&mut stream).await?;
 
         if opcode == OP_QUERY {
@@ -149,6 +149,17 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     write_op_msg(&mut stream, reqid, &sasl_error("database is locked")).await?;
                     return Ok(());
                 }
+                if let Some(state) = creds.instance.write_locked_state() {
+                    tracing::debug!(
+                        %peer,
+                        instance = %creds.instance.uuid,
+                        state = %state,
+                        "rejected: instance write locked"
+                    );
+                    write_op_msg(&mut stream, reqid, &sasl_error("database is write locked"))
+                        .await?;
+                    return Ok(());
+                }
 
                 if let Err(err) = creds.instance.verify_mongodb_auth().await {
                     tracing::error!(
@@ -182,10 +193,10 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                 };
                 write_op_msg(&mut stream, reqid, &reply).await?;
 
-                scram = Some(st);
+                scram = Some((st, creds.instance));
             }
             "saslContinue" => {
-                let st = scram
+                let (st, instance) = scram
                     .take()
                     .ok_or_else(|| bad("saslContinue before saslStart"))?;
                 let payload = msg
@@ -226,7 +237,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     "ok": 1.0,
                 };
                 write_op_msg(&mut stream, reqid, &reply).await?;
-                break (st, backend);
+                break (st, backend, instance);
             }
             _ => {
                 write_op_msg(&mut stream, reqid, &doc! { "ok": 1.0 }).await?;
@@ -242,7 +253,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         .parse::<UserIdentifier>()
         .ok()
         .map(|id| status.connect(id, Some(st.db.to_string()).filter(|s| !s.is_empty())));
-    let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
+    let (c2b, b2c) = tokio::select! {
+        copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
+        _ = instance.write_locked() => {
+            tracing::debug!(%peer, "closed: instance write locked");
+            return Ok(());
+        }
+    };
     tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
 
     Ok(())

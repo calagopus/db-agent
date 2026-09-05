@@ -16,12 +16,16 @@ mod get {
     pub struct Params {
         #[garde(inner(custom(crate::instance::validate_database_name)))]
         db: Option<String>,
+        #[garde(skip)]
+        #[serde(default)]
+        lock: bool,
     }
 
     #[utoipa::path(get, path = "/", responses(
         (status = OK, body = String),
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
     ), params(
         (
             "instance" = uuid::Uuid,
@@ -32,6 +36,10 @@ mod get {
             "db" = Option<String>, Query,
             description = "The db to export, everything if omitted",
         ),
+        (
+            "lock" = Option<bool>, Query,
+            description = "Write lock the instance for the duration of the export, refusing writes through the api and dropping client connections",
+        ),
     ))]
     pub async fn route(instance: GetInstance, Query(params): Query<Params>) -> ApiResponseResult {
         if let Err(errors) = crate::utils::validate_data(&params) {
@@ -40,7 +48,7 @@ mod get {
                 .ok();
         }
 
-        let reader = instance.export(params.db.as_deref()).await?;
+        let reader = instance.export(params.db.as_deref(), params.lock).await?;
 
         ApiResponse::new_stream(reader)
             .with_header("Content-Type", "application/octet-stream")

@@ -187,6 +187,10 @@ impl super::Instance {
         database: &str,
         read_only: bool,
     ) -> Result<TenantConnection, anyhow::Error> {
+        if !read_only {
+            self.ensure_unlocked("write to the database")?;
+        }
+
         self.ensure_online("explore the database").await?;
 
         let permit = tokio::time::timeout(
@@ -259,6 +263,9 @@ impl super::Instance {
         max_rows: u32,
         read_only: bool,
     ) -> Result<Vec<QueryResultSet>, anyhow::Error> {
+        // read_only is a session default the query itself can switch off
+        self.ensure_unlocked("run a query")?;
+
         let mut connection = self.connect_explorer(database, read_only).await?;
         connection.inner.close_on_drop();
 

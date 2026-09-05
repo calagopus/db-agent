@@ -130,6 +130,45 @@ impl DatabasePermission {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteLockReason {
+    Export,
+    Import,
+}
+
+impl WriteLockReason {
+    #[inline]
+    pub fn to_str(self) -> &'static str {
+        match self {
+            WriteLockReason::Export => "exporting",
+            WriteLockReason::Import => "importing",
+        }
+    }
+}
+
+pub struct WriteLockGuard(Instance);
+
+impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        self.0.write_lock.send_replace(None);
+    }
+}
+
+struct LockedReader<R> {
+    inner: R,
+    _guard: WriteLockGuard,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LockedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 fn duplicate_database_permission() -> anyhow::Error {
     crate::response::DisplayError::new("the same database appears twice in the permission list")
         .with_status(axum::http::StatusCode::BAD_REQUEST)
@@ -147,6 +186,7 @@ pub struct InnerInstance {
     backend_auth_error: RwLock<Option<String>>,
 
     power_lock: tokio::sync::Mutex<()>,
+    write_lock: tokio::sync::watch::Sender<Option<WriteLockReason>>,
 
     pub suspended: AtomicBool,
 
@@ -193,6 +233,7 @@ impl Instance {
                 process_handle: RwLock::new(None),
                 backend_auth_error: RwLock::new(None),
                 power_lock: tokio::sync::Mutex::new(()),
+                write_lock: tokio::sync::watch::Sender::new(None),
                 suspended,
                 operations: operations::OperationManager::new(websocket.clone()),
                 websocket,
@@ -230,6 +271,63 @@ impl Instance {
         }
 
         None
+    }
+
+    #[inline]
+    pub fn write_locked_state(&self) -> Option<&'static str> {
+        self.write_lock.borrow().map(WriteLockReason::to_str)
+    }
+
+    /// resolves once a write lock is taken, immediately if one is already held
+    pub async fn write_locked(&self) {
+        let _ = self
+            .write_lock
+            .subscribe()
+            .wait_for(|lock| lock.is_some())
+            .await;
+    }
+
+    pub fn try_write_lock(
+        &self,
+        reason: WriteLockReason,
+        action: &str,
+    ) -> anyhow::Result<WriteLockGuard> {
+        let mut locked_state = None;
+        self.write_lock.send_if_modified(|lock| match lock {
+            Some(state) => {
+                locked_state = Some(state.to_str());
+                false
+            }
+            None => {
+                *lock = Some(reason);
+                true
+            }
+        });
+
+        if let Some(state) = locked_state {
+            return Err(self.write_locked_error(state, action));
+        }
+
+        tracing::info!(instance = %self.uuid, "write locked: {}", reason.to_str());
+
+        Ok(WriteLockGuard(self.clone()))
+    }
+
+    pub fn ensure_unlocked(&self, action: &str) -> anyhow::Result<()> {
+        match self.write_locked_state() {
+            Some(state) => Err(self.write_locked_error(state, action)),
+            None => Ok(()),
+        }
+    }
+
+    fn write_locked_error(&self, state: &str, action: &str) -> anyhow::Error {
+        tracing::debug!(instance = %self.uuid, "instance write locked at check: {state}");
+
+        crate::response::DisplayError::new(format!(
+            "the instance is write locked ({state}), cannot {action}"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT)
+        .into()
     }
 
     pub async fn verify_mongodb_auth(&self) -> anyhow::Result<()> {
@@ -321,6 +419,8 @@ impl Instance {
     }
 
     async fn ensure_acl_writable(&self, action: &str) -> anyhow::Result<()> {
+        self.ensure_unlocked(action)?;
+
         if self.data.read().await.database_type == DatabaseType::Redis {
             return Ok(());
         }
@@ -954,7 +1054,12 @@ impl Instance {
     pub async fn export(
         &self,
         db: Option<&str>,
+        lock: bool,
     ) -> anyhow::Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
+        let guard = lock
+            .then(|| self.try_write_lock(WriteLockReason::Export, "export a database"))
+            .transpose()?;
+
         let data = self.data.read().await;
         let socket = &data.socket_path;
 
@@ -967,7 +1072,9 @@ impl Instance {
                         "pg_dump --no-owner --no-privileges -h {dir} -U postgres {}",
                         crate::utils::shell_quote(db)
                     ),
-                    None => format!("pg_dumpall --no-owner --no-privileges -h {dir} -U postgres"),
+                    None => format!(
+                        "pg_dumpall --no-owner --no-privileges --clean --if-exists -h {dir} -U postgres"
+                    ),
                 }
             }
             DatabaseType::Mariadb => {
@@ -977,7 +1084,9 @@ impl Instance {
                         "mariadb-dump --socket={socket} -u root {}",
                         crate::utils::shell_quote(db)
                     ),
-                    None => format!("mariadb-dump --socket={socket} -u root --all-databases"),
+                    None => format!(
+                        "mariadb-dump --socket={socket} -u root --single-transaction --skip-dump-date --all-databases"
+                    ),
                 }
             }
             DatabaseType::Mongodb => {
@@ -1029,13 +1138,20 @@ return table.concat(out)"#,
             .await?;
 
         let uuid = self.uuid;
-
-        Ok(Box::new(tokio_util::io::StreamReader::new(
+        let reader = tokio_util::io::StreamReader::new(
             stream
                 .output
                 .inspect_err(move |err| tracing::error!(instance = %uuid, "export failed: {err}"))
                 .map_err(std::io::Error::other),
-        )))
+        );
+
+        Ok(match guard {
+            Some(guard) => Box::new(LockedReader {
+                inner: reader,
+                _guard: guard,
+            }),
+            None => Box::new(reader),
+        })
     }
 
     pub async fn import(
@@ -1043,6 +1159,7 @@ return table.concat(out)"#,
         db: Option<&str>,
         source_db: Option<&str>,
         wipe: bool,
+        lock: bool,
         reader: &mut (dyn tokio::io::AsyncRead + Send + Unpin),
     ) -> anyhow::Result<()> {
         if source_db.is_some() {
@@ -1060,18 +1177,34 @@ return table.concat(out)"#,
             }
         }
 
+        let _guard = self.try_import_lock(lock)?;
+
         self.import_inner(db, source_db, wipe, reader).await
     }
 
-    pub async fn check_import(
+    /// the guard has to outlive the import it was taken for
+    pub async fn prepare_import(
         &self,
         db: Option<&str>,
         source_db: Option<&str>,
         wipe: bool,
-    ) -> anyhow::Result<()> {
+        lock: bool,
+    ) -> anyhow::Result<Option<WriteLockGuard>> {
         check_import_args(self.data.read().await.database_type, db, source_db, wipe)?;
 
-        self.ensure_online("import a database").await
+        self.ensure_online("import a database").await?;
+
+        self.try_import_lock(lock)
+    }
+
+    fn try_import_lock(&self, lock: bool) -> anyhow::Result<Option<WriteLockGuard>> {
+        if !lock {
+            self.ensure_unlocked("import a database")?;
+            return Ok(None);
+        }
+
+        self.try_write_lock(WriteLockReason::Import, "import a database")
+            .map(Some)
     }
 
     async fn import_inner(
@@ -1156,7 +1289,7 @@ return table.concat(out)"#,
                             crate::utils::shell_quote(&format!("{db}.*"))
                         )
                     }
-                    _ => format!("mongorestore --uri={uri}{auth} --archive"),
+                    _ => format!("mongorestore --uri={uri}{auth} --archive --drop"),
                 };
                 (None, import)
             }

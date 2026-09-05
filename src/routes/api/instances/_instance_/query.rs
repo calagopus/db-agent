@@ -29,6 +29,7 @@ mod post {
         (status = OK, body = inline(Response)),
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
+        (status = CONFLICT, body = ApiError),
     ), params(
         (
             "instance" = uuid::Uuid,
@@ -45,6 +46,8 @@ mod post {
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
         }
+
+        instance.ensure_unlocked("run a query")?;
 
         let result = instance
             .connection()

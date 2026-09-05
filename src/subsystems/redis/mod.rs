@@ -155,6 +155,18 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         client.write_all(b"-ERR database is locked\r\n").await?;
         return Ok(());
     }
+    if let Some(state) = creds.instance.write_locked_state() {
+        tracing::debug!(
+            %peer,
+            instance = %creds.instance.uuid,
+            state = %state,
+            "rejected: instance write locked"
+        );
+        client
+            .write_all(b"-ERR database is write locked\r\n")
+            .await?;
+        return Ok(());
+    }
 
     let mut backend = match UnixStream::connect(&creds.instance.get_socket_path().await).await {
         Ok(backend) => backend,
@@ -175,7 +187,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let _guard = user_id.map(|id| status.connect(id, None));
-    let (c2b, b2c) = tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    let (c2b, b2c) = tokio::select! {
+        copied = tokio::io::copy_bidirectional(&mut client, &mut backend) => copied?,
+        _ = creds.instance.write_locked() => {
+            tracing::debug!(%peer, "closed: instance write locked");
+            return Ok(());
+        }
+    };
     tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }

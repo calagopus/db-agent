@@ -143,6 +143,16 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         );
         return Ok(());
     }
+    if let Some(state) = creds.instance.write_locked_state() {
+        protocol::send_error(&mut stream, "57P03", "database is write locked").await?;
+        tracing::debug!(
+            %peer,
+            instance = %creds.instance.uuid,
+            state = %state,
+            "rejected: instance write locked"
+        );
+        return Ok(());
+    }
 
     if !scram::authenticate_client(&mut stream, &creds.password).await? {
         protocol::send_error(&mut stream, "28P01", "authentication failed").await?;
@@ -174,7 +184,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let _guard =
         user_id.map(|id| status.connect(id, Some(database.to_string()).filter(|s| !s.is_empty())));
-    let (c2b, b2c) = copy_bidirectional(&mut stream, &mut backend).await?;
+    let (c2b, b2c) = tokio::select! {
+        copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
+        _ = creds.instance.write_locked() => {
+            tracing::debug!(%peer, "closed: instance write locked");
+            return Ok(());
+        }
+    };
     tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
 }
