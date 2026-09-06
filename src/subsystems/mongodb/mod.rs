@@ -256,7 +256,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let (c2b, b2c) = tokio::select! {
         copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
         _ = instance.write_locked() => {
-            tracing::debug!(%peer, "closed: instance write locked");
+            tracing::info!(%peer, "closed: instance write locked");
             return Ok(());
         }
     };

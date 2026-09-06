@@ -187,7 +187,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let (c2b, b2c) = tokio::select! {
         copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
         _ = creds.instance.write_locked() => {
-            tracing::debug!(%peer, "closed: instance write locked");
+            tracing::info!(%peer, "closed: instance write locked");
+            protocol::send_error(&mut stream, "57P01", "database is write locked, connection closed").await?;
             return Ok(());
         }
     };

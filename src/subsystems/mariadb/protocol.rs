@@ -3,6 +3,7 @@ use crate::{
     utils::{bad, get_array, handshake_step},
 };
 use rand::RngExt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
@@ -49,7 +50,12 @@ pub fn random_scramble() -> [u8; 20] {
     std::array::from_fn(|_| rng.random_range(33..=126))
 }
 
-pub fn server_handshake(scramble: &[u8; 20], ssl: bool) -> Vec<u8> {
+pub fn next_connection_id() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn server_handshake(scramble: &[u8; 20], connection_id: u32, ssl: bool) -> Vec<u8> {
     let mut caps = CAPS;
     if ssl {
         caps |= CLIENT_SSL;
@@ -57,7 +63,7 @@ pub fn server_handshake(scramble: &[u8; 20], ssl: bool) -> Vec<u8> {
     let mut p = vec![10]; // protocol version
     p.extend_from_slice(b"8.0.30"); // a plain MySQL version: standard capability negotiation
     p.push(0);
-    p.extend_from_slice(&1u32.to_le_bytes()); // connection id
+    p.extend_from_slice(&connection_id.to_le_bytes());
     p.extend_from_slice(&scramble[..8]); // auth-plugin-data-1
     p.push(0); // filler
     p.extend_from_slice(&(caps as u16).to_le_bytes()); // capabilities lower

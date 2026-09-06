@@ -64,11 +64,12 @@ async fn handle(
     peer: SocketAddr,
 ) -> std::io::Result<()> {
     let scramble = protocol::random_scramble();
+    let connection_id = protocol::next_connection_id();
     let ssl_offered = acceptor.is_some();
     write_packet(
         &mut tcp,
         0,
-        &protocol::server_handshake(&scramble, ssl_offered),
+        &protocol::server_handshake(&scramble, connection_id, ssl_offered),
     )
     .await?;
 
@@ -79,10 +80,19 @@ async fn handle(
         tracing::debug!(%peer, "connection (tls)");
         let acceptor = acceptor.ok_or_else(|| bad("ssl requested without acceptor"))?;
         let tls = crate::utils::handshake_step(acceptor.accept(tcp)).await?;
-        session(tls, &status, &routes, scramble, None, peer).await
+        session(tls, &status, &routes, scramble, connection_id, None, peer).await
     } else {
         tracing::debug!(%peer, "connection (plain)");
-        session(tcp, &status, &routes, scramble, Some((seq, first)), peer).await
+        session(
+            tcp,
+            &status,
+            &routes,
+            scramble,
+            connection_id,
+            Some((seq, first)),
+            peer,
+        )
+        .await
     }
 }
 
@@ -91,6 +101,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     status: &Arc<SubsystemConnections>,
     routes: &DatabaseRouteManager,
     scramble: [u8; 20],
+    connection_id: u32,
     preread: Option<(u8, Vec<u8>)>,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
@@ -217,7 +228,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     write_packet(&mut stream, seq + 1, &protocol::ok_packet()).await?;
-    tracing::info!(%peer, user = %hr.user, database = %hr.database, "client authenticated");
+    tracing::info!(%peer, conn = connection_id, user = %hr.user, database = %hr.database, "client authenticated");
     tracing::debug!(%peer, "backend ready, relaying");
 
     let _guard = user_id
@@ -225,7 +236,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let (c2b, b2c) = tokio::select! {
         copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
         _ = creds.instance.write_locked() => {
-            tracing::debug!(%peer, "closed: instance write locked");
+            tracing::info!(%peer, conn = connection_id, "closed: instance write locked");
+            write_packet(
+                &mut stream,
+                1,
+                &protocol::err_packet(1053, "08S01", "database is write locked, connection closed"),
+            )
+            .await?;
             return Ok(());
         }
     };

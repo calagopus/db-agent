@@ -190,7 +190,10 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let (c2b, b2c) = tokio::select! {
         copied = tokio::io::copy_bidirectional(&mut client, &mut backend) => copied?,
         _ = creds.instance.write_locked() => {
-            tracing::debug!(%peer, "closed: instance write locked");
+            tracing::info!(%peer, "closed: instance write locked");
+            client
+                .write_all(b"-ERR database is write locked, connection closed\r\n")
+                .await?;
             return Ok(());
         }
     };

@@ -1,4 +1,5 @@
-use std::str::FromStr;
+use rustix::net::sockopt;
+use std::{str::FromStr, time::Duration};
 
 pub fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
     let host = host
@@ -56,6 +57,16 @@ pub fn tcp_congestion_control_supported(algorithm: &str) -> bool {
 #[cfg(not(target_os = "linux"))]
 pub fn tcp_congestion_control_supported(_algorithm: &str) -> bool {
     false
+}
+
+pub fn apply_socket_keepalive<F: std::os::fd::AsFd>(stream: &F) {
+    let result = sockopt::set_socket_keepalive(stream, true)
+        .and_then(|()| sockopt::set_tcp_keepidle(stream, Duration::from_secs(60)))
+        .and_then(|()| sockopt::set_tcp_keepintvl(stream, Duration::from_secs(15)))
+        .and_then(|()| sockopt::set_tcp_keepcnt(stream, 4));
+    if let Err(err) = result {
+        tracing::debug!("failed to set tcp keepalive on connection: {}", err);
+    }
 }
 
 #[cfg(target_os = "linux")]

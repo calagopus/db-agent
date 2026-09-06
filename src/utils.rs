@@ -98,6 +98,7 @@ pub async fn accept_loop<
     loop {
         match listener.accept().await {
             Ok((tcp, peer)) => {
+                crate::net::apply_socket_keepalive(&tcp);
                 let fut = on_accept(tcp, peer);
                 tokio::spawn(async move {
                     match fut.await {
