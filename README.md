@@ -11,5 +11,4 @@
 db-agent is a high-performance, low-latency database proxy and agent written in Rust. It is designed to handle database-routing and provisioning
 for PostgreSQL, MySQL, Redis and MongoDB, with a focus on security, scalability, and ease of use. It provides a dedicated REST API for management.
 
-> [!NOTE]
-> db-agent is currently not production-ready. It is being tested and developed on.
+To be compatible with ridiculous versions of various specifications, we only ever parse & "handle" the authentication phase of the database protocols, ensuring that clients can connect seamlessly while maintaining security and protocol compliance. After authentication, db-agent hands off the full duplex communication to the respective database server, allowing normal operation to continue without interference.
