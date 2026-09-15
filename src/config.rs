@@ -6,7 +6,7 @@ use serde_default::DefaultFromSerde;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
-    io::BufRead,
+    io::{BufRead, BufWriter, IsTerminal},
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -84,6 +84,9 @@ fn redis_bind() -> SocketAddr {
 }
 fn api_bind() -> String {
     "0.0.0.0:8090".to_string()
+}
+fn api_request_log_limit() -> usize {
+    250
 }
 fn api_remote_import_blocked_cidrs() -> Vec<cidr::IpCidr> {
     // SAFETY: every literal below is a valid cidr
@@ -379,6 +382,8 @@ nestify::nest! {
             pub token: String,
             #[serde(default)]
             pub disable_openapi_docs: bool,
+            #[serde(default = "api_request_log_limit")]
+            pub request_log_limit: usize,
             #[serde(default)]
             pub disable_remote_import: bool,
             #[serde(default = "api_remote_import_blocked_cidrs")]
@@ -422,6 +427,8 @@ pub const FORBIDDEN_PATHS: &[&str] = &[
 pub type ConfigSnapshot = arc_swap::Guard<Arc<InnerConfig>>;
 type ReloadHandle =
     tracing_subscriber::reload::Handle<Targets, Layered<LevelFilter, tracing_subscriber::Registry>>;
+
+const LOG_CHANNEL_LINES: usize = 4096;
 
 fn log_filter(debug: bool) -> Targets {
     let crate_level = if debug {
@@ -472,7 +479,10 @@ impl Config {
 
         Self::ensure_directories(&inner)?;
 
-        let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+        let (stdout_writer, stdout_guard) =
+            tracing_appender::non_blocking::NonBlockingBuilder::default()
+                .buffered_lines_limit(LOG_CHANNEL_LINES)
+                .finish(BufWriter::new(std::io::stdout()));
 
         let latest_file = std::fs::OpenOptions::new()
             .create(true)
@@ -490,8 +500,8 @@ impl Config {
 
         let (file_writer, file_guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
-                .buffered_lines_limit(50)
-                .finish(latest_file.and(rolling));
+                .buffered_lines_limit(LOG_CHANNEL_LINES)
+                .finish(BufWriter::new(latest_file.and(rolling)));
 
         Self::save_to(path, &inner)?;
 
@@ -504,6 +514,7 @@ impl Config {
                 "%Y-%m-%d %H:%M:%S %z".to_string(),
             ))
             .with_writer(stdout_writer.and(file_writer))
+            .with_ansi(std::io::stdout().is_terminal())
             .with_target(false)
             .with_level(true)
             .with_file(true)
