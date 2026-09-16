@@ -1,5 +1,5 @@
 use super::{DatabaseType, executor::NetworkedContainerOptions};
-use crate::net::{host_to_ip, is_blocked_ip};
+use crate::net::{host_to_ip, is_blocked_ip, unbracket};
 use futures_util::{StreamExt, TryStreamExt};
 use mongodb::options::{ConnectionString, HostInfo, ServerAddress};
 use std::{
@@ -243,7 +243,7 @@ impl super::Instance {
 
                 let mut flags = format!(
                     "-h {} -P {}",
-                    crate::utils::shell_quote(url.host_str().unwrap_or_default()),
+                    crate::utils::shell_quote(unbracket(url.host_str().unwrap_or_default())),
                     url.port().unwrap_or(3306)
                 );
                 if !url.username().is_empty() {

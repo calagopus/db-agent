@@ -1,13 +1,14 @@
 use rustix::net::sockopt;
 use std::{str::FromStr, time::Duration};
 
-pub fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
-    let host = host
-        .strip_prefix('[')
+pub fn unbracket(host: &str) -> &str {
+    host.strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(host)
+}
 
-    std::net::IpAddr::from_str(host).ok()
+pub fn host_to_ip(host: &str) -> Option<std::net::IpAddr> {
+    std::net::IpAddr::from_str(unbracket(host)).ok()
 }
 
 pub fn is_blocked_ip(cidrs: &[cidr::IpCidr], ip: &std::net::IpAddr) -> bool {
