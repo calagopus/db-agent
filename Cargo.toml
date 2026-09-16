@@ -1,5 +1,6 @@
 [package]
 name = "db-agent"
+license = "MIT"
 version = "1.2.1"
 edition = "2024"
 rust-version = "1.97.0"
