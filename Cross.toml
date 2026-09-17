@@ -7,6 +7,9 @@
 # and cargo execs the test binary directly. Deliberately no CARGO_TARGET_*_RUNNER.
 [target.powerpc64le-unknown-linux-musl]
 image = "ghcr.io/rust-cross/rust-musl-cross:powerpc64le-musl"
+# The image ships rustc 1.95.0 at /root/.cargo/bin, ahead of the host toolchain cross
+# appends to PATH, which trips our 1.97.0 rust-version. Drop it so the host's wins.
+pre-build = ["rm -rf /root/.cargo /root/.rustup"]
 
 [target.powerpc64le-unknown-linux-musl.env]
 # The linker is set in the image's own /root/.cargo/config.toml, which cross shadows by

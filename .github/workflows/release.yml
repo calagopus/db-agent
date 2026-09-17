@@ -56,10 +56,6 @@ jobs:
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-musl
 
-    env:
-      # riscv64gc musl is not crt-static by default (??)
-      RUSTFLAGS: "-C target-feature=+crt-static"
-
     steps:
       - name: Checkout sources
         uses: actions/checkout@v7
@@ -79,9 +75,14 @@ jobs:
         uses: docker/setup-qemu-action@v4
 
       - name: Run cargo test
+        env:
+          # riscv64gc musl is not crt-static by default (??)
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cross test --release --target ${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Prepare binary with platform name
