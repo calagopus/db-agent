@@ -25,7 +25,7 @@ impl PostgresExplorer {
             .after_connect(|connection, _| {
                 Box::pin(async move {
                     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                        "SET statement_timeout = {QUERY_STATEMENT_TIMEOUT_MS}; SET bytea_output = 'hex'"
+                        "SET statement_timeout = {QUERY_STATEMENT_TIMEOUT_MS}; SET bytea_output = 'hex'; SET DateStyle = 'ISO, YMD'"
                     )))
                     .execute(connection)
                     .await?;
@@ -152,10 +152,13 @@ const POSTGRES_TABLE_COLUMNS: &str = "SELECT a.attname AS name,
     (a.attidentity <> ''
         OR COALESCE(pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%', false))
         AS auto_increment,
-    COALESCE(i.indisprimary AND a.attnum = ANY (i.indkey::int2[]), false) AS primary_key
+    COALESCE(i.indisprimary AND a.attnum = ANY (i.indkey::int2[]), false) AS primary_key,
+    (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) FROM pg_catalog.pg_enum e
+        WHERE e.enumtypid = COALESCE(NULLIF(t.typbasetype, 0), a.atttypid)) AS enum_values
     FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
     LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
     LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary
     WHERE n.nspname = $1 AND c.relname = $2
@@ -182,10 +185,13 @@ const POSTGRES_COLUMNS: &str = "SELECT n.nspname AS schema, c.relname AS table_n
     (a.attidentity <> ''
         OR COALESCE(pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%', false))
         AS auto_increment,
-    COALESCE(i.indisprimary AND a.attnum = ANY (i.indkey::int2[]), false) AS primary_key
+    COALESCE(i.indisprimary AND a.attnum = ANY (i.indkey::int2[]), false) AS primary_key,
+    (SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder) FROM pg_catalog.pg_enum e
+        WHERE e.enumtypid = COALESCE(NULLIF(t.typbasetype, 0), a.atttypid)) AS enum_values
     FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+    JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
     LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
     LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND i.indisprimary
     WHERE c.relkind = ANY ('{r,p,v,m,f}')
@@ -209,6 +215,8 @@ fn postgres_column(row: &PgRow) -> Result<SchemaColumn, sqlx::Error> {
         auto_increment: row.try_get("auto_increment")?,
         generated: row.try_get("generated")?,
         binary,
+        enum_values: row.try_get("enum_values")?,
+        set_values: None,
     })
 }
 

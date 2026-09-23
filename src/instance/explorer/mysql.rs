@@ -127,10 +127,57 @@ const MYSQL_TABLE_COLUMNS: &str = "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_DEFAU
     FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
     ORDER BY ORDINAL_POSITION";
 
+fn mysql_value_list(column_type: &str, prefix: &str) -> Option<Vec<String>> {
+    let mut chars = column_type
+        .strip_prefix(prefix)?
+        .strip_suffix(')')?
+        .chars()
+        .peekable();
+    let mut values = Vec::new();
+
+    loop {
+        if chars.next()? != '\'' {
+            return None;
+        }
+
+        let mut value = String::new();
+        loop {
+            match chars.next()? {
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    value.push('\'');
+                }
+                '\'' => break,
+                '\\' => value.push(match chars.next()? {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '0' => '\0',
+                    'b' => '\x08',
+                    'Z' => '\x1a',
+                    other => other,
+                }),
+                other => value.push(other),
+            }
+        }
+        values.push(value);
+
+        match chars.next() {
+            None => return Some(values),
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
 fn mysql_column(row: &MySqlRow) -> Result<SchemaColumn, sqlx::Error> {
+    let type_name: String = row.try_get("COLUMN_TYPE")?;
+
     Ok(SchemaColumn {
         name: row.try_get("COLUMN_NAME")?,
-        type_name: row.try_get("COLUMN_TYPE")?,
+        enum_values: mysql_value_list(&type_name, "enum("),
+        set_values: mysql_value_list(&type_name, "set("),
+        type_name,
         cast_type: None,
         nullable: row.try_get::<i64, _>("nullable")? != 0,
         default: row

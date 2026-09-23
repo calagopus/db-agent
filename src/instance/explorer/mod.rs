@@ -434,6 +434,8 @@ pub struct SchemaColumn {
     pub auto_increment: bool,
     pub generated: bool,
     pub binary: bool,
+    pub enum_values: Option<Vec<String>>,
+    pub set_values: Option<Vec<String>>,
 }
 
 #[derive(ToSchema, Serialize, Clone)]
