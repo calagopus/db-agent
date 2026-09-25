@@ -124,12 +124,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let user_id = user.parse::<UserIdentifier>().ok();
     let creds = user_id.and_then(|id| routes.find(DatabaseType::Postgres, &id));
     let Some(creds) = creds else {
-        protocol::send_error(
-            &mut stream,
-            "28P01",
-            &format!("no credential for user {user}"),
-        )
-        .await?;
+        scram::authenticate_client(&mut stream, None).await?;
+        protocol::send_error(&mut stream, "28P01", "authentication failed").await?;
+        tracing::debug!(%peer, %user, "rejected: no credential for user");
         return Ok(());
     };
 
@@ -154,7 +151,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    if !scram::authenticate_client(&mut stream, &creds.password).await? {
+    if !scram::authenticate_client(&mut stream, Some(&creds.password)).await? {
         protocol::send_error(&mut stream, "28P01", "authentication failed").await?;
         return Ok(());
     }

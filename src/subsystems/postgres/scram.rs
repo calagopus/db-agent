@@ -17,7 +17,7 @@ const SCRAM_ITERATIONS: u32 = 4096;
 
 pub async fn authenticate_client<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    password: &str,
+    password: Option<&str>,
 ) -> std::io::Result<bool> {
     let mut advert = 10i32.to_be_bytes().to_vec();
     advert.extend_from_slice(b"SCRAM-SHA-256\0\0");
@@ -57,7 +57,11 @@ pub async fn authenticate_client<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(bad("malformed client-final"));
     };
 
-    let salted = pbkdf2_sha256(password.as_bytes(), &salt, SCRAM_ITERATIONS);
+    let salted = pbkdf2_sha256(
+        password.unwrap_or_default().as_bytes(),
+        &salt,
+        SCRAM_ITERATIONS,
+    );
     let client_key = hmac(&salted, b"Client Key");
     let stored_key = sha256(&client_key);
     let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
@@ -70,7 +74,7 @@ pub async fn authenticate_client<S: AsyncRead + AsyncWrite + Unpin>(
     let Ok(given) = B64.decode(proof_b64) else {
         return Err(bad("bad proof base64"));
     };
-    if !constant_time_eq::constant_time_eq(&expected, &given) {
+    if !constant_time_eq::constant_time_eq(&expected, &given) || password.is_none() {
         return Ok(false);
     }
 

@@ -120,16 +120,16 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let user_id = hr.user.parse::<UserIdentifier>().ok();
     let Some(creds) = user_id.and_then(|id| routes.find(DatabaseType::Mariadb, &id)) else {
+        let (_, seq) =
+            native_auth_response(&mut stream, &hr.plugin, hr.auth_response, cseq, &scramble)
+                .await?;
         write_packet(
             &mut stream,
-            cseq + 1,
-            &protocol::err_packet(
-                1045,
-                "28000",
-                &format!("no credential for user {}", hr.user),
-            ),
+            seq + 1,
+            &protocol::err_packet(1045, "28000", "access denied"),
         )
         .await?;
+        tracing::debug!(%peer, user = %hr.user, "rejected: no credential for user");
         return Ok(());
     };
 
@@ -164,18 +164,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    let (mut token, mut seq) = (hr.auth_response, cseq);
-    if hr.plugin != protocol::NATIVE {
-        write_packet(
-            &mut stream,
-            seq + 1,
-            &protocol::auth_switch_request(&scramble),
-        )
-        .await?;
-        let (s2, t2) = read_packet(&mut stream).await?;
-        token = t2;
-        seq = s2;
-    }
+    let (token, seq) =
+        native_auth_response(&mut stream, &hr.plugin, hr.auth_response, cseq, &scramble).await?;
 
     if !constant_time_eq::constant_time_eq(
         &token,
@@ -248,6 +238,21 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     };
     tracing::debug!(%peer, "closed (c->b {c2b} B, b->c {b2c} B)");
     Ok(())
+}
+
+async fn native_auth_response<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    plugin: &str,
+    token: Vec<u8>,
+    seq: u8,
+    scramble: &[u8; 20],
+) -> std::io::Result<(Vec<u8>, u8)> {
+    if plugin == protocol::NATIVE {
+        return Ok((token, seq));
+    }
+    write_packet(stream, seq + 1, &protocol::auth_switch_request(scramble)).await?;
+    let (seq, token) = read_packet(stream).await?;
+    Ok((token, seq))
 }
 
 /// yields the backend's err packet when it refuses the relayed credentials, so the session can

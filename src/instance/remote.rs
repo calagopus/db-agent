@@ -99,6 +99,16 @@ fn mariadb_uses_tls(url: &Url) -> bool {
     })
 }
 
+fn mariadb_verifies_tls(url: &Url) -> bool {
+    url.query_pairs().any(|(key, value)| {
+        matches!(key.as_ref(), "ssl-mode" | "sslmode" | "ssl")
+            && matches!(
+                value.to_ascii_lowercase().as_str(),
+                "verify_identity" | "verify-full"
+            )
+    })
+}
+
 async fn vetted_hosts(
     hosts: &[String],
     blocked: &[cidr::IpCidr],
@@ -254,6 +264,9 @@ impl super::Instance {
                 }
                 if mariadb_uses_tls(&url) {
                     flags.push_str(" --ssl");
+                }
+                if mariadb_verifies_tls(&url) {
+                    flags.push_str(" --ssl-verify-server-cert");
                 }
 
                 let dump = match &source_db {

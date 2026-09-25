@@ -41,6 +41,15 @@ pub fn hello_doc() -> Document {
     }
 }
 
+pub fn sasl_start_reply(server_first: &str) -> Document {
+    doc! {
+        "conversationId": 1,
+        "done": false,
+        "payload": binary(server_first.as_bytes()),
+        "ok": 1.0,
+    }
+}
+
 pub fn sasl_error(msg: &str) -> Document {
     doc! {
         "ok": 0.0,

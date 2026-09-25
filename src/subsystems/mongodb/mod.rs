@@ -7,11 +7,11 @@ use crate::{
 };
 use bson::doc;
 use protocol::{
-    OP_MSG, OP_QUERY, binary, hello_doc, op_msg_doc, read_message, sasl_error, write_op_msg,
-    write_op_reply,
+    OP_MSG, OP_QUERY, binary, hello_doc, op_msg_doc, read_message, sasl_error, sasl_start_reply,
+    write_op_msg, write_op_reply,
 };
 use scram::Scram;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, copy_bidirectional},
     net::{TcpListener, TcpStream, UnixStream},
@@ -101,7 +101,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     routes: &DatabaseRouteManager,
     peer: SocketAddr,
 ) -> std::io::Result<()> {
-    let mut scram: Option<(Scram, crate::instance::Instance)> = None;
+    let mut scram: Option<(Scram, Option<crate::instance::Instance>)> = None;
 
     let (st, mut backend, instance) = loop {
         let (reqid, opcode, body) = read_message(&mut stream).await?;
@@ -135,8 +135,18 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     .ok()
                     .and_then(|id| routes.find(DatabaseType::Mongodb, &id));
                 let Some(creds) = creds else {
-                    write_op_msg(&mut stream, reqid, &sasl_error("authentication failed")).await?;
-                    return Ok(());
+                    tracing::debug!(%peer, %user, "rejected: no credential for user");
+                    let (st, server_first) = Scram::start(
+                        &crate::utils::generate_password(),
+                        Path::new(""),
+                        bare,
+                        &cnonce,
+                        user,
+                        db,
+                    );
+                    write_op_msg(&mut stream, reqid, &sasl_start_reply(&server_first)).await?;
+                    scram = Some((st, None));
+                    continue;
                 };
 
                 if let Some(state) = creds.instance.locked_state() {
@@ -185,15 +195,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     db,
                 );
 
-                let reply = doc! {
-                    "conversationId": 1,
-                    "done": false,
-                    "payload": binary(server_first.as_bytes()),
-                    "ok": 1.0,
-                };
-                write_op_msg(&mut stream, reqid, &reply).await?;
+                write_op_msg(&mut stream, reqid, &sasl_start_reply(&server_first)).await?;
 
-                scram = Some((st, creds.instance));
+                scram = Some((st, Some(creds.instance)));
             }
             "saslContinue" => {
                 let (st, instance) = scram
@@ -203,7 +207,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     .get_binary_generic("payload")
                     .map_err(|_| bad("no payload"))?;
                 let client_final = String::from_utf8_lossy(payload).into_owned();
-                let Some(server_final) = st.verify(&client_final) else {
+                let (Some(server_final), Some(instance)) = (st.verify(&client_final), instance)
+                else {
                     write_op_msg(&mut stream, reqid, &sasl_error("authentication failed")).await?;
                     return Ok(());
                 };
