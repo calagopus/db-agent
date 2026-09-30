@@ -209,6 +209,13 @@ impl InstanceManager {
             .await
             .retain(|i| i.uuid != instance.uuid);
 
+        instance.route_inserter.clear();
+        instance
+            .app_state
+            .database_route_manager
+            .mariadb_versions
+            .remove(instance.uuid);
+
         Ok(())
     }
 }
@@ -221,6 +228,56 @@ pub struct DatabaseRouteManager {
     pub mariadb: Table,
     pub mongodb: Table,
     pub redis: Table,
+
+    pub mariadb_versions: MariadbVersions,
+}
+
+type MariadbVersion = (u32, u32, u32);
+
+#[derive(Default)]
+pub struct MariadbVersions {
+    versions: RwLock<rustc_hash::FxHashMap<uuid::Uuid, (MariadbVersion, Arc<str>)>>,
+}
+
+impl MariadbVersions {
+    /// ignores anything that is not a mariadb version, keeping the instance's previous one
+    pub fn set(&self, instance: uuid::Uuid, version: &str) -> bool {
+        if version.len() > 60
+            || !version.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+            || !version.to_ascii_lowercase().contains("mariadb")
+        {
+            return false;
+        }
+
+        let mut parts = version
+            .strip_prefix("5.5.5-")
+            .unwrap_or(version)
+            .split(|c: char| !c.is_ascii_digit())
+            .map(|part| part.parse::<u32>().ok());
+        let (Some(Some(major)), Some(Some(minor)), Some(Some(patch))) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+
+        self.versions
+            .write()
+            .insert(instance, ((major, minor, patch), Arc::from(version)));
+
+        true
+    }
+
+    pub fn remove(&self, instance: uuid::Uuid) {
+        self.versions.write().remove(&instance);
+    }
+
+    pub fn lowest(&self) -> Option<Arc<str>> {
+        self.versions
+            .read()
+            .values()
+            .min_by_key(|(parsed, _)| *parsed)
+            .map(|(_, version)| Arc::clone(version))
+    }
 }
 
 impl DatabaseRouteManager {
@@ -314,5 +371,91 @@ impl Drop for DatabaseRouteTableInserter {
         for user in self.inserted_users.get_mut().iter() {
             write.remove(user);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PREFIXED_10: &str = "5.5.5-10.6.21-MariaDB-ubu2004";
+    const PLAIN_11: &str = "11.8.6-MariaDB-ubu2404";
+
+    // MariadbVersions
+
+    #[test]
+    fn mariadb_versions_empty_has_no_lowest() {
+        assert_eq!(MariadbVersions::default().lowest(), None);
+    }
+
+    #[test]
+    fn mariadb_versions_prefixed_sorts_by_real_version_and_keeps_original() {
+        let versions = MariadbVersions::default();
+
+        assert!(versions.set(uuid::Uuid::new_v4(), PLAIN_11));
+        assert!(versions.set(uuid::Uuid::new_v4(), PREFIXED_10));
+
+        assert_eq!(versions.lowest().as_deref(), Some(PREFIXED_10));
+    }
+
+    #[test]
+    fn mariadb_versions_compares_numerically() {
+        let versions = MariadbVersions::default();
+
+        assert!(versions.set(uuid::Uuid::new_v4(), "10.11.0-MariaDB"));
+        assert!(versions.set(uuid::Uuid::new_v4(), "10.6.21-mariadb"));
+
+        assert_eq!(versions.lowest().as_deref(), Some("10.6.21-mariadb"));
+    }
+
+    #[test]
+    fn mariadb_versions_rejects_invalid() {
+        let versions = MariadbVersions::default();
+        let instance = uuid::Uuid::new_v4();
+
+        for version in [
+            "8.0.36",
+            "",
+            "10.6-MariaDB",
+            "10.x.21-MariaDB",
+            "10.6.21-MariaDB\n",
+            "10.6.21-MariaDB-ü",
+            &format!("10.6.21-MariaDB-{}", "a".repeat(60)),
+        ] {
+            assert!(!versions.set(instance, version), "{version:?}");
+        }
+
+        assert_eq!(versions.lowest(), None);
+    }
+
+    #[test]
+    fn mariadb_versions_rejected_set_keeps_previous() {
+        let versions = MariadbVersions::default();
+        let instance = uuid::Uuid::new_v4();
+
+        assert!(versions.set(instance, PLAIN_11));
+        assert!(!versions.set(instance, "8.0.36"));
+
+        assert_eq!(versions.lowest().as_deref(), Some(PLAIN_11));
+    }
+
+    #[test]
+    fn mariadb_versions_lowest_follows_remove_and_reset() {
+        let versions = MariadbVersions::default();
+        let low = uuid::Uuid::new_v4();
+        let high = uuid::Uuid::new_v4();
+
+        assert!(versions.set(low, PREFIXED_10));
+        assert!(versions.set(high, PLAIN_11));
+
+        versions.remove(low);
+        assert_eq!(versions.lowest().as_deref(), Some(PLAIN_11));
+
+        versions.remove(low);
+        assert!(versions.set(high, "11.9.0-MariaDB"));
+        assert_eq!(versions.lowest().as_deref(), Some("11.9.0-MariaDB"));
+
+        versions.remove(high);
+        assert_eq!(versions.lowest(), None);
     }
 }

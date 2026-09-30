@@ -56,6 +56,14 @@ pub async fn run(
     .await
 }
 
+pub async fn read_server_version(socket: &std::path::Path) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket).await?;
+    let (_, hs) = read_packet(&mut stream).await?;
+    let (_, _, version) = protocol::parse_server_handshake(&hs)?;
+
+    Ok(version)
+}
+
 async fn handle(
     mut tcp: TcpStream,
     status: Arc<SubsystemConnections>,
@@ -66,10 +74,18 @@ async fn handle(
     let scramble = protocol::random_scramble();
     let connection_id = protocol::next_connection_id();
     let ssl_offered = acceptor.is_some();
+    let version = routes.mariadb_versions.lowest();
     write_packet(
         &mut tcp,
         0,
-        &protocol::server_handshake(&scramble, connection_id, ssl_offered),
+        &protocol::server_handshake(
+            version
+                .as_deref()
+                .unwrap_or(protocol::FALLBACK_SERVER_VERSION),
+            &scramble,
+            connection_id,
+            ssl_offered,
+        ),
     )
     .await?;
 
@@ -265,7 +281,7 @@ async fn backend_auth(
     client_caps: u32,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let (seq, hs) = read_packet(be).await?;
-    let (scramble, _plugin) = protocol::parse_server_handshake(&hs)?;
+    let (scramble, _plugin, _version) = protocol::parse_server_handshake(&hs)?;
     let token = auth::native_token(&scramble, password.as_bytes());
     write_packet(
         be,

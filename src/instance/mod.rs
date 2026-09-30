@@ -23,6 +23,7 @@ pub mod executor;
 pub mod explorer;
 pub mod identifier;
 pub mod manager;
+pub mod mariadb_version;
 pub mod operations;
 pub mod remote;
 pub mod resources;
@@ -195,11 +196,15 @@ pub struct InnerInstance {
 
     resource_usage: tokio::sync::watch::Sender<resources::ResourceUsage>,
     disk_checker_task: tokio::task::JoinHandle<()>,
+    mariadb_version_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for InnerInstance {
     fn drop(&mut self) {
         self.disk_checker_task.abort();
+        if let Some(task) = &self.mariadb_version_task {
+            task.abort();
+        }
     }
 }
 
@@ -222,6 +227,12 @@ impl Instance {
                 weak.clone(),
                 resource_usage.clone(),
             ));
+            let mariadb_version_task = (data.database_type == DatabaseType::Mariadb).then(|| {
+                tokio::spawn(mariadb_version::run(
+                    weak.clone(),
+                    resource_usage.subscribe(),
+                ))
+            });
 
             InnerInstance {
                 uuid: data.uuid,
@@ -239,6 +250,7 @@ impl Instance {
                 websocket,
                 resource_usage,
                 disk_checker_task,
+                mariadb_version_task,
             }
         }))
     }

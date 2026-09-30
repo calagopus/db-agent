@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
+pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 pub const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 pub const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
@@ -22,7 +23,7 @@ pub const NATIVE: &str = "mysql_native_password";
 
 const MAX_PACKET_LEN: usize = 1024 * 1024;
 
-const CAPS: u32 = CLIENT_LONG_PASSWORD
+const CAPS: u32 = CLIENT_FOUND_ROWS
     | CLIENT_LONG_FLAG
     | CLIENT_PROTOCOL_41
     | CLIENT_SECURE_CONNECTION
@@ -37,6 +38,7 @@ const BACKEND_REQUIRED_CAPS: u32 =
     CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_CONNECT_WITH_DB | CLIENT_PLUGIN_AUTH;
 // Caps safe to pass through from the client as-is.
 const BACKEND_FORWARDABLE_CAPS: u32 = CLIENT_LONG_PASSWORD
+    | CLIENT_FOUND_ROWS
     | CLIENT_LONG_FLAG
     | CLIENT_TRANSACTIONS
     | CLIENT_MULTI_STATEMENTS
@@ -55,13 +57,20 @@ pub fn next_connection_id() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-pub fn server_handshake(scramble: &[u8; 20], connection_id: u32, ssl: bool) -> Vec<u8> {
+pub const FALLBACK_SERVER_VERSION: &str = "5.5.5-10.6.0-MariaDB";
+
+pub fn server_handshake(
+    version: &str,
+    scramble: &[u8; 20],
+    connection_id: u32,
+    ssl: bool,
+) -> Vec<u8> {
     let mut caps = CAPS;
     if ssl {
         caps |= CLIENT_SSL;
     }
     let mut p = vec![10]; // protocol version
-    p.extend_from_slice(b"8.0.30"); // a plain MySQL version: standard capability negotiation
+    p.extend_from_slice(version.as_bytes());
     p.push(0);
     p.extend_from_slice(&connection_id.to_le_bytes());
     p.extend_from_slice(&scramble[..8]); // auth-plugin-data-1
@@ -71,7 +80,7 @@ pub fn server_handshake(scramble: &[u8; 20], connection_id: u32, ssl: bool) -> V
     p.extend_from_slice(&0x0002u16.to_le_bytes()); // status: autocommit
     p.extend_from_slice(&((caps >> 16) as u16).to_le_bytes()); // capabilities upper
     p.push(21); // length of auth-plugin-data (20 + null)
-    p.extend_from_slice(&[0; 10]); // reserved
+    p.extend_from_slice(&[0; 10]); // reserved, zero mariadb caps: handshake_response() forwards none
     p.extend_from_slice(&scramble[8..20]); // auth-plugin-data-2 (12 bytes)
     p.push(0); // null terminator of part 2
     p.extend_from_slice(NATIVE.as_bytes());
@@ -167,9 +176,13 @@ pub fn parse_handshake_response(p: &[u8]) -> std::io::Result<HandshakeResponse> 
     })
 }
 
-pub fn parse_server_handshake(p: &[u8]) -> std::io::Result<([u8; 20], String)> {
-    let mut i = 1; // skip protocol version
-    let _ver = read_cstr(p, &mut i)?;
+/// yields (scramble, auth plugin, server version)
+pub fn parse_server_handshake(p: &[u8]) -> std::io::Result<([u8; 20], String, String)> {
+    if p.first() != Some(&10) {
+        return Err(bad("not a v10 server handshake"));
+    }
+    let mut i = 1;
+    let version = read_cstr(p, &mut i)?;
     i += 4; // connection id
     let mut scramble = [0; 20];
     scramble[..8].copy_from_slice(p.get(i..i + 8).ok_or_else(|| bad("eof"))?);
@@ -188,7 +201,7 @@ pub fn parse_server_handshake(p: &[u8]) -> std::io::Result<([u8; 20], String)> {
     } else {
         String::new()
     };
-    Ok((scramble, plugin))
+    Ok((scramble, plugin, version))
 }
 
 pub fn read_cstr(p: &[u8], i: &mut usize) -> std::io::Result<String> {
