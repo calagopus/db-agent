@@ -128,9 +128,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let hr = protocol::parse_handshake_response(&resp)?;
     tracing::debug!(
         %peer,
-        user = %hr.user,
-        database = %hr.database,
-        plugin = %hr.plugin,
+        user = ?hr.user,
+        database = ?hr.database,
+        plugin = ?hr.plugin,
         "handshake received"
     );
 
@@ -145,7 +145,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
             &protocol::err_packet(1045, "28000", "access denied"),
         )
         .await?;
-        tracing::debug!(%peer, user = %hr.user, "rejected: no credential for user");
+        tracing::debug!(%peer, user = ?hr.user, "rejected: no credential for user");
         return Ok(());
     };
 
@@ -234,7 +234,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     write_packet(&mut stream, seq + 1, &protocol::ok_packet()).await?;
-    tracing::info!(%peer, conn = connection_id, user = %hr.user, database = %hr.database, "client authenticated");
+    tracing::info!(%peer, conn = connection_id, user = %hr.user, database = ?hr.database, "client authenticated");
     tracing::debug!(%peer, "backend ready, relaying");
 
     let _guard = user_id

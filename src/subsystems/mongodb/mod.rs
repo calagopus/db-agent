@@ -128,14 +128,14 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                 let client_first = String::from_utf8_lossy(payload).into_owned();
                 let (bare, cnonce, user) = scram::parse_client_first(&client_first)
                     .ok_or_else(|| bad("bad client-first"))?;
-                tracing::debug!(%peer, %user, database = %db, "saslStart received");
+                tracing::debug!(%peer, ?user, database = ?db, "saslStart received");
 
                 let creds = user
                     .parse::<UserIdentifier>()
                     .ok()
                     .and_then(|id| routes.find(DatabaseType::Mongodb, &id));
                 let Some(creds) = creds else {
-                    tracing::debug!(%peer, %user, "rejected: no credential for user");
+                    tracing::debug!(%peer, ?user, "rejected: no credential for user");
                     let (st, server_first) = Scram::start(
                         &crate::utils::generate_password(),
                         Path::new(""),
@@ -250,7 +250,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
 
-    tracing::info!(%peer, user = %st.user, database = %st.db, "client authenticated");
+    tracing::info!(%peer, user = %st.user, database = ?st.db, "client authenticated");
     tracing::debug!(%peer, "backend ready, relaying");
 
     let _guard = st
