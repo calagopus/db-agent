@@ -406,6 +406,9 @@ async fn main_rt() {
         start_time: Instant::now(),
         container_type: match std::env::var("OCI_CONTAINER").as_deref() {
             Ok("official") => routes::AppContainerType::Official,
+            Ok("official-aio") => routes::AppContainerType::OfficialAIO,
+            Ok("official-heavy") => routes::AppContainerType::OfficialHeavy,
+            Ok("official-heavy-aio") => routes::AppContainerType::OfficialHeavyAIO,
             Ok(_) => routes::AppContainerType::Unknown,
             Err(_) => routes::AppContainerType::None,
         },

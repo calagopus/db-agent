@@ -9,6 +9,11 @@ pub mod api;
 #[serde(rename_all = "snake_case")]
 pub enum AppContainerType {
     Official,
+    #[serde(rename = "official_aio")]
+    OfficialAIO,
+    OfficialHeavy,
+    #[serde(rename = "official_heavy_aio")]
+    OfficialHeavyAIO,
     Unknown,
     None,
 }
