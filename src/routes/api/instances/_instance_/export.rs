@@ -4,6 +4,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 mod get {
     use crate::{
         Query,
+        instance::DatabaseType,
+        io::compression::flate::AsyncFlateReader,
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::instances::_instance_::GetInstance},
     };
@@ -22,7 +24,7 @@ mod get {
     }
 
     #[utoipa::path(get, path = "/", responses(
-        (status = OK, body = String),
+        (status = OK, body = String, description = "A gzip compressed .sql.gz dump for postgres and mariadb, the raw dump otherwise"),
         (status = BAD_REQUEST, body = ApiError),
         (status = NOT_FOUND, body = ApiError),
         (status = CONFLICT, body = ApiError),
@@ -48,11 +50,25 @@ mod get {
                 .ok();
         }
 
+        let database_type = instance.data.read().await.database_type;
         let reader = instance.export(params.db.as_deref(), params.lock).await?;
 
-        ApiResponse::new_stream(reader)
-            .with_header("Content-Type", "application/octet-stream")
-            .ok()
+        match database_type {
+            DatabaseType::Postgres | DatabaseType::Mariadb => {
+                let file_name = params.db.unwrap_or_else(|| instance.uuid.to_string());
+
+                ApiResponse::new_stream(AsyncFlateReader::gzip_encode(reader))
+                    .with_header("Content-Type", "application/gzip")
+                    .with_header(
+                        "Content-Disposition",
+                        &format!("attachment; filename=\"{file_name}.sql.gz\""),
+                    )
+                    .ok()
+            }
+            DatabaseType::Mongodb | DatabaseType::Redis => ApiResponse::new_stream(reader)
+                .with_header("Content-Type", "application/octet-stream")
+                .ok(),
+        }
     }
 }
 

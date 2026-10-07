@@ -6,6 +6,7 @@ mod remote;
 mod post {
     use crate::{
         Query,
+        io::compression::flate::AsyncFlateReader,
         response::{ApiResponse, ApiResponseResult},
         routes::{ApiError, api::instances::_instance_::GetInstance},
     };
@@ -13,6 +14,7 @@ mod post {
     use futures_util::TryStreamExt;
     use garde::Validate;
     use serde::{Deserialize, Serialize};
+    use tokio::io::{AsyncBufReadExt, AsyncRead};
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Validate, Deserialize)]
@@ -59,7 +61,7 @@ mod post {
             "lock" = Option<bool>, Query,
             description = "Write lock the instance for the duration of the import, refusing writes through the api and dropping client connections",
         ),
-    ), request_body = String)]
+    ), request_body(content = String, description = "The dump to import, gzip compressed dumps are detected and decompressed"))]
     pub async fn route(
         instance: GetInstance,
         Query(params): Query<Params>,
@@ -74,6 +76,12 @@ mod post {
         let mut reader = tokio_util::io::StreamReader::new(
             body.into_data_stream().map_err(std::io::Error::other),
         );
+        let gzipped = reader.fill_buf().await?.starts_with(&[0x1f, 0x8b]);
+        let mut reader: Box<dyn AsyncRead + Send + Unpin> = if gzipped {
+            Box::new(AsyncFlateReader::gzip_decode(reader))
+        } else {
+            Box::new(reader)
+        };
 
         instance
             .import(

@@ -1,6 +1,7 @@
 use serde::Serialize;
 use utoipa::ToSchema;
 
+pub mod flate;
 pub mod reader;
 
 #[derive(Debug, Clone, Copy, ToSchema, Serialize, Default)]
