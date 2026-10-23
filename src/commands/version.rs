@@ -20,6 +20,12 @@ impl crate::commands::CliCommand<VersionArgs> for VersionCommand {
                     crate::TARGET
                 );
                 println!(
+                    "upgrades from {} {} ({})",
+                    crate::upgrade::PROVIDER,
+                    crate::upgrade::REPOSITORY,
+                    crate::upgrade::API_URL
+                );
+                println!(
                     "copyright © 2025 - {} Calagopus & Contributors",
                     chrono::Local::now().year()
                 );

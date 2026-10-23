@@ -157,7 +157,8 @@ impl Drop for WriteLockGuard {
 
 struct LockedReader<R> {
     inner: R,
-    _guard: WriteLockGuard,
+    _guard: Option<WriteLockGuard>,
+    _active: manager::ActiveWork,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LockedReader<R> {
@@ -283,6 +284,12 @@ impl Instance {
         }
 
         None
+    }
+
+    /// a start, stop or kill is in flight, a start may have already destroyed the old container
+    #[inline]
+    pub fn power_busy(&self) -> bool {
+        self.power_lock.try_lock().is_err()
     }
 
     #[inline]
@@ -1071,6 +1078,7 @@ impl Instance {
         let guard = lock
             .then(|| self.try_write_lock(WriteLockReason::Export, "export a database"))
             .transpose()?;
+        let active = self.app_state.instance_manager.track_transfer();
 
         let data = self.data.read().await;
         let socket = &data.socket_path;
@@ -1157,13 +1165,11 @@ return table.concat(out)"#,
                 .map_err(std::io::Error::other),
         );
 
-        Ok(match guard {
-            Some(guard) => Box::new(LockedReader {
-                inner: reader,
-                _guard: guard,
-            }),
-            None => Box::new(reader),
-        })
+        Ok(Box::new(LockedReader {
+            inner: reader,
+            _guard: guard,
+            _active: active,
+        }))
     }
 
     pub async fn import(
@@ -1190,6 +1196,7 @@ return table.concat(out)"#,
         }
 
         let _guard = self.try_import_lock(lock)?;
+        let _active = self.app_state.instance_manager.track_transfer();
 
         self.import_inner(db, source_db, wipe, reader).await
     }

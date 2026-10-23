@@ -376,6 +376,8 @@ impl super::Instance {
         wipe: bool,
         bytes_processed: Arc<AtomicU64>,
     ) -> anyhow::Result<()> {
+        let _active = self.app_state.instance_manager.track_transfer();
+
         let stream = self
             .app_state
             .container_executor

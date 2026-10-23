@@ -34,6 +34,7 @@ mod routes;
 mod stats;
 mod subsystems;
 mod tls;
+mod upgrade;
 mod utils;
 
 use extract::{Path, Query};

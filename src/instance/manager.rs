@@ -3,14 +3,35 @@ use futures_util::TryStreamExt;
 use parking_lot::RwLock;
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::Semaphore;
 
+pub struct ActiveWork(Arc<AtomicUsize>);
+
+impl ActiveWork {
+    fn new(active: &Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(active))
+    }
+}
+
+impl Drop for ActiveWork {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Default)]
 pub struct InstanceManager {
     instances: tokio::sync::RwLock<Vec<super::Instance>>,
+    booted: AtomicBool,
+    autostarts: Arc<AtomicUsize>,
+    transfers: Arc<AtomicUsize>,
 }
 
 impl InstanceManager {
@@ -54,8 +75,10 @@ impl InstanceManager {
                     let app_state = app_state.clone();
                     let semaphore = Arc::clone(&semaphore);
                     let instance = instance.clone();
+                    let active = ActiveWork::new(&self.autostarts);
 
                     async move {
+                        let _active = active;
                         tracing::info!(instance = %instance.uuid, "restoring instance state {state:?}");
 
                         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -89,6 +112,7 @@ impl InstanceManager {
         }
 
         drop(write);
+        self.booted.store(true, Ordering::SeqCst);
 
         tokio::spawn({
             let app_state = app_state.clone();
@@ -114,12 +138,7 @@ impl InstanceManager {
                             continue;
                         }
 
-                        match sqlx::query("UPDATE instances SET state = ? WHERE uuid = ?")
-                            .bind(state.to_str())
-                            .bind(uuid)
-                            .execute(app_state.database.write())
-                            .await
-                        {
+                        match Self::persist_state(&app_state.database, uuid, state).await {
                             Ok(_) => {
                                 persisted.insert(uuid, state);
                             }
@@ -131,6 +150,61 @@ impl InstanceManager {
                 }
             }
         });
+    }
+
+    #[inline]
+    pub fn booted(&self) -> bool {
+        self.booted.load(Ordering::SeqCst)
+    }
+
+    /// Instances restored by boot that have not finished starting yet.
+    #[inline]
+    pub fn autostarts(&self) -> usize {
+        self.autostarts.load(Ordering::SeqCst)
+    }
+
+    /// Imports and exports in flight.
+    #[inline]
+    pub fn transfers(&self) -> usize {
+        self.transfers.load(Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn track_transfer(&self) -> ActiveWork {
+        ActiveWork::new(&self.transfers)
+    }
+
+    pub async fn persist(&self, database: &crate::database::Database) -> anyhow::Result<()> {
+        if !self.booted() {
+            anyhow::bail!("instances are still booting");
+        }
+
+        let states: Vec<(uuid::Uuid, ContainerState)> = self
+            .get_instances()
+            .await
+            .iter()
+            .map(|i| (i.uuid, i.resource_usage().state))
+            .collect();
+
+        for (uuid, state) in states {
+            Self::persist_state(database, uuid, state).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn persist_state(
+        database: &crate::database::Database,
+        uuid: uuid::Uuid,
+        state: ContainerState,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE instances SET state = ? WHERE uuid = ?")
+            .bind(state.to_str())
+            .bind(uuid)
+            .execute(database.write())
+            .await?;
+
+        Ok(())
     }
 
     async fn stored_states(

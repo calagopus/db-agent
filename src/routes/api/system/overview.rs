@@ -36,6 +36,13 @@ mod get {
     }
 
     #[derive(ToSchema, Serialize)]
+    struct ResponseUpgrade {
+        provider: &'static str,
+        repository: &'static str,
+        api_url: &'static str,
+    }
+
+    #[derive(ToSchema, Serialize)]
     struct Response<'a> {
         version: &'a str,
         local_time: chrono::DateTime<chrono::Local>,
@@ -50,6 +57,9 @@ mod get {
 
         architecture: &'static str,
         kernel_version: String,
+
+        #[schema(inline)]
+        upgrade: Option<ResponseUpgrade>,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -91,6 +101,14 @@ mod get {
             }
         }
 
+        let upgrade = (matches!(state.container_type, crate::routes::AppContainerType::None)
+            && crate::upgrade::ReleaseProvider::available().is_some())
+        .then_some(ResponseUpgrade {
+            provider: crate::upgrade::PROVIDER,
+            repository: crate::upgrade::REPOSITORY,
+            api_url: crate::upgrade::API_URL,
+        });
+
         ApiResponse::new_serialized(Response {
             version: &state.version,
             local_time: chrono::Local::now(),
@@ -111,6 +129,7 @@ mod get {
             instances,
             architecture: std::env::consts::ARCH,
             kernel_version: System::kernel_long_version(),
+            upgrade,
         })
         .ok()
     }
