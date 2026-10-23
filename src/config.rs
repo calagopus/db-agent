@@ -474,7 +474,7 @@ impl Config {
     ) -> anyhow::Result<(Arc<Self>, LogGuard)> {
         let file = File::open(path).context(format!("failed to open config file {path}"))?;
         let reader = std::io::BufReader::new(file);
-        let inner: InnerConfig = serde_norway::from_reader(reader)
+        let inner: InnerConfig = serde_saphyr::from_reader(reader)
             .context(format!("failed to parse config file {path}"))?;
 
         Self::ensure_directories(&inner)?;
@@ -666,8 +666,8 @@ impl Config {
         let file = options
             .open(path)
             .context(format!("failed to create config file {path}"))?;
-        let writer = std::io::BufWriter::new(file);
-        serde_norway::to_writer(writer, inner)
+        let mut writer = std::io::BufWriter::new(file);
+        serde_saphyr::to_io_writer(&mut writer, inner)
             .context(format!("failed to write config file {path}"))?;
 
         Ok(())

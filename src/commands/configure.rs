@@ -97,7 +97,7 @@ impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
                         }
                     };
 
-                    match serde_norway::from_slice(&decoded) {
+                    match serde_saphyr::from_slice(&decoded) {
                         Ok(patch) => patch,
                         Err(_) => {
                             eprintln!("{}", "failed to decode join data payload!".red());
