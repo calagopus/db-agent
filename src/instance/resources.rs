@@ -46,9 +46,20 @@ pub struct ResourceUsage {
 
     pub cpu_absolute: f64,
     pub uptime: u64,
+    #[serde(skip)]
+    pub started_at: Option<std::time::Instant>,
 }
 
 impl ResourceUsage {
+    /// Fills `uptime` from `started_at`, measured at `at`.
+    pub fn with_uptime_at(mut self, at: std::time::Instant) -> Self {
+        self.uptime = self.started_at.map_or(0, |started_at| {
+            at.saturating_duration_since(started_at).as_millis() as u64
+        });
+
+        self
+    }
+
     /// Resets all metrics tied to a live container, keeping only disk usage.
     pub fn wipe(&mut self, state: ContainerState) {
         *self = Self {

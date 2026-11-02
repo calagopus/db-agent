@@ -1520,7 +1520,9 @@ return table.concat(out)"#,
     }
 
     pub fn resource_usage(&self) -> resources::ResourceUsage {
-        *self.resource_usage.borrow()
+        self.resource_usage
+            .borrow()
+            .with_uptime_at(std::time::Instant::now())
     }
 
     #[inline]

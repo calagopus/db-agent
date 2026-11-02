@@ -155,9 +155,17 @@ pub async fn handle_ws(
 
                 Box::pin(async move {
                     let mut last_state = None;
+                    let mut throttle = tokio::time::interval(std::time::Duration::from_secs(1));
+                    throttle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                     while resource_usage.changed().await.is_ok() {
-                        let usage = *resource_usage.borrow_and_update();
+                        let mut deadline = throttle.tick().await;
+                        if deadline.elapsed() >= std::time::Duration::from_secs(1) {
+                            deadline = throttle.tick().await;
+                        }
+                        let usage = resource_usage
+                            .borrow_and_update()
+                            .with_uptime_at(deadline.into_std());
 
                         if last_state != Some(usage.state) {
                             last_state = Some(usage.state);
@@ -182,8 +190,6 @@ pub async fn handle_ws(
                                 .build(),
                             )
                             .await;
-
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 })
             },

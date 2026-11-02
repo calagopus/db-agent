@@ -21,7 +21,12 @@ pub async fn handle_ws(ws: WebSocketUpgrade, state: GetState) -> Response {
                 let socket = Arc::clone(&socket);
 
                 async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
                     loop {
+                        interval.tick().await;
+
                         let mut utilization = HashMap::new();
                         for instance in state.instance_manager.get_instances().await.iter() {
                             utilization.insert(instance.uuid, instance.resource_usage());
@@ -40,8 +45,6 @@ pub async fn handle_ws(ws: WebSocketUpgrade, state: GetState) -> Response {
                             .await
                             .send(Message::Text(utilization_json.into()))
                             .await?;
-
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
             }),

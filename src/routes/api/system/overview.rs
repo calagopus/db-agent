@@ -66,7 +66,7 @@ mod get {
         (status = OK, body = inline(Response)),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let mut sys = System::new_all();
+        let mut sys = System::new_all()?;
         sys.refresh_cpu_all();
 
         let mut used_bytes_process = 0;
@@ -128,7 +128,7 @@ mod get {
             },
             instances,
             architecture: std::env::consts::ARCH,
-            kernel_version: System::kernel_long_version(),
+            kernel_version: System::kernel_long_version().unwrap_or_else(|_| "unknown".to_string()),
             upgrade,
         })
         .ok()

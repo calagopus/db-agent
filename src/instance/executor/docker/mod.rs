@@ -1367,6 +1367,7 @@ impl DockerProcessHandle {
             struct CachedState {
                 status: Option<bollard::models::ContainerStateStatusEnum>,
                 started_at: Option<chrono::DateTime<chrono::Utc>>,
+                started_instant: Option<Instant>,
             }
 
             let arm_wait = || {
@@ -1420,13 +1421,29 @@ impl DockerProcessHandle {
 
                     let state = inspect.state.unwrap_or_default();
 
+                    let started_at = state.started_at.as_deref().and_then(|started_at| {
+                        chrono::DateTime::parse_from_rfc3339(started_at)
+                            .ok()
+                            .map(|started_at| started_at.with_timezone(&chrono::Utc))
+                    });
+                    let started_instant = match &cached {
+                        Some(previous) if previous.started_at == started_at => {
+                            previous.started_instant
+                        }
+                        _ => started_at.map(|started_at| {
+                            let now = Instant::now();
+                            let elapsed = (chrono::Utc::now() - started_at)
+                                .to_std()
+                                .unwrap_or_default();
+
+                            now.checked_sub(elapsed).unwrap_or(now)
+                        }),
+                    };
+
                     cached = Some(CachedState {
                         status: state.status,
-                        started_at: state.started_at.as_deref().and_then(|started_at| {
-                            chrono::DateTime::parse_from_rfc3339(started_at)
-                                .ok()
-                                .map(|started_at| started_at.with_timezone(&chrono::Utc))
-                        }),
+                        started_at,
+                        started_instant,
                     });
                 }
 
@@ -1434,23 +1451,14 @@ impl DockerProcessHandle {
                     continue;
                 };
 
-                let (container_state, uptime) = match state.status {
+                let (container_state, started_at) = match state.status {
                     Some(bollard::models::ContainerStateStatusEnum::RUNNING) => {
-                        let uptime = state
-                            .started_at
-                            .map(|started| {
-                                chrono::Utc::now()
-                                    .signed_duration_since(started)
-                                    .num_milliseconds()
-                                    .max(0) as u64
-                            })
-                            .unwrap_or(0);
-                        (ContainerState::Running, uptime)
+                        (ContainerState::Running, state.started_instant)
                     }
                     Some(bollard::models::ContainerStateStatusEnum::PAUSED) => {
-                        (ContainerState::Stopping, 0)
+                        (ContainerState::Stopping, None)
                     }
-                    _ => (ContainerState::Offline, 0),
+                    _ => (ContainerState::Offline, None),
                 };
 
                 if !wait_armed && container_state == ContainerState::Running {
@@ -1460,7 +1468,7 @@ impl DockerProcessHandle {
 
                 state_usage.send_modify(|usage| {
                     usage.state = container_state;
-                    usage.uptime = uptime;
+                    usage.started_at = started_at;
                 });
             }
         });
