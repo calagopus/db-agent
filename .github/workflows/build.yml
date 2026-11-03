@@ -28,15 +28,21 @@ jobs:
           - build: x86_64-linux
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            jemalloc_lg_page: 12
           - build: aarch64-linux
             os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
+            jemalloc_lg_page: 16
           - build: riscv64-linux
             os: ubuntu-24.04
             target: riscv64gc-unknown-linux-musl
+            jemalloc_lg_page: 12
+            # jemalloc needs libgcc's __ffsdi2, rustc links musl with -nodefaultlibs
+            link_flags: -C link-arg=-lgcc
           - build: ppc64le-linux
             os: ubuntu-24.04
             target: powerpc64le-unknown-linux-musl
+            jemalloc_lg_page: 16
 
     steps:
       - name: Checkout sources
@@ -61,12 +67,14 @@ jobs:
       - name: Run cargo test
         env:
           # riscv64gc musl is not crt-static by default (??)
-          RUSTFLAGS: "-C target-feature=+crt-static"
+          RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.link_flags }}"
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
         run: cross test --release --target ${{ matrix.target }}
 
       - name: Build release binary
         env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
+          RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.link_flags }}"
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Prepare binary with platform name

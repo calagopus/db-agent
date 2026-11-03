@@ -1,3 +1,8 @@
+# jemalloc bakes its page size in at configure time; the workflows set this per target
+# (16 = 64 KiB) so aarch64/ppc64le binaries also boot on 16K and 64K page kernels.
+[build.env]
+passthrough = ["JEMALLOC_SYS_WITH_LG_PAGE"]
+
 # cross ships no image for powerpc64le-unknown-linux-musl (cross-rs/cross#1776), so we
 # borrow the one from rust-cross/rust-musl-cross. Its gcc is POWER8-baselined, which is
 # the actual ppc64le floor; cross's own ppc64le-gnu image defaults to -mcpu=power9 and

@@ -89,6 +89,20 @@ macro_rules! exit_error {
     };
 }
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(target_os = "linux")]
+const MALLOC_CONF: &std::ffi::CStr = c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:4,tcache_nslots_small_max:20,tcache_max:4096";
+
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF_PTR: Option<&'static std::ffi::c_char> =
+    // SAFETY: MALLOC_CONF is a 'static nul-terminated C string, which is what
+    // jemalloc reads this symbol as during its initialization.
+    Some(unsafe { &*MALLOC_CONF.as_ptr() });
+
 fn spawn_subsystem(
     name: &'static str,
     fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -639,4 +653,31 @@ fn main() {
         .build()
         .expect("failed to build Tokio runtime")
         .block_on(main_rt());
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malloc_conf_is_applied() {
+        use tikv_jemalloc_ctl::raw;
+
+        // SAFETY: opt.narenas is a read-only unsigned int option.
+        let narenas: std::ffi::c_uint =
+            unsafe { raw::read(b"opt.narenas\0") }.expect("read opt.narenas");
+        assert_eq!(narenas, 4, "narenas from MALLOC_CONF was not applied");
+
+        // SAFETY: opt.background_thread is a read-only bool option.
+        let background: bool =
+            unsafe { raw::read(b"opt.background_thread\0") }.expect("read opt.background_thread");
+        assert!(
+            background,
+            "background_thread from MALLOC_CONF was not applied"
+        );
+
+        // SAFETY: opt.dirty_decay_ms is a read-only ssize_t option.
+        let dirty_decay: isize =
+            unsafe { raw::read(b"opt.dirty_decay_ms\0") }.expect("read opt.dirty_decay_ms");
+        assert_eq!(dirty_decay, 1000, "dirty_decay_ms was not applied");
+    }
 }
