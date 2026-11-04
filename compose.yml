@@ -4,6 +4,9 @@ services:
     restart: unless-stopped
     environment:
       TZ: "Europe/Berlin"
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "/var/lib/docker/containers/:/var/lib/docker/containers/"
