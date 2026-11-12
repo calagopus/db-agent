@@ -29,3 +29,11 @@ services:
       - 6379:6379
       # Management API (config: api.bind)
       - 8090:8090
+    # unauthenticated health check, reports 503 while any enabled subsystem is not serving.
+    # adjust the port if you change api.bind, and use https:// if api.tls.enabled is set
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8090/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
