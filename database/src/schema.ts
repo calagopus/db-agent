@@ -19,6 +19,7 @@ export const instances = sqliteTable(
     image_gid: integer().notNull(),
     volumes: text().notNull(),
     socket_path: text().notNull(),
+    control_socket_path: text(),
     timezone: text(),
     env: text().default('{}').notNull(),
     cmd: text(),

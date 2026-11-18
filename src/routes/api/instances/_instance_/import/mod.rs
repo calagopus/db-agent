@@ -47,7 +47,7 @@ mod post {
         ),
         (
             "source_db" = Option<String>, Query,
-            description = "The db the dump was taken from, mongodb only, requires db",
+            description = "The db the dump was taken from, mongodb and clickhouse only, requires db; defaults to db for clickhouse",
         ),
         (
             "db" = Option<String>, Query,

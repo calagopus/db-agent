@@ -215,7 +215,7 @@ impl super::Instance {
         let pool = match pool {
             Some(pool) => pool,
             None => {
-                let socket = self.get_socket_path().await;
+                let socket = self.get_control_socket_path().await;
 
                 let pool = match self.data.read().await.database_type {
                     DatabaseType::Mariadb => {
@@ -224,7 +224,7 @@ impl super::Instance {
                     DatabaseType::Postgres => {
                         TenantPool::Postgres(PostgresExplorer::create_pool(&socket, database))
                     }
-                    DatabaseType::Mongodb | DatabaseType::Redis => {
+                    DatabaseType::Mongodb | DatabaseType::Redis | DatabaseType::Clickhouse => {
                         return Err(unsupported_engine());
                     }
                 };
@@ -1191,7 +1191,9 @@ impl super::Instance {
                 return Ok(mysql::MYSQL_TYPES.iter().map(ToString::to_string).collect());
             }
             DatabaseType::Postgres => {}
-            DatabaseType::Mongodb | DatabaseType::Redis => return Err(unsupported_engine()),
+            DatabaseType::Mongodb | DatabaseType::Redis | DatabaseType::Clickhouse => {
+                return Err(unsupported_engine());
+            }
         }
 
         let mut connection = self.connect_explorer(database, true).await?;

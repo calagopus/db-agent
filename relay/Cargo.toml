@@ -1,0 +1,16 @@
+[package]
+name = "relay"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+
+[dependencies]
+libc = "0.2.191"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+unwrap_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

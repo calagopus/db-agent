@@ -78,17 +78,24 @@ jobs:
         if: matrix.build == 'ppc64le-linux'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
+      - name: Build relay binary
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.link_flags }}"
+        run: cross build --release --target ${{ matrix.target }} -p relay
+
       - name: Run cargo test
         env:
           # riscv64gc musl is not crt-static by default (??)
           RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.link_flags }}"
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
-        run: cross test --release --target ${{ matrix.target }}
+          RELAY_BINARY_PATH: target/${{ matrix.target }}/release/relay
+        run: cross test --release --target ${{ matrix.target }} --workspace
 
       - name: Build release binary
         env:
           RUSTFLAGS: "-C target-feature=+crt-static ${{ matrix.link_flags }}"
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ matrix.jemalloc_lg_page }}
+          RELAY_BINARY_PATH: target/${{ matrix.target }}/release/relay
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Prepare binary with platform name

@@ -82,6 +82,12 @@ fn redis_enabled() -> bool {
 fn redis_bind() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 6379))
 }
+fn clickhouse_enabled() -> bool {
+    true
+}
+fn clickhouse_bind() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 9000))
+}
 fn api_bind() -> String {
     "0.0.0.0:8090".to_string()
 }
@@ -124,7 +130,7 @@ fn docker_tmpfs_size() -> MiB {
     100u64.into()
 }
 fn docker_container_pid_limit() -> u64 {
-    512
+    5120
 }
 fn docker_timezone() -> String {
     if let Ok(tz) = std::env::var("TZ") {
@@ -279,6 +285,18 @@ nestify::nest! {
             #[serde(default = "redis_enabled")]
             pub enabled: bool,
             #[serde(default = "redis_bind")]
+            #[schema(value_type = String)]
+            pub bind: SocketAddr,
+            #[serde(default)]
+            pub tls: Tls,
+        },
+
+        #[serde(default)]
+        #[schema(inline)]
+        pub clickhouse: #[derive(ToSchema, Deserialize, Serialize, DefaultFromSerde)] #[serde(default)] pub struct Clickhouse {
+            #[serde(default = "clickhouse_enabled")]
+            pub enabled: bool,
+            #[serde(default = "clickhouse_bind")]
             #[schema(value_type = String)]
             pub bind: SocketAddr,
             #[serde(default)]

@@ -21,6 +21,7 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub static CLAP_COMMAND: OnceLock<clap::Command> = OnceLock::new();
 
+mod bins;
 mod commands;
 mod config;
 mod database;
@@ -388,6 +389,16 @@ async fn main_rt() {
             subsystems::redis::run(
                 Arc::clone(&config),
                 Arc::clone(&registry.redis),
+                Arc::clone(&database_route_manager),
+            ),
+        );
+    }
+    if config.load().clickhouse.enabled {
+        spawn_subsystem(
+            "clickhouse",
+            subsystems::clickhouse::run(
+                Arc::clone(&config),
+                Arc::clone(&registry.clickhouse),
                 Arc::clone(&database_route_manager),
             ),
         );

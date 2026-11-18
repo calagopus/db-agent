@@ -347,10 +347,11 @@ impl super::Instance {
                     source_db,
                 )
             }
-            DatabaseType::Redis => {
-                return Err(crate::response::DisplayError::new(
-                    "remote imports are not supported for redis",
-                )
+            DatabaseType::Redis | DatabaseType::Clickhouse => {
+                return Err(crate::response::DisplayError::new(format!(
+                    "remote imports are not supported for {}",
+                    database_type.to_str()
+                ))
                 .into());
             }
         };

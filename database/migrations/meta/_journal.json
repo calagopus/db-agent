@@ -29,6 +29,13 @@
       "when": 1787302450860,
       "tag": "0003_instance_state",
       "breakpoints": false
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794748445267,
+      "tag": "0004_control_socket_path",
+      "breakpoints": false
     }
   ]
 }

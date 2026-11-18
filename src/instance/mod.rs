@@ -17,6 +17,7 @@ use tokio::{
 };
 use utoipa::ToSchema;
 
+pub mod clickhouse_backups;
 pub mod connection;
 pub mod disk_checker;
 pub mod executor;
@@ -78,6 +79,7 @@ pub enum DatabaseType {
     Mariadb,
     Mongodb,
     Redis,
+    Clickhouse,
 }
 
 impl DatabaseType {
@@ -88,6 +90,7 @@ impl DatabaseType {
             DatabaseType::Mariadb => "mariadb",
             DatabaseType::Mongodb => "mongodb",
             DatabaseType::Redis => "redis",
+            DatabaseType::Clickhouse => "clickhouse",
         }
     }
 
@@ -98,6 +101,7 @@ impl DatabaseType {
             "mariadb" => Some(DatabaseType::Mariadb),
             "mongodb" => Some(DatabaseType::Mongodb),
             "redis" => Some(DatabaseType::Redis),
+            "clickhouse" => Some(DatabaseType::Clickhouse),
             _ => None,
         }
     }
@@ -171,6 +175,70 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LockedReader<R> {
     }
 }
 
+/// an uploaded clickhouse backup zip, removed from the data volume once dropped
+struct StagedBackup {
+    instance: Instance,
+    file: String,
+    user: String,
+}
+
+impl StagedBackup {
+    async fn tables(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stream = self
+            .instance
+            .exec(
+                executor::ExecOptions::new(vec![
+                    "clickhouse".to_string(),
+                    "local".to_string(),
+                    format!("--param_f={} :: metadata/*/*.sql", self.file),
+                    "-q".to_string(),
+                    "SELECT DISTINCT _file FROM file({f:String}, LineAsString) FORMAT TSVRaw"
+                        .to_string(),
+                ])
+                .with_user(self.user.clone()),
+            )
+            .await?;
+        drop(stream.stdin);
+
+        let mut listing = Vec::new();
+        while let Some(chunk) = stream.output.next().await {
+            listing.extend_from_slice(&chunk?);
+        }
+
+        Ok(connection::clickhouse::parse_backup_tables(
+            &String::from_utf8_lossy(&listing),
+        ))
+    }
+}
+
+impl Drop for StagedBackup {
+    fn drop(&mut self) {
+        let instance = self.instance.clone();
+        let options = executor::ExecOptions::new(vec![
+            "rm".to_string(),
+            "-f".to_string(),
+            std::mem::take(&mut self.file),
+        ])
+        .with_user(std::mem::take(&mut self.user));
+
+        tokio::spawn(async move {
+            let result = async {
+                let mut stream = instance.exec(options).await?;
+                drop(stream.stdin);
+                while let Some(chunk) = stream.output.next().await {
+                    chunk?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+
+            if let Err(err) = result {
+                tracing::warn!(instance = %instance.uuid, "failed to remove a staged backup: {err:#}");
+            }
+        });
+    }
+}
+
 fn duplicate_database_permission() -> anyhow::Error {
     crate::response::DisplayError::new("the same database appears twice in the permission list")
         .with_status(axum::http::StatusCode::BAD_REQUEST)
@@ -198,12 +266,16 @@ pub struct InnerInstance {
     resource_usage: tokio::sync::watch::Sender<resources::ResourceUsage>,
     disk_checker_task: tokio::task::JoinHandle<()>,
     mariadb_version_task: Option<tokio::task::JoinHandle<()>>,
+    clickhouse_backups_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for InnerInstance {
     fn drop(&mut self) {
         self.disk_checker_task.abort();
         if let Some(task) = &self.mariadb_version_task {
+            task.abort();
+        }
+        if let Some(task) = &self.clickhouse_backups_task {
             task.abort();
         }
     }
@@ -234,6 +306,13 @@ impl Instance {
                     resource_usage.subscribe(),
                 ))
             });
+            let clickhouse_backups_task =
+                (data.database_type == DatabaseType::Clickhouse).then(|| {
+                    tokio::spawn(clickhouse_backups::run(
+                        weak.clone(),
+                        resource_usage.subscribe(),
+                    ))
+                });
 
             InnerInstance {
                 uuid: data.uuid,
@@ -252,13 +331,22 @@ impl Instance {
                 resource_usage,
                 disk_checker_task,
                 mariadb_version_task,
+                clickhouse_backups_task,
             }
         }))
     }
 
     pub async fn get_socket_path(&self) -> PathBuf {
+        self.host_socket_path(&self.data.read().await.socket_path)
+    }
+
+    pub async fn get_control_socket_path(&self) -> PathBuf {
+        self.host_socket_path(self.data.read().await.control_socket())
+    }
+
+    fn host_socket_path(&self, container_path: &str) -> PathBuf {
         self.app_state.config.socket_path(self.uuid).join(
-            std::path::Path::new(&self.data.read().await.socket_path)
+            std::path::Path::new(container_path)
                 .file_name()
                 .unwrap_or_default(),
         )
@@ -356,10 +444,13 @@ impl Instance {
     }
 
     async fn verify_mongodb_auth_inner(&self) -> anyhow::Result<()> {
-        let conn = connection::mongodb::MongodbConnection::new(self.get_socket_path().await, None)?;
+        let conn = connection::mongodb::MongodbConnection::new(
+            self.get_control_socket_path().await,
+            None,
+        )?;
         let enforced = conn.auth_enforced().await?;
 
-        if let Err(err) = self.ensure_mongodb_root().await {
+        if let Err(err) = self.ensure_root().await {
             if enforced {
                 anyhow::bail!(
                     "authorization is enforced but the agent has no root credentials: {err}"
@@ -375,17 +466,28 @@ impl Instance {
         Ok(())
     }
 
-    pub async fn ensure_mongodb_root(&self) -> anyhow::Result<()> {
-        let socket = self.get_socket_path().await;
+    pub async fn ensure_root(&self) -> anyhow::Result<()> {
+        let socket = self.get_control_socket_path().await;
 
         let mut data = self.data.write().await;
         if data.root_password.is_some() {
             return Ok(());
         }
 
-        let conn = connection::mongodb::MongodbConnection::new(socket, None)?;
         let password = crate::utils::generate_password();
-        conn.create_root(&password).await?;
+        match data.database_type {
+            DatabaseType::Mongodb => {
+                connection::mongodb::MongodbConnection::new(socket, None)?
+                    .create_root(&password)
+                    .await?
+            }
+            DatabaseType::Clickhouse => {
+                connection::clickhouse::ClickhouseConnection::new(socket, None)?
+                    .create_root(&password)
+                    .await?
+            }
+            _ => return Ok(()),
+        }
 
         sqlx::query("UPDATE instances SET root_password = ? WHERE uuid = ?")
             .bind(&password)
@@ -1075,13 +1177,8 @@ impl Instance {
         db: Option<&str>,
         lock: bool,
     ) -> anyhow::Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>> {
-        let guard = lock
-            .then(|| self.try_write_lock(WriteLockReason::Export, "export a database"))
-            .transpose()?;
-        let active = self.app_state.instance_manager.track_transfer();
-
         let data = self.data.read().await;
-        let socket = &data.socket_path;
+        let socket = data.control_socket();
 
         let command = match data.database_type {
             DatabaseType::Postgres => {
@@ -1146,16 +1243,49 @@ return table.concat(out)"#,
                     r#"set -e; keyspace=$(redis-cli -s {socket} --raw INFO keyspace); for db in $(printf %s "$keyspace" | sed -n 's/^db\([0-9][0-9]*\):.*/\1/p'); do redis-cli -s {socket} -n "$db" --raw EVAL {script} 0 "$db"; done"#
                 )
             }
+            DatabaseType::Clickhouse => String::new(),
         };
+        let database_type = data.database_type;
         let user = format!("{}:{}", data.image_uid, data.image_gid);
         drop(data);
 
-        let stream = self
-            .exec(
+        let guard = lock
+            .then(|| self.try_write_lock(WriteLockReason::Export, "export a database"))
+            .transpose()?;
+        let active = self.app_state.instance_manager.track_transfer();
+
+        let stream = if database_type == DatabaseType::Clickhouse {
+            // detached so a client gone mid BACKUP still reaches the exec, which
+            // unlinks the zip before streaming it
+            let instance = self.clone();
+            let db = db.map(str::to_string);
+            tokio::spawn(async move {
+                instance.ensure_online("export a database").await?;
+
+                let connection = instance.clickhouse_connection().await?;
+                let file = connection.backup_file().await?;
+                connection.backup(db.as_deref(), &file).await?;
+
+                let file = crate::utils::shell_quote(&file);
+                instance
+                    .exec(
+                        executor::ExecOptions::new(vec![
+                            "sh".to_string(),
+                            "-c".to_string(),
+                            format!("exec <{file} && rm -f {file} && exec cat"),
+                        ])
+                        .with_user(user),
+                    )
+                    .await
+            })
+            .await??
+        } else {
+            self.exec(
                 executor::ExecOptions::new(vec!["sh".to_string(), "-c".to_string(), command])
                     .with_user(user),
             )
-            .await?;
+            .await?
+        };
 
         let uuid = self.uuid;
         let reader = tokio_util::io::StreamReader::new(
@@ -1186,7 +1316,10 @@ return table.concat(out)"#,
             if db.is_none() {
                 return Err(crate::response::DisplayError::new("source_db requires a db").into());
             }
-            if database_type != DatabaseType::Mongodb {
+            if !matches!(
+                database_type,
+                DatabaseType::Mongodb | DatabaseType::Clickhouse
+            ) {
                 return Err(crate::response::DisplayError::new(format!(
                     "{} cannot import a single db out of a dump, omit source_db",
                     database_type.to_str()
@@ -1194,6 +1327,8 @@ return table.concat(out)"#,
                 .into());
             }
         }
+
+        check_import_args(self.data.read().await.database_type, db, source_db, wipe)?;
 
         let _guard = self.try_import_lock(lock)?;
         let _active = self.app_state.instance_manager.track_transfer();
@@ -1233,11 +1368,27 @@ return table.concat(out)"#,
         wipe: bool,
         reader: &mut (dyn tokio::io::AsyncRead + Send + Unpin),
     ) -> anyhow::Result<()> {
-        let data = self.data.read().await;
-        let socket = &data.socket_path;
-        let database_type = data.database_type;
-
+        let database_type = self.data.read().await.database_type;
         check_import_args(database_type, db, source_db, wipe)?;
+
+        let staged = match database_type {
+            DatabaseType::Clickhouse => {
+                self.ensure_online("import a database").await?;
+                let data = self.data.read().await;
+                let user = format!("{}:{}", data.image_uid, data.image_gid);
+                drop(data);
+
+                Some(StagedBackup {
+                    instance: self.clone(),
+                    file: self.clickhouse_connection().await?.backup_file().await?,
+                    user,
+                })
+            }
+            _ => None,
+        };
+
+        let data = self.data.read().await;
+        let socket = data.control_socket();
 
         let (wipe_command, command) = match database_type {
             DatabaseType::Postgres => {
@@ -1317,6 +1468,18 @@ return table.concat(out)"#,
                 let wipe = wipe.then(|| format!("redis-cli -s {socket} FLUSHALL"));
                 (wipe, format!("redis-cli -s {socket} --pipe"))
             }
+            DatabaseType::Clickhouse => {
+                let file = staged.as_ref().map_or("", |staged| &staged.file);
+                let dir = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+                (
+                    None,
+                    format!(
+                        "mkdir -p {} && cat > {}",
+                        crate::utils::shell_quote(dir),
+                        crate::utils::shell_quote(file)
+                    ),
+                )
+            }
         };
         let user = format!("{}:{}", data.image_uid, data.image_gid);
         drop(data);
@@ -1390,6 +1553,23 @@ return table.concat(out)"#,
             // the target failing on a truncated dump
             drained = &mut drain => drained,
             written = &mut write => written.and(drain.await),
+        };
+
+        // only wiped once the upload is staged, a dropped upload leaves the db intact
+        let result = match &staged {
+            Some(staged) if result.is_ok() => {
+                let connection = self.clickhouse_connection().await?;
+                if wipe && let Some(db) = db {
+                    connection::DatabaseConnection::delete_database(&connection, db).await?;
+                }
+
+                let target = db.map(|db| (db, source_db.unwrap_or(db)));
+                connection
+                    .drop_restore_targets(target, &staged.tables().await?)
+                    .await?;
+                connection.restore(target, &staged.file).await
+            }
+            _ => result,
         };
 
         if wipe

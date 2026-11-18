@@ -305,11 +305,13 @@ trait DockerStoredInstanceExt {
         &self,
         config: &crate::config::Config,
         host_mounts: Option<&host_mounts::HostMountTable>,
+        relay: Option<&Path>,
     ) -> bollard::models::HostConfig;
     fn container_config(
         &self,
         config: &crate::config::Config,
         host_mounts: Option<&host_mounts::HostMountTable>,
+        relay: Option<&Path>,
     ) -> bollard::models::ContainerCreateBody;
 }
 
@@ -453,6 +455,7 @@ impl DockerStoredInstanceExt for StoredInstance {
         &self,
         config: &crate::config::Config,
         host_mounts: Option<&host_mounts::HostMountTable>,
+        relay: Option<&Path>,
     ) -> bollard::models::HostConfig {
         let mut mounts = vec![bollard::models::Mount {
             typ: Some(bollard::models::MountType::BIND),
@@ -485,6 +488,19 @@ impl DockerStoredInstanceExt for StoredInstance {
             });
         }
 
+        if let Some(relay) = relay {
+            mounts.push(bollard::models::Mount {
+                typ: Some(bollard::models::MountType::BIND),
+                source: Some(host_mounts::translate_source(
+                    host_mounts,
+                    &relay.to_string_lossy(),
+                )),
+                target: Some(crate::bins::RELAY_CONTAINER_PATH.to_string()),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
+
         let cfg = config.load();
         let (mounts, binds) = split_selinux_binds(mounts);
 
@@ -503,6 +519,7 @@ impl DockerStoredInstanceExt for StoredInstance {
         &self,
         config: &crate::config::Config,
         host_mounts: Option<&host_mounts::HostMountTable>,
+        relay: Option<&Path>,
     ) -> bollard::models::ContainerCreateBody {
         let cfg = config.load();
         let timezone = self
@@ -526,7 +543,7 @@ impl DockerStoredInstanceExt for StoredInstance {
                     CONTAINER_TYPE_DATABASE.to_string(),
                 ),
             ])),
-            host_config: Some(self.host_config(config, host_mounts)),
+            host_config: Some(self.host_config(config, host_mounts, relay)),
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
@@ -1740,7 +1757,9 @@ impl super::ContainerExecutor for DockerExecutor {
         tokio::fs::create_dir_all(&socket_dir).await?;
         self.chown(&socket_dir, data.image_uid, data.image_gid)?;
 
-        let bollard_config = data.container_config(&self.app_config, self.host_mounts());
+        let relay = crate::bins::get_relay_bin_path(&self.app_config).await?;
+        let bollard_config =
+            data.container_config(&self.app_config, self.host_mounts(), relay.as_deref());
 
         let container = self
             .docker

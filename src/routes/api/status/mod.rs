@@ -16,6 +16,7 @@ mod get {
         mariadb: SubsystemStatus,
         mongodb: SubsystemStatus,
         redis: SubsystemStatus,
+        clickhouse: SubsystemStatus,
     }
 
     #[utoipa::path(get, path = "/", responses(
@@ -27,6 +28,7 @@ mod get {
             mariadb: state.subsystem_registry.mariadb.to_api_response(),
             mongodb: state.subsystem_registry.mongodb.to_api_response(),
             redis: state.subsystem_registry.redis.to_api_response(),
+            clickhouse: state.subsystem_registry.clickhouse.to_api_response(),
         })
         .ok()
     }

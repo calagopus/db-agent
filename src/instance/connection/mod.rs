@@ -2,6 +2,7 @@ use super::{DatabasePermission, identifier::UserIdentifier};
 use serde::Serialize;
 use utoipa::ToSchema;
 
+pub mod clickhouse;
 pub mod mariadb;
 pub mod mongodb;
 pub mod postgres;
@@ -79,14 +80,14 @@ impl super::Instance {
     /// for the acl paths, which gate on ensure_acl_writable instead because a
     /// redis user is ours to store and needs no backend
     pub(super) async fn acl_connection(&self) -> anyhow::Result<Box<dyn DatabaseConnection>> {
-        let socket = self.get_socket_path().await;
+        let socket = self.get_control_socket_path().await;
 
         let database_type = self.data.read().await.database_type;
         Ok(match database_type {
             super::DatabaseType::Postgres => Box::new(postgres::PostgresConnection::new(socket)),
             super::DatabaseType::Mariadb => Box::new(mariadb::MariadbConnection::new(socket)),
             super::DatabaseType::Mongodb => {
-                self.ensure_mongodb_root().await?;
+                self.ensure_root().await?;
                 let root_password = self.data.read().await.root_password.clone();
                 Box::new(mongodb::MongodbConnection::new(
                     socket,
@@ -94,6 +95,17 @@ impl super::Instance {
                 )?)
             }
             super::DatabaseType::Redis => Box::new(redis::RedisConnection::new(socket)?),
+            super::DatabaseType::Clickhouse => Box::new(self.clickhouse_connection().await?),
         })
+    }
+
+    pub(super) async fn clickhouse_connection(
+        &self,
+    ) -> anyhow::Result<clickhouse::ClickhouseConnection> {
+        let socket = self.get_control_socket_path().await;
+
+        self.ensure_root().await?;
+        let root_password = self.data.read().await.root_password.clone();
+        clickhouse::ClickhouseConnection::new(socket, root_password.as_deref())
     }
 }

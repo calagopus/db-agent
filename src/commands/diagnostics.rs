@@ -107,6 +107,7 @@ impl crate::commands::CliCommand<DiagnosticsArgs> for DiagnosticsCommand {
                     ("mariadb", config.mariadb.enabled),
                     ("mongodb", config.mongodb.enabled),
                     ("redis", config.redis.enabled),
+                    ("clickhouse", config.clickhouse.enabled),
                 ] {
                     write_line(
                         &mut output,

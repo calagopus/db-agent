@@ -27,7 +27,7 @@ pub async fn run(
             };
             let database = Instance(database);
 
-            let socket = database.get_socket_path().await;
+            let socket = database.get_control_socket_path().await;
             match tokio::time::timeout(
                 PROBE_TIMEOUT,
                 crate::subsystems::mariadb::read_server_version(&socket),

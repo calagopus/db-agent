@@ -1,0 +1,1 @@
+ALTER TABLE `instances` ADD `control_socket_path` text;

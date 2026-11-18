@@ -1,6 +1,7 @@
 use status::SubsystemConnections;
 use std::sync::Arc;
 
+pub mod clickhouse;
 pub mod mariadb;
 pub mod mongodb;
 pub mod postgres;
@@ -13,4 +14,5 @@ pub struct SubsystemRegistry {
     pub mariadb: Arc<SubsystemConnections>,
     pub mongodb: Arc<SubsystemConnections>,
     pub redis: Arc<SubsystemConnections>,
+    pub clickhouse: Arc<SubsystemConnections>,
 }

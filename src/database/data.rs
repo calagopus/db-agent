@@ -92,8 +92,6 @@ pub struct StoredInstance {
     pub memory: i64,
     pub swap: i64,
     pub disk: i64,
-    /// Only has an effect with a scheduler that implements weights, CFQ on
-    /// cgroup v1 and BFQ or iocost on v2. It is silently ignored otherwise.
     pub io_weight: Option<i64>,
     pub cpu: i64,
     pub image: String,
@@ -101,12 +99,39 @@ pub struct StoredInstance {
     pub image_gid: u32,
     pub volumes: VolumeMapping,
     pub socket_path: String,
+    pub control_socket_path: Option<String>,
     pub timezone: Option<String>,
     pub env: BTreeMap<String, String>,
     pub cmd: Option<Vec<String>>,
     #[serde(skip)]
     pub root_password: Option<String>,
     pub created: chrono::DateTime<chrono::Utc>,
+}
+
+fn check_control_socket(
+    socket_path: &str,
+    control_socket_path: Option<&str>,
+) -> anyhow::Result<()> {
+    let parent = |path: &str| std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+    if let Some(control) = control_socket_path
+        && parent(control) != parent(socket_path)
+    {
+        return Err(crate::response::DisplayError::new(
+            "control_socket_path must be in the same directory as socket_path",
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+impl StoredInstance {
+    #[inline]
+    pub fn control_socket(&self) -> &str {
+        self.control_socket_path
+            .as_deref()
+            .unwrap_or(&self.socket_path)
+    }
 }
 
 impl FromRow<'_, SqliteRow> for StoredInstance {
@@ -141,6 +166,7 @@ impl FromRow<'_, SqliteRow> for StoredInstance {
                 })?
             },
             socket_path: row.try_get("socket_path")?,
+            control_socket_path: row.try_get("control_socket_path")?,
             timezone: row.try_get("timezone")?,
             env: {
                 let raw = row.try_get::<String, _>("env")?;
@@ -180,6 +206,7 @@ pub struct StoredInstanceCreate {
     pub image_gid: u32,
     pub volumes: VolumeMapping,
     pub socket_path: String,
+    pub control_socket_path: Option<String>,
     pub timezone: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -191,14 +218,16 @@ impl StoredInstanceCreate {
         self,
         database: &crate::database::Database,
     ) -> anyhow::Result<StoredInstance> {
+        check_control_socket(&self.socket_path, self.control_socket_path.as_deref())?;
+
         loop {
             let uuid = uuid::Uuid::new_v4();
             let uuid_short = uuid.as_fields().0 as i64;
             let created = chrono::Utc::now();
 
             match sqlx::query(
-                "INSERT INTO instances (uuid, uuid_short, database_type, suspended, memory, swap, disk, io_weight, cpu, image, image_uid, image_gid, volumes, socket_path, timezone, env, cmd, created)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO instances (uuid, uuid_short, database_type, suspended, memory, swap, disk, io_weight, cpu, image, image_uid, image_gid, volumes, socket_path, control_socket_path, timezone, env, cmd, created)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(uuid)
             .bind(uuid_short)
@@ -214,6 +243,7 @@ impl StoredInstanceCreate {
             .bind(self.image_gid)
             .bind(serde_json::to_string(&self.volumes)?)
             .bind(&self.socket_path)
+            .bind(&self.control_socket_path)
             .bind(&self.timezone)
             .bind(serde_json::to_string(&self.env)?)
             .bind(self.cmd.as_ref().map(serde_json::to_string).transpose()?)
@@ -237,6 +267,7 @@ impl StoredInstanceCreate {
                         image_gid: self.image_gid,
                         volumes: self.volumes,
                         socket_path: self.socket_path,
+                        control_socket_path: self.control_socket_path,
                         timezone: self.timezone,
                         env: self.env,
                         cmd: self.cmd,
@@ -265,6 +296,7 @@ pub struct StoredInstanceUpdate {
     pub image_gid: Option<u32>,
     pub volumes: Option<VolumeMapping>,
     pub socket_path: Option<String>,
+    pub control_socket_path: Option<Option<String>>,
     pub timezone: Option<Option<String>>,
     pub env: Option<BTreeMap<String, String>>,
     pub cmd: Option<Option<Vec<String>>>,
@@ -311,6 +343,9 @@ impl StoredInstanceUpdate {
         if let Some(socket_path) = self.socket_path {
             new_data.socket_path = socket_path;
         }
+        if let Some(control_socket_path) = self.control_socket_path {
+            new_data.control_socket_path = control_socket_path;
+        }
         if let Some(timezone) = self.timezone {
             new_data.timezone = timezone;
         }
@@ -320,11 +355,15 @@ impl StoredInstanceUpdate {
         if let Some(cmd) = self.cmd {
             new_data.cmd = cmd;
         }
+        check_control_socket(
+            &new_data.socket_path,
+            new_data.control_socket_path.as_deref(),
+        )?;
 
         sqlx::query(
             "UPDATE instances SET suspended = ?, memory = ?, swap = ?,
             disk = ?, io_weight = ?, cpu = ?, image = ?, image_uid = ?,
-            image_gid = ?, volumes = ?, socket_path = ?, timezone = ?,
+            image_gid = ?, volumes = ?, socket_path = ?, control_socket_path = ?, timezone = ?,
             env = ?, cmd = ? WHERE uuid = ?",
         )
         .bind(new_data.suspended)
@@ -338,6 +377,7 @@ impl StoredInstanceUpdate {
         .bind(new_data.image_gid)
         .bind(serde_json::to_string(&new_data.volumes)?)
         .bind(&new_data.socket_path)
+        .bind(&new_data.control_socket_path)
         .bind(&new_data.timezone)
         .bind(serde_json::to_string(&new_data.env)?)
         .bind(
@@ -382,8 +422,6 @@ pub struct StoredUser {
     pub instance_uuid: uuid::Uuid,
     pub username: String,
     pub password: String,
-    // lives in its own table, `FromRow` leaves it empty for the callers that
-    // only need the user itself
     pub databases: Vec<StoredUserDatabase>,
     pub created: chrono::DateTime<chrono::Utc>,
 }
@@ -416,5 +454,26 @@ impl FromRow<'_, SqliteRow> for StoredUserDatabase {
             permission: decode_permission(row)?,
             created: decode_created(row)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // check_control_socket
+
+    #[test]
+    fn control_socket_must_share_parent_directory() {
+        assert!(check_control_socket("/run/db/1/mysqld.sock", None).is_ok());
+        assert!(
+            check_control_socket("/run/db/1/mysqld.sock", Some("/run/db/1/control.sock")).is_ok()
+        );
+        assert!(
+            check_control_socket("/run/db/1/mysqld.sock", Some("/run/db/2/control.sock")).is_err()
+        );
+        assert!(
+            check_control_socket("/run/db/1/mysqld.sock", Some("/run/db/control.sock")).is_err()
+        );
     }
 }

@@ -27,5 +27,7 @@ services:
       - 27017:27017
       # Redis proxy (config: redis.bind)
       - 6379:6379
+      # ClickHouse native proxy (config: clickhouse.bind)
+      - 9000:9000
       # Management API (config: api.bind)
       - 8090:8090

@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{io::Write, path::Path, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -6,6 +6,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DB_AGENT_UPGRADE_PROVIDER");
     println!("cargo:rerun-if-env-changed=DB_AGENT_UPGRADE_REPOSITORY");
     println!("cargo:rerun-if-env-changed=DB_AGENT_UPGRADE_API_URL");
+    println!("cargo:rerun-if-env-changed=RELAY_BINARY_PATH");
+    println!("cargo:rerun-if-changed=relay/src");
+    println!("cargo:rerun-if-changed=relay/Cargo.toml");
 
     let target_arch =
         std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown".to_string());
@@ -16,6 +19,62 @@ fn main() {
 
     handle_git_info();
     handle_upgrade_source();
+    handle_relay(&target_arch);
+}
+
+#[allow(clippy::panic)]
+fn handle_relay(target_arch: &str) {
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
+    let out_path = Path::new(&out_dir).join("relay.gz");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        std::fs::write(&out_path, []).expect("failed to write relay placeholder");
+        return;
+    }
+
+    let binary_path = match std::env::var("RELAY_BINARY_PATH") {
+        Ok(path) if !path.is_empty() => Path::new(&manifest_dir).join(path),
+        _ => {
+            let musl_arch = match target_arch {
+                "riscv64" => "riscv64gc",
+                "powerpc64" => "powerpc64le",
+                arch => arch,
+            };
+            let target = format!("{musl_arch}-unknown-linux-musl");
+            let target_dir = Path::new(&manifest_dir).join("target").join("relay");
+
+            let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .args(["build", "-p", "relay", "--release", "--target", &target])
+                .env("CARGO_TARGET_DIR", &target_dir)
+                .env("RUSTFLAGS", "-C target-feature=+crt-static")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .status();
+            if !status.is_ok_and(|status| status.success()) {
+                panic!(
+                    "failed to build the relay for {target}, install the target or set RELAY_BINARY_PATH to a prebuilt static relay"
+                );
+            }
+
+            target_dir.join(target).join("release").join("relay")
+        }
+    };
+
+    let binary = std::fs::read(&binary_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read relay binary {}: {err}",
+            binary_path.display()
+        )
+    });
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder
+        .write_all(&binary)
+        .expect("failed to compress relay");
+    std::fs::write(
+        &out_path,
+        encoder.finish().expect("failed to compress relay"),
+    )
+    .expect("failed to write compressed relay");
 }
 
 fn handle_git_info() {

@@ -302,6 +302,7 @@ pub struct DatabaseRouteManager {
     pub mariadb: Table,
     pub mongodb: Table,
     pub redis: Table,
+    pub clickhouse: Table,
 
     pub mariadb_versions: MariadbVersions,
 }
@@ -361,6 +362,7 @@ impl DatabaseRouteManager {
             DatabaseType::Mariadb => &self.mariadb,
             DatabaseType::Mongodb => &self.mongodb,
             DatabaseType::Redis => &self.redis,
+            DatabaseType::Clickhouse => &self.clickhouse,
         }
     }
 
