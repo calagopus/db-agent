@@ -3,8 +3,12 @@ use crate::{
     utils::{bad, get_array, handshake_step},
 };
 use rand::RngExt;
-use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::{
+    pin::Pin,
+    sync::atomic::{AtomicU32, Ordering},
+    task::{Context, Poll, ready},
+};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
@@ -22,6 +26,11 @@ pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 pub const NATIVE: &str = "mysql_native_password";
 
 const MAX_PACKET_LEN: usize = 1024 * 1024;
+const MAX_PAYLOAD_LEN: usize = 0xff_ffff;
+
+const COM_SLEEP: u8 = 0x00;
+const COM_CHANGE_USER: u8 = 0x11;
+const COM_MULTI: u8 = 0xfe;
 
 const CAPS: u32 = CLIENT_FOUND_ROWS
     | CLIENT_LONG_FLAG
@@ -285,4 +294,247 @@ pub async fn write_packet<S: AsyncWrite + Unpin>(
         .write_all(&[len as u8, (len >> 8) as u8, (len >> 16) as u8, seq])
         .await?;
     stream.write_all(payload).await
+}
+
+/// Rewrites COM_CHANGE_USER, and COM_MULTI which can nest one, to COM_SLEEP in the client's
+/// command stream, so mariadbd answers ER_UNKNOWN_COM_ERROR in order instead of re-authenticating
+/// over a socket that trusts root.
+pub struct CommandFilter<S> {
+    inner: S,
+    header: [u8; 4],
+    header_len: usize,
+    remaining: usize,
+    continued: bool,
+    command: bool,
+}
+
+impl<S> CommandFilter<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            header: [0; 4],
+            header_len: 0,
+            remaining: 0,
+            continued: false,
+            command: false,
+        }
+    }
+
+    fn filter(&mut self, buf: &mut [u8]) {
+        let mut pos = 0;
+        while pos < buf.len() {
+            if self.remaining == 0 {
+                let n = (self.header.len() - self.header_len).min(buf.len() - pos);
+                if let (Some(dst), Some(src)) = (
+                    self.header.get_mut(self.header_len..self.header_len + n),
+                    buf.get(pos..pos + n),
+                ) {
+                    dst.copy_from_slice(src);
+                }
+                self.header_len += n;
+                pos += n;
+
+                if self.header_len == self.header.len() {
+                    let [b0, b1, b2, _] = self.header;
+                    let len = u32::from_le_bytes([b0, b1, b2, 0]) as usize;
+                    self.header_len = 0;
+                    self.remaining = len;
+                    self.command = !self.continued && len > 0;
+                    self.continued = len == MAX_PAYLOAD_LEN;
+                }
+                continue;
+            }
+
+            if std::mem::take(&mut self.command)
+                && let Some(cmd) = buf.get_mut(pos)
+                && matches!(*cmd, COM_CHANGE_USER | COM_MULTI)
+            {
+                *cmd = COM_SLEEP;
+            }
+
+            let n = self.remaining.min(buf.len() - pos);
+            self.remaining -= n;
+            pos += n;
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CommandFilter<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let start = buf.filled().len();
+        ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        if let Some(read) = buf.filled_mut().get_mut(start..) {
+            this.filter(read);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CommandFilter<S> {
+    #[inline]
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    #[inline]
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    #[inline]
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    #[inline]
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COM_QUIT: u8 = 0x01;
+    const COM_QUERY: u8 = 0x03;
+    const COM_RESET_CONNECTION: u8 = 0x1f;
+
+    fn packet(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut out = vec![len as u8, (len >> 8) as u8, (len >> 16) as u8, seq];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn command(cmd: u8, len: usize) -> Vec<u8> {
+        let mut out = vec![COM_CHANGE_USER; len];
+        if let Some(first) = out.first_mut() {
+            *first = cmd;
+        }
+        out
+    }
+
+    async fn filtered(input: &[u8], chunk: usize) -> Vec<u8> {
+        let mut filter = CommandFilter::new(input);
+        let mut buf = vec![0; chunk];
+        let mut out = Vec::with_capacity(input.len());
+        loop {
+            let n = filter.read(&mut buf).await.expect("read through filter");
+            if n == 0 {
+                return out;
+            }
+            out.extend_from_slice(buf.get(..n).expect("n within buffer"));
+        }
+    }
+
+    async fn assert_filtered(input: &[u8], expected: &[u8]) {
+        for chunk in [input.len().max(1), 1, 3] {
+            assert_eq!(filtered(input, chunk).await, expected, "chunk size {chunk}");
+        }
+    }
+
+    // CommandFilter
+
+    #[tokio::test]
+    async fn change_user_becomes_sleep() {
+        let input = packet(0, &command(COM_CHANGE_USER, 6));
+        let expected = packet(0, &command(COM_SLEEP, 6));
+        assert_filtered(&input, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn multi_becomes_sleep() {
+        let input = packet(0, &command(COM_MULTI, 6));
+        let expected = packet(0, &command(COM_SLEEP, 6));
+        assert_filtered(&input, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn other_commands_and_headers_untouched() {
+        let mut input = packet(COM_MULTI, &command(COM_QUERY, 0x11));
+        input.extend(packet(COM_CHANGE_USER, &command(COM_QUIT, 0xfe)));
+        input.extend(packet(0, &command(COM_RESET_CONNECTION, 1)));
+        assert_filtered(&input, &input).await;
+    }
+
+    #[tokio::test]
+    async fn pipelined_packets_filtered_independently() {
+        let mut input = packet(0, &command(COM_QUERY, 5));
+        input.extend(packet(0, &command(COM_CHANGE_USER, 7)));
+        input.extend(packet(0, &command(COM_MULTI, 2)));
+        input.extend(packet(0, &command(COM_QUIT, 1)));
+        input.extend(packet(0, &command(COM_CHANGE_USER, 1)));
+
+        let mut expected = packet(0, &command(COM_QUERY, 5));
+        expected.extend(packet(0, &command(COM_SLEEP, 7)));
+        expected.extend(packet(0, &command(COM_SLEEP, 2)));
+        expected.extend(packet(0, &command(COM_QUIT, 1)));
+        expected.extend(packet(0, &command(COM_SLEEP, 1)));
+
+        assert_filtered(&input, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn continuation_payload_untouched_and_next_command_filtered() {
+        let mut input = packet(0, &command(COM_QUERY, MAX_PAYLOAD_LEN));
+        input.extend(packet(1, &command(COM_CHANGE_USER, 4)));
+        input.extend(packet(0, &command(COM_CHANGE_USER, 4)));
+
+        let mut expected = packet(0, &command(COM_QUERY, MAX_PAYLOAD_LEN));
+        expected.extend(packet(1, &command(COM_CHANGE_USER, 4)));
+        expected.extend(packet(0, &command(COM_SLEEP, 4)));
+
+        assert_filtered(&input, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn continuation_ended_by_empty_packet() {
+        let mut input = packet(0, &command(COM_MULTI, MAX_PAYLOAD_LEN));
+        input.extend(packet(1, &[]));
+        input.extend(packet(0, &command(COM_MULTI, 3)));
+
+        let mut expected = packet(0, &command(COM_SLEEP, MAX_PAYLOAD_LEN));
+        expected.extend(packet(1, &[]));
+        expected.extend(packet(0, &command(COM_SLEEP, 3)));
+
+        assert_filtered(&input, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn empty_command_then_change_user() {
+        let mut input = packet(0, &[]);
+        input.extend(packet(0, &command(COM_CHANGE_USER, 3)));
+
+        let mut expected = packet(0, &[]);
+        expected.extend(packet(0, &command(COM_SLEEP, 3)));
+
+        assert_filtered(&input, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn truncated_trailing_header_passed_through() {
+        let mut input = packet(0, &command(COM_QUERY, 3));
+        input.extend([0x05, 0x00]);
+        assert_filtered(&input, &input).await;
+    }
 }

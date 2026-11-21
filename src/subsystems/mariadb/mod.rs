@@ -239,6 +239,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 
     let _guard = user_id
         .map(|id| status.connect(id, Some(hr.database.to_string()).filter(|s| !s.is_empty())));
+    let mut stream = protocol::CommandFilter::new(stream);
     let (c2b, b2c) = tokio::select! {
         copied = copy_bidirectional(&mut stream, &mut backend) => copied?,
         _ = creds.instance.write_locked() => {
